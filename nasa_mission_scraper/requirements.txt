@@ -1,0 +1,22 @@
+# NASA Mission Scraper v2 — Python Dependencies
+
+# Web scraping & HTTP
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+
+# DuckDuckGo search (new package name as of 2024)
+ddgs>=0.1.0
+
+# PDF processing — native text extraction + page rasterisation
+PyMuPDF>=1.23.0
+
+# OCR for scanned / handwritten / image-only PDF pages
+pytesseract>=0.3.10
+Pillow>=10.0.0
+
+# MongoDB Atlas
+pymongo[srv]>=4.6.0
+
+# Environment variables
+python-dotenv>=1.0.0
