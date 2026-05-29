@@ -19,7 +19,8 @@ from pathlib import Path
 from datetime import timedelta
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-OLLAMA_URL  = "http://172.16.5.121:11434/api/generate"
+# OLLAMA_URL  = "http://172.16.5.121:11434/api/generate"
+OLLAMA_URL  = "http://127.0.0.1:11434/api/generate"
 MODEL       = "mistral-small3.1:24b"
 OUTPUT_FILE = "processed.json"
 
