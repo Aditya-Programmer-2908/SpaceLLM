@@ -7,7 +7,7 @@ Strategy  : Freeze full transformer backbone, apply LoRA ONLY to lm_head
 Method    : Standard BF16 LoRA — NOT QLoRA, no bitsandbytes
 
 Launch:
-    export CUDA_VISIBLE_DEVICES=1
+    export CUDA_VISIBLE_DEVICES=1,2
     python fine_tuning/train_spacellm_lora.py
 
 Output layout:
@@ -20,10 +20,11 @@ To load after training:
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from peft import PeftModel
     import torch
+    export CUDA_VISIBLE_DEVICES=1,2
     base  = AutoModelForCausalLM.from_pretrained(
                 "openai/gpt-oss-20b",
                 torch_dtype=torch.bfloat16,
-                device_map="cuda:0")
+                device_map="auto")
     model = PeftModel.from_pretrained(base, "./outputs/spacellm_lora_final")
     tok   = AutoTokenizer.from_pretrained("./outputs/spacellm_lora_final")
 """
@@ -206,7 +207,7 @@ def tokenise_record(record: dict, tokenizer, max_seq_len: int):
         logger.warning(f"apply_chat_template failed: {e} — skipping")
         return None
 
-    full_enc  = tokenizer(
+    full_enc = tokenizer(
         full_text,
         truncation=True,
         max_length=max_seq_len,
@@ -280,15 +281,21 @@ def build_hf_dataset(records: list, tokenizer, max_seq_len: int, split_name: str
 def main():
     args = parse_args()
 
+    # ── Detect available GPUs from CUDA_VISIBLE_DEVICES ──────────────────
+    # With CUDA_VISIBLE_DEVICES=1,2 → PyTorch sees them as cuda:0 and cuda:1
+    # We load the model onto cuda:0 (physical GPU 1) and let device_map
+    # spill overflow layers to cuda:1 (physical GPU 2) if needed
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     logger.info("=" * 60)
     logger.info("  SpaceLLM — Experimental LoRA  (lm_head only, BF16)")
-    logger.info(f"  Run ID   : {RUN_ID}")
-    logger.info(f"  Model    : {args.model_id}")
-    logger.info(f"  Strategy : LoRA on lm_head ONLY — backbone fully frozen")
-    logger.info(f"  Epochs   : {args.epochs}  |  LR: {args.lr}")
-    logger.info(f"  Batch    : {args.batch_size}  |  Grad accum: {args.grad_accum}"
+    logger.info(f"  Run ID            : {RUN_ID}")
+    logger.info(f"  Model             : {args.model_id}")
+    logger.info(f"  Strategy          : LoRA on lm_head ONLY — backbone frozen")
+    logger.info(f"  Epochs            : {args.epochs}  |  LR: {args.lr}")
+    logger.info(f"  Batch             : {args.batch_size}  |  Grad accum: {args.grad_accum}"
                 f"  |  Eff batch: {args.batch_size * args.grad_accum}")
-    logger.info(f"  Log      : {LOG_FILE}")
+    logger.info(f"  CUDA_VISIBLE_DEVS : {visible if visible else 'all'}")
+    logger.info(f"  Log               : {LOG_FILE}")
     logger.info("=" * 60)
 
     try:
@@ -305,6 +312,12 @@ def main():
         logger.error(f"Missing dependency: {e}")
         logger.error("Run: uv pip install -r requirements.txt")
         sys.exit(1)
+
+    # Detect how many GPUs are visible
+    n_gpus = torch.cuda.device_count()
+    logger.info(f"Visible GPUs      : {n_gpus}")
+    for i in range(n_gpus):
+        logger.info(f"  cuda:{i} → {torch.cuda.get_device_name(i)}")
 
     # ── Dataset file check ────────────────────────────────────────────────
     logger.info("")
@@ -340,26 +353,49 @@ def main():
         logger.info("pad_token set to eos_token")
 
     tokenizer.padding_side = "right"
-    logger.info(f"Vocab size       : {tokenizer.vocab_size:,}")
-    logger.info(f"Pad token        : '{tokenizer.pad_token}'  (id={tokenizer.pad_token_id})")
+    logger.info(f"Vocab size        : {tokenizer.vocab_size:,}")
+    logger.info(f"Pad token         : '{tokenizer.pad_token}'  (id={tokenizer.pad_token_id})")
 
     if tokenizer.chat_template is not None:
-        logger.info("Chat template    : found (harmony format)")
+        logger.info("Chat template     : found (harmony format)")
     else:
-        logger.warning("Chat template    : NOT FOUND")
+        logger.warning("Chat template     : NOT FOUND")
 
-    # ── Model in BF16 ─────────────────────────────────────────────────────
-    # KEY FIX: device_map="cuda:0" forces ALL layers onto one GPU
-    # This prevents the meta/cuda device split that breaks LoRA backprop
-    # CUDA_VISIBLE_DEVICES=1 means physical GPU1 is seen as cuda:0 here
+    # ── Model loading strategy ────────────────────────────────────────────
+    # With CUDA_VISIBLE_DEVICES=1,2:
+    #   - PyTorch remaps → cuda:0 = physical GPU1, cuda:1 = physical GPU2
+    #   - We build a max_memory dict to control how model layers are split
+    #   - lm_head is kept on cuda:0 so LoRA backprop stays on one device
+    #   - Transformer layers spill to cuda:1 if needed
     logger.info("")
-    logger.info(f"Loading model: {args.model_id}  [BF16, single GPU]")
+    logger.info(f"Loading model: {args.model_id}  [BF16, {n_gpus} GPU(s)]")
+
+    if n_gpus >= 2:
+        # Split: put lm_head (last layer) on cuda:0 by leaving it most memory
+        # Give cuda:1 enough for transformer body, cuda:0 for lm_head + LoRA
+        gpu0_mem = torch.cuda.get_device_properties(0).total_memory
+        gpu1_mem = torch.cuda.get_device_properties(1).total_memory
+        # Reserve 2GB headroom on each
+        max_memory = {
+            0: f"{int((gpu0_mem / 1024**3) - 2)}GiB",
+            1: f"{int((gpu1_mem / 1024**3) - 2)}GiB",
+        }
+        logger.info(f"Max memory map    : {max_memory}")
+        device_map_arg = "auto"
+    else:
+        # Single GPU — put everything on cuda:0
+        max_memory = None
+        device_map_arg = "cuda:0"
+
+    logger.info(f"device_map        : {device_map_arg}")
+
     t0 = time.time()
     try:
         model = AutoModelForCausalLM.from_pretrained(
             args.model_id,
             torch_dtype=torch.bfloat16,
-            device_map="cuda:0",            # force all layers onto one GPU
+            device_map=device_map_arg,
+            max_memory=max_memory,
             trust_remote_code=True,
             ignore_mismatched_sizes=True,   # handles MXFP4 → BF16 conversion
         )
@@ -368,10 +404,19 @@ def main():
         sys.exit(1)
 
     logger.info(f"Model loaded in {time.time() - t0:.1f}s")
-    logger.info(f"Model dtype      : {next(model.parameters()).dtype}")
+    logger.info(f"Model dtype       : {next(model.parameters()).dtype}")
     if hasattr(model, "hf_device_map"):
-        devices = set(str(v) for v in model.hf_device_map.values())
-        logger.info(f"Devices used     : {devices}")
+        # Show layer → device assignment
+        device_counts = defaultdict(int)
+        for layer, dev in model.hf_device_map.items():
+            device_counts[str(dev)] += 1
+        logger.info("Layer distribution:")
+        for dev, count in sorted(device_counts.items()):
+            logger.info(f"  {dev} : {count} layer(s)")
+        # Log specifically where lm_head landed — critical for LoRA
+        lm_head_device = model.hf_device_map.get("lm_head", "unknown")
+        logger.info(f"lm_head device    : {lm_head_device}  ← LoRA will be on this device")
+
     log_gpu_memory("after model load")
 
     model.config.use_cache = False
@@ -379,6 +424,8 @@ def main():
     logger.info("Gradient checkpointing: enabled")
 
     # ── LoRA on lm_head ONLY ──────────────────────────────────────────────
+    # LoRA adapters are automatically placed on the same device as lm_head
+    # With our max_memory setup, lm_head stays on cuda:0
     logger.info("")
     logger.info("Applying LoRA to lm_head ONLY — backbone stays frozen ...")
     lora_config = LoraConfig(
@@ -390,6 +437,11 @@ def main():
         target_modules=["lm_head"],
     )
     model = get_peft_model(model, lora_config)
+
+    # Verify LoRA weights are on same device as lm_head — prevents backprop error
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            logger.info(f"LoRA weight '{name}' on device: {param.device}")
 
     logger.info("")
     log_trainable_parameters(model)
@@ -450,13 +502,14 @@ def main():
         "scheduler":        "cosine",
         "bf16":             True,
         "max_seq_len":      args.max_seq_len,
-        "device_map":       "cuda:0 (single GPU)",
+        "visible_gpus":     visible if visible else "all",
+        "n_gpus_used":      n_gpus,
     }.items():
         logger.info(f"  {k:<25}: {v}")
 
     # ── Data collator ─────────────────────────────────────────────────────
     data_collator = DataCollatorForSeq2Seq(
-        tokenizer=tokenizer,            # DataCollatorForSeq2Seq uses tokenizer=
+        tokenizer=tokenizer,
         model=model,
         padding=True,
         pad_to_multiple_of=8,
@@ -469,7 +522,7 @@ def main():
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
-        processing_class=tokenizer,     # Trainer uses processing_class= (v4.50+)
+        processing_class=tokenizer,
         data_collator=data_collator,
     )
 
@@ -565,6 +618,7 @@ def main():
     logger.info(f"  Logs             →  {LOG_DIR}")
     logger.info("")
     logger.info("  To load for evaluation:")
+    logger.info("  export CUDA_VISIBLE_DEVICES=1,2")
     logger.info("  from transformers import AutoModelForCausalLM, AutoTokenizer")
     logger.info("  from peft import PeftModel")
     logger.info("  import torch")
