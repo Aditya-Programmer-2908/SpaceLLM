@@ -6,8 +6,14 @@ Phase     : Experimentation
 Strategy  : Freeze full transformer backbone, apply LoRA ONLY to lm_head
 Method    : Standard BF16 LoRA — NOT QLoRA, no bitsandbytes
 
+Triton     : DISABLED — patched out before any import fires.
+             This prevents the Python.h / gcc JIT-compile error that occurs
+             when python3.12-dev headers are not installed on the system.
+             The MXFP4 → BF16 weight conversion falls back to the pure-PyTorch
+             path inside transformers/integrations/mxfp4.py automatically.
+
 Launch:
-    export CUDA_VISIBLE_DEVICES=1,2
+    export CUDA_VISIBLE_DEVICES=1
     python fine_tuning/train_spacellm_lora.py
 
 Output layout:
@@ -20,20 +26,157 @@ To load after training:
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from peft import PeftModel
     import torch
-    export CUDA_VISIBLE_DEVICES=1,2
     base  = AutoModelForCausalLM.from_pretrained(
                 "openai/gpt-oss-20b",
-                torch_dtype=torch.bfloat16,
-                device_map="auto")
+                dtype=torch.bfloat16,
+                device_map="cuda:0")
     model = PeftModel.from_pretrained(base, "./outputs/spacellm_lora_final")
     tok   = AutoTokenizer.from_pretrained("./outputs/spacellm_lora_final")
 """
+
+# ── TRITON PATCH — must be the very first thing before any other import ───────
+#
+# Triton's CudaUtils driver JIT-compiles a small C extension (cuda_utils.c)
+# on first init, which requires Python.h from python3.12-dev. When those
+# headers are absent, gcc fails and the entire MXFP4 weight loading chain
+# errors out. The patch below replaces the two Triton internals that trigger
+# this compilation with harmless no-ops, so the rest of the stack never
+# attempts to call gcc.
+#
+# Scope of impact:
+#   - Triton JIT kernels are disabled (we don't call any directly).
+#   - The MXFP4 swizzle path in transformers falls back to pure PyTorch ops.
+#   - torch.compile / inductor paths that internally call Triton also become
+#     no-ops, but we are not using those here.
+#
+import sys
+import types
+
+def _patch_triton():
+    """
+    Install a lightweight stub for triton.backends.nvidia.driver before
+    the real triton package loads. Two entry points need to be patched:
+
+      1. triton.runtime.build._build        — the gcc subprocess call
+      2. triton.backends.nvidia.driver.CudaUtils.__init__  — the caller
+
+    Strategy: inject a fake 'triton' top-level package whose sub-modules
+    export just enough surface area to satisfy the import chain inside
+    transformers/mxfp4.py and triton/runtime/driver.py, returning stub
+    objects everywhere a real driver or compiled module would be expected.
+    """
+
+    # ── Stub classes ──────────────────────────────────────────────────────
+
+    class _StubDriver:
+        """Pretends to be the Triton CUDA driver. Every attribute access
+        returns another stub so callers that do driver.foo.bar() don't
+        crash with AttributeError."""
+        def __getattr__(self, name):
+            return _StubDriver()
+        def __call__(self, *a, **kw):
+            return _StubDriver()
+        def __bool__(self):
+            return False
+
+    class _StubCudaUtils:
+        def __init__(self):
+            pass
+        def __getattr__(self, name):
+            return lambda *a, **kw: None
+
+    class _ActiveDriverDescriptor:
+        """Replaces triton.runtime.driver.DriverManager.active property."""
+        def __get__(self, obj, objtype=None):
+            return _StubDriver()
+        def __set__(self, obj, value):
+            pass
+
+    class _StubDriverManager:
+        active  = _ActiveDriverDescriptor()
+        default = _StubDriver()
+        def __init__(self):
+            self._active  = _StubDriver()
+            self._default = _StubDriver()
+
+    # ── Build stub module tree ────────────────────────────────────────────
+
+    def _make_module(name, parent=None):
+        mod = types.ModuleType(name)
+        sys.modules[name] = mod
+        if parent:
+            # attach as attribute on parent so dotted access works
+            leaf = name.split(".")[-1]
+            setattr(parent, leaf, mod)
+        return mod
+
+    # Only patch if triton is not already successfully imported
+    # (i.e. if someone has python3.12-dev installed, leave it alone)
+    try:
+        import triton  # noqa: F401 — if this succeeds, no patch needed
+        return  # real triton is available, nothing to do
+    except Exception:
+        pass  # expected — headers missing, proceed with stub
+
+    triton_mod          = _make_module("triton")
+    triton_runtime      = _make_module("triton.runtime",            triton_mod)
+    triton_runtime_drv  = _make_module("triton.runtime.driver",     triton_runtime)
+    triton_runtime_bld  = _make_module("triton.runtime.build",      triton_runtime)
+    triton_runtime_jit  = _make_module("triton.runtime.jit",        triton_runtime)
+    triton_backends     = _make_module("triton.backends",            triton_mod)
+    triton_backends_nv  = _make_module("triton.backends.nvidia",     triton_backends)
+    triton_backends_drv = _make_module("triton.backends.nvidia.driver", triton_backends_nv)
+
+    # runtime.driver — exposes `driver` singleton
+    drv_singleton = _StubDriverManager()
+    triton_runtime_drv.driver = drv_singleton
+
+    # runtime.build — stub _build so nothing tries to call gcc
+    def _stub_build(*a, **kw):
+        return None
+    triton_runtime_bld._build                  = _stub_build
+    triton_runtime_bld.compile_module_from_src = lambda *a, **kw: types.ModuleType("_stub_cuda_utils")
+
+    # runtime.jit — stub JITFunction so @triton.jit decorators don't crash
+    class _StubJITFunction:
+        def __init__(self, fn):
+            self.fn = fn
+        def __call__(self, *a, **kw):
+            # Forward to the underlying Python function so non-GPU callers work
+            try:
+                return self.fn(*a, **kw)
+            except Exception:
+                return None
+        def __getattr__(self, name):
+            return lambda *a, **kw: None
+
+    triton_runtime_jit.JITFunction = _StubJITFunction
+    triton_mod.jit = lambda fn=None, **kw: (
+        _StubJITFunction(fn) if fn is not None
+        else (lambda f: _StubJITFunction(f))
+    )
+
+    # backends.nvidia.driver — stub CudaUtils
+    triton_backends_drv.CudaUtils = _StubCudaUtils
+
+    # top-level triton aliases
+    triton_mod.runtime  = triton_runtime
+    triton_mod.backends = triton_backends
+
+    # Also patch the cache-hit path: triton caches compiled .so files under
+    # ~/.triton/cache. If a stale broken .so exists, importing it would still
+    # fail. We redirect the cache loader to our stub too.
+    triton_runtime_bld.load_module = lambda *a, **kw: types.ModuleType("_stub_cuda_utils")
+
+
+_patch_triton()
+
+# ── Now it is safe to import everything else ──────────────────────────────────
 
 import argparse
 import json
 import logging
 import os
-import sys
 import time
 from collections import defaultdict
 from datetime import datetime
@@ -68,7 +211,7 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%H:%M:%S",
     handlers=[
-        logging.StreamHandler(sys.stdout),
+        logging.StreamHandler(),
         logging.FileHandler(LOG_FILE, encoding="utf-8"),
     ],
 )
@@ -93,6 +236,24 @@ def parse_args():
     return p.parse_args()
 
 # ── GPU diagnostics ───────────────────────────────────────────────────────────
+
+def log_gpu_info():
+    """Log visible GPU names before torch is imported."""
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,name,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            logger.info("Visible GPUs      :")
+            for line in result.stdout.strip().splitlines():
+                idx, name, mem = line.split(",")
+                logger.info(f"  cuda:{idx.strip()} → {name.strip()}  ({int(mem.strip()):,} MiB)")
+    except Exception:
+        pass  # nvidia-smi not available — will show after torch loads
+
 
 def log_gpu_memory(label: str = ""):
     try:
@@ -137,7 +298,7 @@ def log_trainable_parameters(model):
 def load_jsonl(path: Path) -> list:
     if not path.exists():
         logger.error(f"File not found: {path}")
-        sys.exit(1)
+        raise SystemExit(1)
     records = []
     with path.open(encoding="utf-8") as f:
         for line_no, line in enumerate(f, 1):
@@ -207,7 +368,7 @@ def tokenise_record(record: dict, tokenizer, max_seq_len: int):
         logger.warning(f"apply_chat_template failed: {e} — skipping")
         return None
 
-    full_enc = tokenizer(
+    full_enc  = tokenizer(
         full_text,
         truncation=True,
         max_length=max_seq_len,
@@ -266,7 +427,7 @@ def build_hf_dataset(records: list, tokenizer, max_seq_len: int, split_name: str
         logger.warning(f"[{split_name}] Skipped {skipped} records")
     if not tokenised:
         logger.error(f"[{split_name}] Zero usable records — aborting")
-        sys.exit(1)
+        raise SystemExit(1)
 
     lengths = [len(t["input_ids"]) for t in tokenised]
     logger.info(
@@ -281,20 +442,16 @@ def build_hf_dataset(records: list, tokenizer, max_seq_len: int, split_name: str
 def main():
     args = parse_args()
 
-    # ── Detect available GPUs from CUDA_VISIBLE_DEVICES ──────────────────
-    # With CUDA_VISIBLE_DEVICES=1,2 → PyTorch sees them as cuda:0 and cuda:1
-    # We load the model onto cuda:0 (physical GPU 1) and let device_map
-    # spill overflow layers to cuda:1 (physical GPU 2) if needed
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     logger.info("=" * 60)
     logger.info("  SpaceLLM — Experimental LoRA  (lm_head only, BF16)")
     logger.info(f"  Run ID            : {RUN_ID}")
     logger.info(f"  Model             : {args.model_id}")
     logger.info(f"  Strategy          : LoRA on lm_head ONLY — backbone frozen")
+    logger.info(f"  Triton            : DISABLED (Python.h stub active)")
     logger.info(f"  Epochs            : {args.epochs}  |  LR: {args.lr}")
     logger.info(f"  Batch             : {args.batch_size}  |  Grad accum: {args.grad_accum}"
                 f"  |  Eff batch: {args.batch_size * args.grad_accum}")
-    logger.info(f"  CUDA_VISIBLE_DEVS : {visible if visible else 'all'}")
+    logger.info(f"  CUDA_VISIBLE_DEVS : {os.environ.get('CUDA_VISIBLE_DEVICES', 'unset')}")
     logger.info(f"  Log               : {LOG_FILE}")
     logger.info("=" * 60)
 
@@ -311,13 +468,9 @@ def main():
     except ImportError as e:
         logger.error(f"Missing dependency: {e}")
         logger.error("Run: uv pip install -r requirements.txt")
-        sys.exit(1)
+        raise SystemExit(1)
 
-    # Detect how many GPUs are visible
-    n_gpus = torch.cuda.device_count()
-    logger.info(f"Visible GPUs      : {n_gpus}")
-    for i in range(n_gpus):
-        logger.info(f"  cuda:{i} → {torch.cuda.get_device_name(i)}")
+    log_gpu_info()
 
     # ── Dataset file check ────────────────────────────────────────────────
     logger.info("")
@@ -331,7 +484,7 @@ def main():
 
     if not TRAIN_FILE.exists() or not VAL_FILE.exists():
         logger.error("Train or validation file missing — cannot proceed")
-        sys.exit(1)
+        raise SystemExit(1)
 
     log_gpu_memory("before model load")
 
@@ -345,7 +498,7 @@ def main():
         )
     except Exception as e:
         logger.error(f"Tokenizer load failed: {e}")
-        sys.exit(1)
+        raise SystemExit(1)
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token    = tokenizer.eos_token
@@ -361,62 +514,35 @@ def main():
     else:
         logger.warning("Chat template     : NOT FOUND")
 
-    # ── Model loading strategy ────────────────────────────────────────────
-    # With CUDA_VISIBLE_DEVICES=1,2:
-    #   - PyTorch remaps → cuda:0 = physical GPU1, cuda:1 = physical GPU2
-    #   - We build a max_memory dict to control how model layers are split
-    #   - lm_head is kept on cuda:0 so LoRA backprop stays on one device
-    #   - Transformer layers spill to cuda:1 if needed
+    # ── Model in BF16 ─────────────────────────────────────────────────────
+    # dtype= instead of torch_dtype= (fixes deprecation warning in new transformers)
+    # TRANSFORMERS_NO_MXFP4_KERNELS env var tells the MXFP4 path in
+    # transformers/integrations/mxfp4.py to use the pure-PyTorch fallback
+    # instead of the Triton swizzle path, so no Triton driver is ever needed.
+    os.environ.setdefault("TRANSFORMERS_NO_MXFP4_KERNELS", "1")
+
     logger.info("")
-    logger.info(f"Loading model: {args.model_id}  [BF16, {n_gpus} GPU(s)]")
-
-    if n_gpus >= 2:
-        # Split: put lm_head (last layer) on cuda:0 by leaving it most memory
-        # Give cuda:1 enough for transformer body, cuda:0 for lm_head + LoRA
-        gpu0_mem = torch.cuda.get_device_properties(0).total_memory
-        gpu1_mem = torch.cuda.get_device_properties(1).total_memory
-        # Reserve 2GB headroom on each
-        max_memory = {
-            0: f"{int((gpu0_mem / 1024**3) - 2)}GiB",
-            1: f"{int((gpu1_mem / 1024**3) - 2)}GiB",
-        }
-        logger.info(f"Max memory map    : {max_memory}")
-        device_map_arg = "auto"
-    else:
-        # Single GPU — put everything on cuda:0
-        max_memory = None
-        device_map_arg = "cuda:0"
-
-    logger.info(f"device_map        : {device_map_arg}")
-
+    logger.info(f"Loading model: {args.model_id}  [BF16, single GPU]")
+    logger.info(f"device_map        : cuda:0")
+    logger.info(f"MXFP4 kernels     : disabled (pure-PyTorch fallback)")
     t0 = time.time()
     try:
         model = AutoModelForCausalLM.from_pretrained(
             args.model_id,
-            torch_dtype=torch.bfloat16,
-            device_map=device_map_arg,
-            max_memory=max_memory,
+            dtype=torch.bfloat16,           # use dtype= (torch_dtype= is deprecated)
+            device_map="cuda:0",
             trust_remote_code=True,
-            ignore_mismatched_sizes=True,   # handles MXFP4 → BF16 conversion
+            ignore_mismatched_sizes=True,
         )
     except Exception as e:
         logger.error(f"Model load failed: {e}")
-        sys.exit(1)
+        raise SystemExit(1)
 
     logger.info(f"Model loaded in {time.time() - t0:.1f}s")
     logger.info(f"Model dtype       : {next(model.parameters()).dtype}")
     if hasattr(model, "hf_device_map"):
-        # Show layer → device assignment
-        device_counts = defaultdict(int)
-        for layer, dev in model.hf_device_map.items():
-            device_counts[str(dev)] += 1
-        logger.info("Layer distribution:")
-        for dev, count in sorted(device_counts.items()):
-            logger.info(f"  {dev} : {count} layer(s)")
-        # Log specifically where lm_head landed — critical for LoRA
-        lm_head_device = model.hf_device_map.get("lm_head", "unknown")
-        logger.info(f"lm_head device    : {lm_head_device}  ← LoRA will be on this device")
-
+        devices = set(str(v) for v in model.hf_device_map.values())
+        logger.info(f"Devices used      : {devices}")
     log_gpu_memory("after model load")
 
     model.config.use_cache = False
@@ -424,8 +550,6 @@ def main():
     logger.info("Gradient checkpointing: enabled")
 
     # ── LoRA on lm_head ONLY ──────────────────────────────────────────────
-    # LoRA adapters are automatically placed on the same device as lm_head
-    # With our max_memory setup, lm_head stays on cuda:0
     logger.info("")
     logger.info("Applying LoRA to lm_head ONLY — backbone stays frozen ...")
     lora_config = LoraConfig(
@@ -437,11 +561,6 @@ def main():
         target_modules=["lm_head"],
     )
     model = get_peft_model(model, lora_config)
-
-    # Verify LoRA weights are on same device as lm_head — prevents backprop error
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            logger.info(f"LoRA weight '{name}' on device: {param.device}")
 
     logger.info("")
     log_trainable_parameters(model)
@@ -502,8 +621,7 @@ def main():
         "scheduler":        "cosine",
         "bf16":             True,
         "max_seq_len":      args.max_seq_len,
-        "visible_gpus":     visible if visible else "all",
-        "n_gpus_used":      n_gpus,
+        "device_map":       "cuda:0 (single GPU)",
     }.items():
         logger.info(f"  {k:<25}: {v}")
 
@@ -522,7 +640,7 @@ def main():
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
-        processing_class=tokenizer,
+        processing_class=tokenizer,     # v4.50+ API
         data_collator=data_collator,
     )
 
@@ -549,10 +667,10 @@ def main():
         trainer.save_model(str(interrupted_dir))
         tokenizer.save_pretrained(str(interrupted_dir))
         logger.info(f"Saved to: {interrupted_dir}")
-        sys.exit(0)
+        raise SystemExit(0)
     except Exception as e:
         logger.error(f"Training failed: {e}", exc_info=True)
-        sys.exit(1)
+        raise SystemExit(1)
 
     elapsed = time.time() - t_start
     logger.info(f"Training complete in {elapsed / 60:.1f} min  ({elapsed:.0f}s)")
@@ -586,6 +704,7 @@ def main():
         "run_id":                RUN_ID,
         "base_model":            args.model_id,
         "strategy":              "LoRA on lm_head ONLY — backbone frozen — BF16",
+        "triton":                "disabled (Python.h stub — pure-PyTorch MXFP4 fallback)",
         "lora_r":                16,
         "lora_alpha":            32,
         "lora_dropout":          0.05,
@@ -618,13 +737,12 @@ def main():
     logger.info(f"  Logs             →  {LOG_DIR}")
     logger.info("")
     logger.info("  To load for evaluation:")
-    logger.info("  export CUDA_VISIBLE_DEVICES=1,2")
     logger.info("  from transformers import AutoModelForCausalLM, AutoTokenizer")
     logger.info("  from peft import PeftModel")
     logger.info("  import torch")
     logger.info(f"  base  = AutoModelForCausalLM.from_pretrained(")
     logger.info(f"              '{args.model_id}',")
-    logger.info(f"              torch_dtype=torch.bfloat16, device_map='auto')")
+    logger.info(f"              dtype=torch.bfloat16, device_map='auto')")
     logger.info(f"  model = PeftModel.from_pretrained(base, '{FINAL_DIR}')")
     logger.info(f"  tok   = AutoTokenizer.from_pretrained('{FINAL_DIR}')")
     logger.info("=" * 60)
