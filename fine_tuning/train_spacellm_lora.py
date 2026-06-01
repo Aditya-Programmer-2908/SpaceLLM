@@ -23,7 +23,7 @@ To load after training:
     base  = AutoModelForCausalLM.from_pretrained(
                 "openai/gpt-oss-20b",
                 torch_dtype=torch.bfloat16,
-                device_map="auto")
+                device_map="cuda:0")
     model = PeftModel.from_pretrained(base, "./outputs/spacellm_lora_final")
     tok   = AutoTokenizer.from_pretrained("./outputs/spacellm_lora_final")
 """
@@ -31,6 +31,7 @@ To load after training:
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 from collections import defaultdict
@@ -185,7 +186,6 @@ IGNORE_INDEX = -100
 def tokenise_record(record: dict, tokenizer, max_seq_len: int):
     messages = record.get("messages", [])
 
-    # Map 'developer' → 'system' for gpt-oss chat template
     hf_messages = []
     for msg in messages:
         role    = "system" if msg["role"] == "developer" else msg["role"]
@@ -196,7 +196,6 @@ def tokenise_record(record: dict, tokenizer, max_seq_len: int):
     if not hf_messages:
         return None
 
-    # Full conversation
     try:
         full_text = tokenizer.apply_chat_template(
             hf_messages,
@@ -219,7 +218,6 @@ def tokenise_record(record: dict, tokenizer, max_seq_len: int):
     if len(input_ids) < 4:
         return None
 
-    # Prefix (system + user) to locate assistant boundary
     prefix_msgs = [m for m in hf_messages if m["role"] != "assistant"]
     try:
         prefix_text = tokenizer.apply_chat_template(
@@ -239,7 +237,6 @@ def tokenise_record(record: dict, tokenizer, max_seq_len: int):
     )
     prefix_len = len(prefix_enc["input_ids"])
 
-    # Mask prefix — loss only on assistant tokens
     labels = [IGNORE_INDEX] * prefix_len + input_ids[prefix_len:]
     labels = labels[:len(input_ids)]
 
@@ -352,19 +349,19 @@ def main():
         logger.warning("Chat template    : NOT FOUND")
 
     # ── Model in BF16 ─────────────────────────────────────────────────────
-    # ignore_mismatched_sizes=True  → handles MXFP4 quantized weight conversion
-    # device_map="auto"             → splits across GPUs automatically
-    # Do NOT use torchrun           → incompatible with MoE + device_map
+    # KEY FIX: device_map="cuda:0" forces ALL layers onto one GPU
+    # This prevents the meta/cuda device split that breaks LoRA backprop
+    # CUDA_VISIBLE_DEVICES=1 means physical GPU1 is seen as cuda:0 here
     logger.info("")
-    logger.info(f"Loading model: {args.model_id}  [BF16, device_map=auto]")
+    logger.info(f"Loading model: {args.model_id}  [BF16, single GPU]")
     t0 = time.time()
     try:
         model = AutoModelForCausalLM.from_pretrained(
             args.model_id,
             torch_dtype=torch.bfloat16,
-            device_map="auto",
+            device_map="cuda:0",            # force all layers onto one GPU
             trust_remote_code=True,
-            ignore_mismatched_sizes=True,
+            ignore_mismatched_sizes=True,   # handles MXFP4 → BF16 conversion
         )
     except Exception as e:
         logger.error(f"Model load failed: {e}")
@@ -413,11 +410,6 @@ def main():
     val_dataset   = build_hf_dataset(val_records,   tokenizer, args.max_seq_len, "validation")
 
     # ── Training arguments ────────────────────────────────────────────────
-    # Removed deprecated args:
-    #   warmup_ratio      → warmup_steps
-    #   logging_dir       → removed (use TENSORBOARD_LOGGING_DIR if needed)
-    #   group_by_length   → removed in new transformers
-    #   ddp_find_unused_parameters → removed (not using DDP)
     logger.info("")
     logger.info("── Training configuration ───────────────────────────")
     training_args = TrainingArguments(
@@ -428,11 +420,11 @@ def main():
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
         lr_scheduler_type="cosine",
-        warmup_steps=args.warmup_steps,         # warmup_ratio removed in v5.2
+        warmup_steps=args.warmup_steps,
         optim="adamw_torch",
         bf16=True,
         fp16=False,
-        eval_strategy="steps",                  # evaluation_strategy removed
+        eval_strategy="steps",
         eval_steps=args.eval_steps,
         save_strategy="steps",
         save_steps=args.save_steps,
@@ -458,14 +450,13 @@ def main():
         "scheduler":        "cosine",
         "bf16":             True,
         "max_seq_len":      args.max_seq_len,
-        "multi_gpu":        "device_map=auto",
+        "device_map":       "cuda:0 (single GPU)",
     }.items():
         logger.info(f"  {k:<25}: {v}")
 
     # ── Data collator ─────────────────────────────────────────────────────
-    # DataCollatorForSeq2Seq still uses tokenizer= (not processing_class)
     data_collator = DataCollatorForSeq2Seq(
-        tokenizer=tokenizer,
+        tokenizer=tokenizer,            # DataCollatorForSeq2Seq uses tokenizer=
         model=model,
         padding=True,
         pad_to_multiple_of=8,
@@ -473,13 +464,12 @@ def main():
     )
 
     # ── Trainer ───────────────────────────────────────────────────────────
-    # Trainer uses processing_class= (tokenizer= removed in new transformers)
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
-        processing_class=tokenizer,             # tokenizer= removed in v4.50+
+        processing_class=tokenizer,     # Trainer uses processing_class= (v4.50+)
         data_collator=data_collator,
     )
 
