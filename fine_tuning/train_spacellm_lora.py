@@ -404,18 +404,6 @@ def tokenise_record(record: dict, tokenizer, max_seq_len: int):
     if all(lbl == IGNORE_INDEX for lbl in labels):
         return None
 
-    # Use model.config.vocab_size — NOT tokenizer.vocab_size.
-    # tokenizer.vocab_size excludes added special tokens; model.config.vocab_size
-    # reflects the actual embedding table size after resize_token_embeddings.
-    # Any label outside [0, model_vocab) crashes the CUDA cross-entropy kernel.
-    model_vocab = tokenizer.model_vocab_size  # injected after resize below
-    labels = [
-        lbl if lbl == IGNORE_INDEX else (
-            lbl if 0 <= lbl < model_vocab else IGNORE_INDEX
-        )
-        for lbl in labels
-    ]
-
     if all(lbl == IGNORE_INDEX for lbl in labels):
         return None
 
@@ -444,10 +432,17 @@ def build_hf_dataset(records: list, tokenizer, max_seq_len: int, split_name: str
         raise SystemExit(1)
 
     lengths = [len(t["input_ids"]) for t in tokenised]
+    # Debug: log max token ID seen so we can confirm nothing exceeds model vocab
+    max_input_id = max(max(t["input_ids"]) for t in tokenised)
+    max_label_id = max(
+        max((lbl for lbl in t["labels"] if lbl != IGNORE_INDEX), default=0)
+        for t in tokenised
+    )
     logger.info(
         f"[{split_name}] {len(tokenised):,} records | "
         f"seq len  min={min(lengths)}  max={max(lengths)}  "
-        f"mean={sum(lengths)/len(lengths):.0f}"
+        f"mean={sum(lengths)/len(lengths):.0f} | "
+        f"max_input_id={max_input_id}  max_label_id={max_label_id}"
     )
     return Dataset.from_list(tokenised)
 
@@ -558,24 +553,6 @@ def main():
     logger.info(f"Model loaded + dequantized on CPU in {time.time() - t0:.1f}s")
     logger.info(f"Model dtype       : {next(model.parameters()).dtype}")
 
-    # ── Align tokenizer and model vocab ──────────────────────────────────
-    # tokenizer.vocab_size = base vocab (no special tokens).
-    # len(tokenizer)       = full vocab including all added special tokens.
-    # model.config.vocab_size = embedding table size.
-    # If these disagree the cross-entropy loss crashes in CUDA when it
-    # sees a label ID >= embedding table rows. resize_token_embeddings
-    # expands (or contracts) the embedding + lm_head to match exactly.
-    tok_len = len(tokenizer)
-    if tok_len != model.config.vocab_size:
-        logger.warning(
-            f"Tokenizer length ({tok_len:,}) != model vocab "
-            f"({model.config.vocab_size:,}) — resizing embeddings"
-        )
-        model.resize_token_embeddings(tok_len)
-        logger.info(f"Embeddings resized to {tok_len:,}")
-    else:
-        logger.info(f"Vocab aligned: tokenizer={tok_len:,} == model={model.config.vocab_size:,}")
-
     # Move to GPU(s) after dequantization is complete.
     # accelerate's dispatch_model shards layers across all visible GPUs
     # using a balanced memory map — avoids the cudaErrorIllegalAddress
@@ -660,10 +637,22 @@ def main():
     log_gpu_memory("after LoRA init")
 
     # ── Datasets ──────────────────────────────────────────────────────────
-    # Inject the true model vocab size onto the tokenizer object so
-    # tokenise_record() can access it without receiving model as an arg.
-    tokenizer.model_vocab_size = model.config.vocab_size
-    logger.info(f"model_vocab_size injected : {tokenizer.model_vocab_size:,}")
+    # ── Vocab alignment diagnostic ───────────────────────────────────────
+    # config.vocab_size=201,088 > all token IDs — NO resize needed.
+    # Log all relevant sizes so we can confirm alignment.
+    logger.info("")
+    logger.info("── Vocab alignment ──────────────────────────────────")
+    logger.info(f"  tokenizer.vocab_size : {tokenizer.vocab_size:,}  (base, no special tokens)")
+    logger.info(f"  len(tokenizer)       : {len(tokenizer):,}  (base + added special tokens)")
+    logger.info(f"  model.config.vocab   : {model.config.vocab_size:,}  (embedding table size)")
+    logger.info(f"  pad_token_id         : {tokenizer.pad_token_id}")
+    logger.info(f"  eos_token_id         : {tokenizer.eos_token_id}")
+    logger.info(f"  bos_token_id         : {tokenizer.bos_token_id}")
+    assert len(tokenizer) <= model.config.vocab_size, (
+        f"FATAL: len(tokenizer)={len(tokenizer)} > model vocab={model.config.vocab_size}. "
+        f"Call model.resize_token_embeddings(len(tokenizer)) to fix."
+    )
+    logger.info("  Vocab check PASSED: all token IDs within model embedding table")
 
     logger.info("")
     logger.info("── Loading datasets ─────────────────────────────────")
