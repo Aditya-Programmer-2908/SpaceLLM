@@ -619,48 +619,27 @@ def main():
     model.gradient_checkpointing_enable()
     logger.info("Gradient checkpointing: enabled")
 
-    # ====================== STRONGER FIX FOR gpt-oss-20b ======================
+    # ====================== FINAL STRONG FIX FOR gpt-oss-20b ======================
     logger.info("")
     logger.info("── Strong Vocab & lm_head Fix ───────────────────────")
     
-    logger.info(f"Before - lm_head: {model.get_output_embeddings().weight.shape}")
-    logger.info(f"Tokenizer len : {len(tokenizer):,}")
-    logger.info(f"Old config vocab: {model.config.vocab_size:,}")
+    logger.info(f"Before - lm_head shape: {model.get_output_embeddings().weight.shape}")
+    logger.info(f"Tokenizer length      : {len(tokenizer):,}")
+    logger.info(f"Old config vocab_size : {model.config.vocab_size:,}")
 
-    # Force everything to match tokenizer
+    # Core fixes
     model.config.tie_word_embeddings = False
     model.config.vocab_size = len(tokenizer)
-    
-    # Resize embeddings
     model.resize_token_embeddings(len(tokenizer))
-    
-    # Extra: Force lm_head to match exactly
-    if hasattr(model, "lm_head"):
-        model.lm_head.weight = torch.nn.Parameter(
-            model.lm_head.weight.data[:len(tokenizer)]
-        )
-    elif hasattr(model, "base_model") and hasattr(model.base_model.model, "lm_head"):
-        lm_head = model.base_model.model.lm_head
-        if lm_head.weight.shape[0] != len(tokenizer):
-            logger.info("Manually resizing lm_head after PEFT...")
-            # This is a bit hacky but often needed with PEFT + custom models
-            new_lm_head = torch.nn.Linear(
-                lm_head.in_features, 
-                len(tokenizer), 
-                bias=lm_head.bias is not None
-            ).to(lm_head.weight.device, lm_head.weight.dtype)
-            new_lm_head.weight.data = lm_head.weight.data[:len(tokenizer)]
-            if lm_head.bias is not None:
-                new_lm_head.bias.data = lm_head.bias.data[:len(tokenizer)]
-            model.base_model.model.lm_head = new_lm_head
 
-    logger.info(f"After fix - lm_head: {model.get_output_embeddings().weight.shape}")
-    logger.info(f"Final config vocab_size: {model.config.vocab_size:,}")
-    # =========================================================================
-    # ======================================================================
+    logger.info(f"After resize - lm_head shape: {model.get_output_embeddings().weight.shape}")
+
+    # === CRITICAL: Disable custom loss function ===
+    if hasattr(model, "base_model") and hasattr(model.base_model.model, "loss_function"):
+        model.base_model.model.loss_function = None
+        logger.info("✅ Disabled custom gpt_oss loss_function (using standard HF loss)")
 
     # ── LoRA on lm_head ONLY ──────────────────────────────────────────────
-        # ── LoRA on lm_head ONLY ──────────────────────────────────────────────
     logger.info("")
     logger.info("Applying LoRA to lm_head ONLY — backbone stays frozen ...")
     
@@ -675,14 +654,14 @@ def main():
     )
     model = get_peft_model(model, lora_config)
 
-    # Ensure lm_head size is correct after LoRA
+    # Final check
     if hasattr(model, "base_model") and hasattr(model.base_model.model, "lm_head"):
         logger.info(f"Final lm_head shape after LoRA: {model.base_model.model.lm_head.weight.shape}")
 
     logger.info("")
     log_trainable_parameters(model)
     log_gpu_memory("after LoRA init")
-
+    # =========================================================================
     # ── Datasets ──────────────────────────────────────────────────────────
     # ── Vocab alignment diagnostic ───────────────────────────────────────
     # config.vocab_size=201,088 > all token IDs — NO resize needed.
@@ -770,7 +749,7 @@ def main():
         label_pad_token_id=IGNORE_INDEX,
     )
 
-        # ── Final Forward Sanity Check (Very Important) ─────────────────────
+    """    # ── Final Forward Sanity Check (Very Important) ─────────────────────
     logger.info("")
     logger.info("── Final Forward Sanity Check ───────────────────────")
     try:
@@ -792,7 +771,7 @@ def main():
             if logits_shape[-1] != model.config.vocab_size:
                 logger.error(f"CRITICAL MISMATCH: logits vocab={logits_shape[-1]}, config={model.config.vocab_size}")
     except Exception as e:
-        logger.warning(f"Sanity check failed: {e}")
+        logger.warning(f"Sanity check failed: {e}") """
     # =====================================================================
 
     # ── Trainer ───────────────────────────────────────────────────────────
