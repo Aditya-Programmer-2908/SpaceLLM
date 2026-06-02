@@ -634,10 +634,37 @@ def main():
 
     logger.info(f"After resize - lm_head shape: {model.get_output_embeddings().weight.shape}")
 
-    # === CRITICAL: Disable custom loss function ===
-    if hasattr(model, "base_model") and hasattr(model.base_model.model, "loss_function"):
-        model.base_model.model.loss_function = None
-        logger.info("✅ Disabled custom gpt_oss loss_function (using standard HF loss)")
+    # === CRITICAL: Disable custom loss function (robust version) ===
+    disabled = False
+    # Try different possible paths where the loss_function might live
+    for attr_path in [
+        (model, "loss_function"),
+        (model, "base_model", "loss_function"),
+        (model, "base_model", "model", "loss_function"),
+        (getattr(model, "base_model", None), "model", "loss_function"),
+    ]:
+        try:
+            if len(attr_path) == 2:
+                obj, name = attr_path
+                if hasattr(obj, name):
+                    setattr(obj, name, None)
+                    disabled = True
+                    logger.info("✅ Disabled custom gpt_oss loss_function")
+                    break
+            elif len(attr_path) == 3:
+                obj1, name1, name2 = attr_path
+                if hasattr(obj1, name1):
+                    obj2 = getattr(obj1, name1)
+                    if hasattr(obj2, name2):
+                        setattr(obj2, name2, None)
+                        disabled = True
+                        logger.info("✅ Disabled custom gpt_oss loss_function")
+                        break
+        except:
+            continue
+
+    if not disabled:
+        logger.warning("Could not find custom loss_function to disable")
 
     # ── LoRA on lm_head ONLY ──────────────────────────────────────────────
     logger.info("")
@@ -655,12 +682,16 @@ def main():
     model = get_peft_model(model, lora_config)
 
     # Final check
-    if hasattr(model, "base_model") and hasattr(model.base_model.model, "lm_head"):
-        logger.info(f"Final lm_head shape after LoRA: {model.base_model.model.lm_head.weight.shape}")
+    try:
+        lm_head = model.get_output_embeddings()
+        logger.info(f"Final lm_head shape after LoRA: {lm_head.weight.shape}")
+    except:
+        logger.info("Could not inspect final lm_head shape")
 
     logger.info("")
     log_trainable_parameters(model)
     log_gpu_memory("after LoRA init")
+    # =========================================================================
     # =========================================================================
     # ── Datasets ──────────────────────────────────────────────────────────
     # ── Vocab alignment diagnostic ───────────────────────────────────────
