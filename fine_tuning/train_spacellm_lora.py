@@ -6,11 +6,9 @@ Phase     : Experimentation
 Strategy  : Freeze full transformer backbone, apply LoRA ONLY to lm_head
 Method    : Standard BF16 LoRA — NOT QLoRA, no bitsandbytes
 
-Triton     : DISABLED — patched out before any import fires.
-             This prevents the Python.h / gcc JIT-compile error that occurs
-             when python3.12-dev headers are not installed on the system.
-             The MXFP4 → BF16 weight conversion falls back to the pure-PyTorch
-             path inside transformers/integrations/mxfp4.py automatically.
+Triton     : Available (python3.12-dev installed).
+             MXFP4 weights are dequantized to BF16 via Mxfp4Config(dequantize=True)
+             so the model is fully training-compatible.
 
 Launch:
     export CUDA_VISIBLE_DEVICES=1
@@ -28,7 +26,7 @@ To load after training:
     import torch
     base  = AutoModelForCausalLM.from_pretrained(
                 "openai/gpt-oss-20b",
-                dtype=torch.bfloat16,
+                quantization_config=Mxfp4Config(dequantize=True),
                 device_map="cuda:0")
     model = PeftModel.from_pretrained(base, "./outputs/spacellm_lora_final")
     tok   = AutoTokenizer.from_pretrained("./outputs/spacellm_lora_final")
@@ -447,7 +445,7 @@ def main():
     logger.info(f"  Run ID            : {RUN_ID}")
     logger.info(f"  Model             : {args.model_id}")
     logger.info(f"  Strategy          : LoRA on lm_head ONLY — backbone frozen")
-    logger.info(f"  Triton            : DISABLED (Python.h stub active)")
+    logger.info(f"  Quantization      : Mxfp4Config(dequantize=True)  →  plain BF16")
     logger.info(f"  Epochs            : {args.epochs}  |  LR: {args.lr}")
     logger.info(f"  Batch             : {args.batch_size}  |  Grad accum: {args.grad_accum}"
                 f"  |  Eff batch: {args.batch_size * args.grad_accum}")
@@ -463,6 +461,7 @@ def main():
             TrainingArguments,
             DataCollatorForSeq2Seq,
             Trainer,
+            Mxfp4Config,
         )
         from peft import LoraConfig, TaskType, get_peft_model
     except ImportError as e:
@@ -514,22 +513,23 @@ def main():
     else:
         logger.warning("Chat template     : NOT FOUND")
 
-    # ── Model in BF16 ─────────────────────────────────────────────────────
-    # dtype= instead of torch_dtype= (fixes deprecation warning in new transformers)
-    # TRANSFORMERS_NO_MXFP4_KERNELS env var tells the MXFP4 path in
-    # transformers/integrations/mxfp4.py to use the pure-PyTorch fallback
-    # instead of the Triton swizzle path, so no Triton driver is ever needed.
-    os.environ.setdefault("TRANSFORMERS_NO_MXFP4_KERNELS", "1")
-
+    # ── Model — dequantize MXFP4 → BF16 on load ──────────────────────────
+    # The checkpoint is MXFP4-quantized. Trainer rejects quantized models
+    # outright ("MXFP4 don't support training"). Passing dequantize=True
+    # converts every MXFP4 weight shard to plain BF16 during loading so the
+    # model lands in memory with no quantization config attached — making it
+    # fully compatible with Trainer and standard LoRA backprop.
+    # NOTE: do NOT set dtype= alongside quantization_config; Mxfp4Config
+    # controls the output dtype internally and the two args conflict.
     logger.info("")
-    logger.info(f"Loading model: {args.model_id}  [BF16, single GPU]")
+    logger.info(f"Loading model: {args.model_id}  [MXFP4 → BF16 dequantize, single GPU]")
     logger.info(f"device_map        : cuda:0")
-    logger.info(f"MXFP4 kernels     : disabled (pure-PyTorch fallback)")
+    logger.info(f"quantization      : Mxfp4Config(dequantize=True)  →  plain BF16")
     t0 = time.time()
     try:
         model = AutoModelForCausalLM.from_pretrained(
             args.model_id,
-            dtype=torch.bfloat16,           # use dtype= (torch_dtype= is deprecated)
+            quantization_config=Mxfp4Config(dequantize=True),
             device_map="cuda:0",
             trust_remote_code=True,
             ignore_mismatched_sizes=True,
@@ -742,7 +742,7 @@ def main():
     logger.info("  import torch")
     logger.info(f"  base  = AutoModelForCausalLM.from_pretrained(")
     logger.info(f"              '{args.model_id}',")
-    logger.info(f"              dtype=torch.bfloat16, device_map='auto')")
+    logger.info(f"              quantization_config=Mxfp4Config(dequantize=True), device_map='auto')")
     logger.info(f"  model = PeftModel.from_pretrained(base, '{FINAL_DIR}')")
     logger.info(f"  tok   = AutoTokenizer.from_pretrained('{FINAL_DIR}')")
     logger.info("=" * 60)
