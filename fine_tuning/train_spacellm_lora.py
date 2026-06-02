@@ -11,7 +11,7 @@ Triton     : Available (python3.12-dev installed).
              so the model is fully training-compatible.
 
 Launch:
-    export CUDA_VISIBLE_DEVICES=1
+    export CUDA_VISIBLE_DEVICES=0,1,2   # all three GPUs
     python fine_tuning/train_spacellm_lora.py
 
 Output layout:
@@ -27,7 +27,7 @@ To load after training:
     base  = AutoModelForCausalLM.from_pretrained(
                 "openai/gpt-oss-20b",
                 quantization_config=Mxfp4Config(dequantize=True),
-                device_map="cuda:0")
+                device_map="auto")
     model = PeftModel.from_pretrained(base, "./outputs/spacellm_lora_final")
     tok   = AutoTokenizer.from_pretrained("./outputs/spacellm_lora_final")
 """
@@ -522,15 +522,15 @@ def main():
     # NOTE: do NOT set dtype= alongside quantization_config; Mxfp4Config
     # controls the output dtype internally and the two args conflict.
     logger.info("")
-    logger.info(f"Loading model: {args.model_id}  [MXFP4 → BF16 dequantize, single GPU]")
-    logger.info(f"device_map        : cuda:0")
+    logger.info(f"Loading model: {args.model_id}  [MXFP4 → BF16 dequantize, multi-GPU]")
+    logger.info(f"device_map        : auto (layers sharded across all visible GPUs)")
     logger.info(f"quantization      : Mxfp4Config(dequantize=True)  →  plain BF16")
     t0 = time.time()
     try:
         model = AutoModelForCausalLM.from_pretrained(
             args.model_id,
             quantization_config=Mxfp4Config(dequantize=True),
-            device_map="cuda:0",
+            device_map="auto",
             trust_remote_code=True,
             ignore_mismatched_sizes=True,
         )
@@ -621,7 +621,7 @@ def main():
         "scheduler":        "cosine",
         "bf16":             True,
         "max_seq_len":      args.max_seq_len,
-        "device_map":       "cuda:0 (single GPU)",
+        "device_map":       "auto (multi-GPU)",
     }.items():
         logger.info(f"  {k:<25}: {v}")
 
@@ -704,7 +704,7 @@ def main():
         "run_id":                RUN_ID,
         "base_model":            args.model_id,
         "strategy":              "LoRA on lm_head ONLY — backbone frozen — BF16",
-        "triton":                "disabled (Python.h stub — pure-PyTorch MXFP4 fallback)",
+        "triton":                "available (python3.12-dev installed)",
         "lora_r":                16,
         "lora_alpha":            32,
         "lora_dropout":          0.05,
