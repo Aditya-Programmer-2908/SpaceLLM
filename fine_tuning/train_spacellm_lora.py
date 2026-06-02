@@ -404,13 +404,15 @@ def tokenise_record(record: dict, tokenizer, max_seq_len: int):
     if all(lbl == IGNORE_INDEX for lbl in labels):
         return None
 
-    # Belt-and-suspenders: mask any label token ID that is outside the
-    # model vocab range to IGNORE_INDEX so cross-entropy never sees it.
-    # This catches pad_token_id, bos_token_id, or any special token that
-    # sits beyond vocab_size in the tokenizer's extended vocabulary.
-    vocab_size = tokenizer.vocab_size
+    # Use model.config.vocab_size — NOT tokenizer.vocab_size.
+    # tokenizer.vocab_size excludes added special tokens; model.config.vocab_size
+    # reflects the actual embedding table size after resize_token_embeddings.
+    # Any label outside [0, model_vocab) crashes the CUDA cross-entropy kernel.
+    model_vocab = tokenizer.model_vocab_size  # injected after resize below
     labels = [
-        lbl if (lbl == IGNORE_INDEX or 0 <= lbl < vocab_size) else IGNORE_INDEX
+        lbl if lbl == IGNORE_INDEX else (
+            lbl if 0 <= lbl < model_vocab else IGNORE_INDEX
+        )
         for lbl in labels
     ]
 
@@ -518,16 +520,6 @@ def main():
         tokenizer.pad_token_id = tokenizer.eos_token_id
         logger.info("pad_token set to eos_token")
 
-    # Critical: pad_token_id must be within [0, vocab_size) otherwise it
-    # leaks into labels and triggers nll_loss out-of-range CUDA assertions.
-    # This model has vocab_size=199998 but pad_token_id=199999 — clamp it.
-    if tokenizer.pad_token_id >= tokenizer.vocab_size:
-        safe_pad_id = tokenizer.vocab_size - 1
-        logger.warning(
-            f"pad_token_id={tokenizer.pad_token_id} is outside vocab "
-            f"(vocab_size={tokenizer.vocab_size}) — clamping to {safe_pad_id}"
-        )
-        tokenizer.pad_token_id = safe_pad_id
 
     tokenizer.padding_side = "right"
     logger.info(f"Vocab size        : {tokenizer.vocab_size:,}")
@@ -565,6 +557,24 @@ def main():
 
     logger.info(f"Model loaded + dequantized on CPU in {time.time() - t0:.1f}s")
     logger.info(f"Model dtype       : {next(model.parameters()).dtype}")
+
+    # ── Align tokenizer and model vocab ──────────────────────────────────
+    # tokenizer.vocab_size = base vocab (no special tokens).
+    # len(tokenizer)       = full vocab including all added special tokens.
+    # model.config.vocab_size = embedding table size.
+    # If these disagree the cross-entropy loss crashes in CUDA when it
+    # sees a label ID >= embedding table rows. resize_token_embeddings
+    # expands (or contracts) the embedding + lm_head to match exactly.
+    tok_len = len(tokenizer)
+    if tok_len != model.config.vocab_size:
+        logger.warning(
+            f"Tokenizer length ({tok_len:,}) != model vocab "
+            f"({model.config.vocab_size:,}) — resizing embeddings"
+        )
+        model.resize_token_embeddings(tok_len)
+        logger.info(f"Embeddings resized to {tok_len:,}")
+    else:
+        logger.info(f"Vocab aligned: tokenizer={tok_len:,} == model={model.config.vocab_size:,}")
 
     # Move to GPU(s) after dequantization is complete.
     # accelerate's dispatch_model shards layers across all visible GPUs
@@ -650,6 +660,11 @@ def main():
     log_gpu_memory("after LoRA init")
 
     # ── Datasets ──────────────────────────────────────────────────────────
+    # Inject the true model vocab size onto the tokenizer object so
+    # tokenise_record() can access it without receiving model as an arg.
+    tokenizer.model_vocab_size = model.config.vocab_size
+    logger.info(f"model_vocab_size injected : {tokenizer.model_vocab_size:,}")
+
     logger.info("")
     logger.info("── Loading datasets ─────────────────────────────────")
     train_records = load_jsonl(TRAIN_FILE)
