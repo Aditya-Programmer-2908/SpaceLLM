@@ -619,21 +619,44 @@ def main():
     model.gradient_checkpointing_enable()
     logger.info("Gradient checkpointing: enabled")
 
-    # ====================== CRITICAL FIX FOR gpt-oss-20b ======================
+    # ====================== STRONGER FIX FOR gpt-oss-20b ======================
     logger.info("")
-    logger.info("── Vocab & lm_head Alignment Fix ─────────────────────")
+    logger.info("── Strong Vocab & lm_head Fix ───────────────────────")
     
-    logger.info(f"Before fix - lm_head shape: {model.get_output_embeddings().weight.shape}")
-    logger.info(f"Tokenizer length     : {len(tokenizer):,}")
-    logger.info(f"Config vocab_size    : {model.config.vocab_size:,}")
+    logger.info(f"Before - lm_head: {model.get_output_embeddings().weight.shape}")
+    logger.info(f"Tokenizer len : {len(tokenizer):,}")
+    logger.info(f"Old config vocab: {model.config.vocab_size:,}")
 
-    # This is the main fix
+    # Force everything to match tokenizer
     model.config.tie_word_embeddings = False
     model.config.vocab_size = len(tokenizer)
+    
+    # Resize embeddings
     model.resize_token_embeddings(len(tokenizer))
+    
+    # Extra: Force lm_head to match exactly
+    if hasattr(model, "lm_head"):
+        model.lm_head.weight = torch.nn.Parameter(
+            model.lm_head.weight.data[:len(tokenizer)]
+        )
+    elif hasattr(model, "base_model") and hasattr(model.base_model.model, "lm_head"):
+        lm_head = model.base_model.model.lm_head
+        if lm_head.weight.shape[0] != len(tokenizer):
+            logger.info("Manually resizing lm_head after PEFT...")
+            # This is a bit hacky but often needed with PEFT + custom models
+            new_lm_head = torch.nn.Linear(
+                lm_head.in_features, 
+                len(tokenizer), 
+                bias=lm_head.bias is not None
+            ).to(lm_head.weight.device, lm_head.weight.dtype)
+            new_lm_head.weight.data = lm_head.weight.data[:len(tokenizer)]
+            if lm_head.bias is not None:
+                new_lm_head.bias.data = lm_head.bias.data[:len(tokenizer)]
+            model.base_model.model.lm_head = new_lm_head
 
-    logger.info(f"After resize - lm_head shape: {model.get_output_embeddings().weight.shape}")
-    logger.info("✅ tie_word_embeddings disabled + embedding resized")
+    logger.info(f"After fix - lm_head: {model.get_output_embeddings().weight.shape}")
+    logger.info(f"Final config vocab_size: {model.config.vocab_size:,}")
+    # =========================================================================
     # ======================================================================
 
     # ── LoRA on lm_head ONLY ──────────────────────────────────────────────
@@ -747,15 +770,45 @@ def main():
         label_pad_token_id=IGNORE_INDEX,
     )
 
+        # ── Final Forward Sanity Check (Very Important) ─────────────────────
+    logger.info("")
+    logger.info("── Final Forward Sanity Check ───────────────────────")
+    try:
+        from torch.utils.data import DataLoader
+        small_dl = DataLoader(train_dataset.select(range(2)), batch_size=1, 
+                            collate_fn=data_collator)
+        test_batch = next(iter(small_dl))
+        test_batch = {k: v.to("cuda:0") if torch.is_tensor(v) else v 
+                     for k, v in test_batch.items()}
+
+        with torch.no_grad():
+            outputs = model(**test_batch)
+            logits_shape = outputs.logits.shape
+            max_label = test_batch["labels"].max().item()
+            logger.info(f"Logits shape       : {logits_shape}")
+            logger.info(f"Max label ID       : {max_label}")
+            logger.info(f"Config vocab_size  : {model.config.vocab_size}")
+            
+            if logits_shape[-1] != model.config.vocab_size:
+                logger.error(f"CRITICAL MISMATCH: logits vocab={logits_shape[-1]}, config={model.config.vocab_size}")
+    except Exception as e:
+        logger.warning(f"Sanity check failed: {e}")
+    # =====================================================================
+
     # ── Trainer ───────────────────────────────────────────────────────────
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
-        processing_class=tokenizer,     # v4.50+ API
+        processing_class=tokenizer,
         data_collator=data_collator,
     )
+
+    # Try to bypass custom loss
+    if hasattr(model, "base_model") and hasattr(model.base_model.model, "loss_function"):
+        model.base_model.model.loss_function = None
+        logger.info("Disabled custom loss_function from gpt_oss model")
 
     # ── Train ─────────────────────────────────────────────────────────────
     logger.info("")
