@@ -27,7 +27,8 @@ To load after training:
     base  = AutoModelForCausalLM.from_pretrained(
                 "openai/gpt-oss-20b",
                 quantization_config=Mxfp4Config(dequantize=True),
-                device_map="auto")
+                device_map="cpu")
+    model = model.to("cuda")
     model = PeftModel.from_pretrained(base, "./outputs/spacellm_lora_final")
     tok   = AutoTokenizer.from_pretrained("./outputs/spacellm_lora_final")
 """
@@ -522,15 +523,15 @@ def main():
     # NOTE: do NOT set dtype= alongside quantization_config; Mxfp4Config
     # controls the output dtype internally and the two args conflict.
     logger.info("")
-    logger.info(f"Loading model: {args.model_id}  [MXFP4 → BF16 dequantize, multi-GPU]")
-    logger.info(f"device_map        : auto (layers sharded across all visible GPUs)")
+    logger.info(f"Loading model: {args.model_id}  [MXFP4 → BF16 dequantize → GPU]")
+    logger.info(f"device_map        : cpu  (dequantize on CPU, then .to(cuda) for training)")
     logger.info(f"quantization      : Mxfp4Config(dequantize=True)  →  plain BF16")
     t0 = time.time()
     try:
         model = AutoModelForCausalLM.from_pretrained(
             args.model_id,
             quantization_config=Mxfp4Config(dequantize=True),
-            device_map="auto",
+            device_map="cpu",           # dequantize safely on CPU first
             trust_remote_code=True,
             ignore_mismatched_sizes=True,
         )
@@ -538,11 +539,33 @@ def main():
         logger.error(f"Model load failed: {e}")
         raise SystemExit(1)
 
-    logger.info(f"Model loaded in {time.time() - t0:.1f}s")
+    logger.info(f"Model loaded + dequantized on CPU in {time.time() - t0:.1f}s")
     logger.info(f"Model dtype       : {next(model.parameters()).dtype}")
+
+    # Move to GPU(s) after dequantization is complete.
+    # accelerate's dispatch_model shards layers across all visible GPUs
+    # using a balanced memory map — avoids the cudaErrorIllegalAddress
+    # that occurs when dequantization kernels run across multiple GPUs.
+    logger.info("Dispatching model across GPUs ...")
+    t1 = time.time()
+    try:
+        from accelerate import dispatch_model, infer_auto_device_map
+        device_map = infer_auto_device_map(
+            model,
+            max_memory={i: "44GiB" for i in range(torch.cuda.device_count())},
+            no_split_module_classes=["GptOssDecoderLayer"],
+        )
+        model = dispatch_model(model, device_map=device_map)
+    except Exception as e:
+        # Fallback: put everything on cuda:0 if dispatch fails
+        logger.warning(f"dispatch_model failed ({e}) — falling back to cuda:0")
+        model = model.to("cuda:0")
+    logger.info(f"GPU dispatch done in {time.time() - t1:.1f}s")
     if hasattr(model, "hf_device_map"):
-        devices = set(str(v) for v in model.hf_device_map.values())
-        logger.info(f"Devices used      : {devices}")
+        from collections import Counter
+        dev_counts = Counter(str(v) for v in model.hf_device_map.values())
+        for dev, count in sorted(dev_counts.items()):
+            logger.info(f"  {dev} : {count} layers")
     log_gpu_memory("after model load")
 
     model.config.use_cache = False
@@ -621,7 +644,7 @@ def main():
         "scheduler":        "cosine",
         "bf16":             True,
         "max_seq_len":      args.max_seq_len,
-        "device_map":       "auto (multi-GPU)",
+        "device_map":       "cpu→GPU dispatch (accelerate)",
     }.items():
         logger.info(f"  {k:<25}: {v}")
 
