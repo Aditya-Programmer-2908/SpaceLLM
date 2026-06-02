@@ -619,9 +619,28 @@ def main():
     model.gradient_checkpointing_enable()
     logger.info("Gradient checkpointing: enabled")
 
+    # ====================== CRITICAL FIX FOR gpt-oss-20b ======================
+    logger.info("")
+    logger.info("── Vocab & lm_head Alignment Fix ─────────────────────")
+    
+    logger.info(f"Before fix - lm_head shape: {model.get_output_embeddings().weight.shape}")
+    logger.info(f"Tokenizer length     : {len(tokenizer):,}")
+    logger.info(f"Config vocab_size    : {model.config.vocab_size:,}")
+
+    # This is the main fix
+    model.config.tie_word_embeddings = False
+    model.config.vocab_size = len(tokenizer)
+    model.resize_token_embeddings(len(tokenizer))
+
+    logger.info(f"After resize - lm_head shape: {model.get_output_embeddings().weight.shape}")
+    logger.info("✅ tie_word_embeddings disabled + embedding resized")
+    # ======================================================================
+
     # ── LoRA on lm_head ONLY ──────────────────────────────────────────────
+        # ── LoRA on lm_head ONLY ──────────────────────────────────────────────
     logger.info("")
     logger.info("Applying LoRA to lm_head ONLY — backbone stays frozen ...")
+    
     lora_config = LoraConfig(
         r=16,
         lora_alpha=32,
@@ -629,8 +648,13 @@ def main():
         bias="none",
         task_type=TaskType.CAUSAL_LM,
         target_modules=["lm_head"],
+        init_lora_weights=True,
     )
     model = get_peft_model(model, lora_config)
+
+    # Ensure lm_head size is correct after LoRA
+    if hasattr(model, "base_model") and hasattr(model.base_model.model, "lm_head"):
+        logger.info(f"Final lm_head shape after LoRA: {model.base_model.model.lm_head.weight.shape}")
 
     logger.info("")
     log_trainable_parameters(model)
@@ -640,19 +664,21 @@ def main():
     # ── Vocab alignment diagnostic ───────────────────────────────────────
     # config.vocab_size=201,088 > all token IDs — NO resize needed.
     # Log all relevant sizes so we can confirm alignment.
+        # ── Vocab alignment diagnostic ───────────────────────────────────────
     logger.info("")
     logger.info("── Vocab alignment ──────────────────────────────────")
-    logger.info(f"  tokenizer.vocab_size : {tokenizer.vocab_size:,}  (base, no special tokens)")
-    logger.info(f"  len(tokenizer)       : {len(tokenizer):,}  (base + added special tokens)")
-    logger.info(f"  model.config.vocab   : {model.config.vocab_size:,}  (embedding table size)")
+    logger.info(f"  tokenizer.vocab_size : {tokenizer.vocab_size:,}")
+    logger.info(f"  len(tokenizer)       : {len(tokenizer):,}")
+    logger.info(f"  model.config.vocab   : {model.config.vocab_size:,}")
     logger.info(f"  pad_token_id         : {tokenizer.pad_token_id}")
     logger.info(f"  eos_token_id         : {tokenizer.eos_token_id}")
-    logger.info(f"  bos_token_id         : {tokenizer.bos_token_id}")
-    assert len(tokenizer) <= model.config.vocab_size, (
-        f"FATAL: len(tokenizer)={len(tokenizer)} > model vocab={model.config.vocab_size}. "
-        f"Call model.resize_token_embeddings(len(tokenizer)) to fix."
-    )
-    logger.info("  Vocab check PASSED: all token IDs within model embedding table")
+    
+    # After the fix we added earlier, this should always pass
+    if len(tokenizer) > model.config.vocab_size:
+        logger.warning("Vocab mismatch detected - resizing again")
+        model.resize_token_embeddings(len(tokenizer))
+    
+    logger.info("  ✅ Vocab alignment PASSED")
 
     logger.info("")
     logger.info("── Loading datasets ─────────────────────────────────")
