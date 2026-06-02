@@ -404,6 +404,19 @@ def tokenise_record(record: dict, tokenizer, max_seq_len: int):
     if all(lbl == IGNORE_INDEX for lbl in labels):
         return None
 
+    # Belt-and-suspenders: mask any label token ID that is outside the
+    # model vocab range to IGNORE_INDEX so cross-entropy never sees it.
+    # This catches pad_token_id, bos_token_id, or any special token that
+    # sits beyond vocab_size in the tokenizer's extended vocabulary.
+    vocab_size = tokenizer.vocab_size
+    labels = [
+        lbl if (lbl == IGNORE_INDEX or 0 <= lbl < vocab_size) else IGNORE_INDEX
+        for lbl in labels
+    ]
+
+    if all(lbl == IGNORE_INDEX for lbl in labels):
+        return None
+
     return {
         "input_ids":      input_ids,
         "attention_mask": full_enc["attention_mask"],
@@ -504,6 +517,17 @@ def main():
         tokenizer.pad_token    = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
         logger.info("pad_token set to eos_token")
+
+    # Critical: pad_token_id must be within [0, vocab_size) otherwise it
+    # leaks into labels and triggers nll_loss out-of-range CUDA assertions.
+    # This model has vocab_size=199998 but pad_token_id=199999 — clamp it.
+    if tokenizer.pad_token_id >= tokenizer.vocab_size:
+        safe_pad_id = tokenizer.vocab_size - 1
+        logger.warning(
+            f"pad_token_id={tokenizer.pad_token_id} is outside vocab "
+            f"(vocab_size={tokenizer.vocab_size}) — clamping to {safe_pad_id}"
+        )
+        tokenizer.pad_token_id = safe_pad_id
 
     tokenizer.padding_side = "right"
     logger.info(f"Vocab size        : {tokenizer.vocab_size:,}")
