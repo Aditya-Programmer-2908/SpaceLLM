@@ -546,20 +546,56 @@ def main():
     # accelerate's dispatch_model shards layers across all visible GPUs
     # using a balanced memory map — avoids the cudaErrorIllegalAddress
     # that occurs when dequantization kernels run across multiple GPUs.
+    #
+    # We auto-discover the decoder layer class name from the model so
+    # no_split_module_classes is always correct regardless of model variant.
     logger.info("Dispatching model across GPUs ...")
     t1 = time.time()
     try:
         from accelerate import dispatch_model, infer_auto_device_map
+        import inspect
+
+        # Auto-discover the decoder layer class: find all nn.Module subclasses
+        # whose name contains "layer" or "block" (case-insensitive) — these
+        # are the classes that must never be split across two GPUs.
+        import torch.nn as nn
+        no_split = []
+        for name, module in model.named_modules():
+            cls = type(module)
+            cls_name = cls.__name__.lower()
+            if (
+                issubclass(cls, nn.Module)
+                and cls is not nn.Module
+                and ("layer" in cls_name or "block" in cls_name)
+                and cls.__name__ not in no_split
+                # exclude tiny utility layers (norm, activation, etc.)
+                and sum(p.numel() for p in module.parameters()) > 1_000_000
+            ):
+                no_split.append(cls.__name__)
+        no_split = list(dict.fromkeys(no_split))  # deduplicate, preserve order
+        logger.info(f"no_split_module_classes : {no_split}")
+
+        # Leave ~4GB headroom per GPU for activations + optimizer states
+        n_gpus = torch.cuda.device_count()
+        max_memory = {}
+        for i in range(n_gpus):
+            props = torch.cuda.get_device_properties(i)
+            free  = torch.cuda.mem_get_info(i)[0]            # bytes currently free
+            alloc = max(0, free - 4 * 1024**3)               # reserve 4GB headroom
+            max_memory[i] = f"{int(alloc / 1024**3)}GiB"
+        max_memory["cpu"] = "80GiB"                          # fallback offload
+        logger.info(f"max_memory per device  : {max_memory}")
+
         device_map = infer_auto_device_map(
             model,
-            max_memory={i: "44GiB" for i in range(torch.cuda.device_count())},
-            no_split_module_classes=["GptOssDecoderLayer"],
+            max_memory=max_memory,
+            no_split_module_classes=no_split,
         )
         model = dispatch_model(model, device_map=device_map)
     except Exception as e:
-        # Fallback: put everything on cuda:0 if dispatch fails
         logger.warning(f"dispatch_model failed ({e}) — falling back to cuda:0")
         model = model.to("cuda:0")
+
     logger.info(f"GPU dispatch done in {time.time() - t1:.1f}s")
     if hasattr(model, "hf_device_map"):
         from collections import Counter
