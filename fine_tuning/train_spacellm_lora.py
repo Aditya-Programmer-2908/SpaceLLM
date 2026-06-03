@@ -30,6 +30,12 @@ To load after training:
                 device_map="auto")
     model = PeftModel.from_pretrained(base, "./outputs/spacellm_lora_final")
     tok   = AutoTokenizer.from_pretrained("./outputs/spacellm_lora_final")
+
+CHANGES FROM v1 (fixes for loss spikes + eval_loss: nan):
+  - lr: 2e-4 → 2e-5  (10x lower — primary fix for loss explosions)
+  - max_grad_norm=1.0 added to TrainingArguments  (clips exploding gradients)
+  - warmup_steps: 100 → 200  (gentler ramp at lower LR)
+  - data_collator pad_to_multiple_of: 8 → 64  (aligns with vocab padding)
 """
 
 # ── TRITON PATCH — must be the very first thing before any other import ───────
@@ -285,9 +291,11 @@ def parse_args():
     p.add_argument("--epochs",                 type=int,   default=3)
     p.add_argument("--batch_size",             type=int,   default=1)
     p.add_argument("--grad_accum",             type=int,   default=16)
-    p.add_argument("--lr",                     type=float, default=2e-4)
+    # FIX 1: lr lowered from 2e-4 to 2e-5 — primary fix for loss spikes
+    p.add_argument("--lr",                     type=float, default=2e-5)
     p.add_argument("--max_seq_len",            type=int,   default=2048)
-    p.add_argument("--warmup_steps",           type=int,   default=100)
+    # FIX 2: warmup_steps increased from 100 to 200 — gentler ramp at lower LR
+    p.add_argument("--warmup_steps",           type=int,   default=200)
     p.add_argument("--save_steps",             type=int,   default=500)
     p.add_argument("--eval_steps",             type=int,   default=500)
     p.add_argument("--logging_steps",          type=int,   default=20)
@@ -674,9 +682,6 @@ def main():
     logger.info(f"  tie_word_embeddings  : {model.config.tie_word_embeddings}")
 
     # Step 1: Untie embeddings FIRST
-    # Must happen before resize and before PEFT wrapping.
-    # Call resize at current size with pad_to_multiple_of to physically
-    # decouple the weight tensors without changing vocab yet.
     model.config.tie_word_embeddings = False
     _current_vocab = model.get_output_embeddings().weight.shape[0]
     model.resize_token_embeddings(_current_vocab, pad_to_multiple_of=64)
@@ -685,8 +690,7 @@ def main():
     # Step 2: Resize to fit tokenizer, padded to multiple of 64
     model.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=64)
 
-    # Step 3: Read back ACTUAL padded vocab from weight shape — this is
-    # the true n_classes that the CUDA kernel will use.
+    # Step 3: Read back ACTUAL padded vocab from weight shape
     actual_vocab = model.get_output_embeddings().weight.shape[0]
     model.config.vocab_size = actual_vocab
 
@@ -696,7 +700,6 @@ def main():
     logger.info(f"  lm_head shape after       : {model.get_output_embeddings().weight.shape}")
     logger.info(f"  model.config.vocab_size   : {model.config.vocab_size:,}")
 
-    # Hard assertions — if these fail, training WILL crash with CUDA assertion
     assert model.get_input_embeddings().weight.shape[0] == actual_vocab, \
         f"embed_tokens {model.get_input_embeddings().weight.shape[0]} != {actual_vocab}"
     assert model.get_output_embeddings().weight.shape[0] == actual_vocab, \
@@ -706,10 +709,6 @@ def main():
     logger.info(f"  Vocab alignment PASSED (vocab={actual_vocab:,})")
 
     # ── CRITICAL FIX: Replace custom loss_function BEFORE GPU dispatch ────
-    # gpt-oss-20b has a custom loss_function attribute that its forward()
-    # calls directly. Setting it to None (previous approach) causes
-    # "NoneType object is not callable". We replace it with a standard
-    # shifted cross-entropy that matches the expected call signature.
     logger.info("")
     logger.info("── Injecting standard CE loss (pre-dispatch) ────────")
     found = _inject_loss_function(model, label="pre-dispatch")
@@ -723,7 +722,6 @@ def main():
     try:
         from accelerate import dispatch_model, infer_auto_device_map
 
-        # Auto-discover decoder layer class names (must not be split across GPUs)
         no_split = []
         for name, module in model.named_modules():
             cls      = type(module)
@@ -743,7 +741,7 @@ def main():
         max_memory = {}
         for i in range(n_gpus):
             free  = torch.cuda.mem_get_info(i)[0]
-            alloc = max(0, free - 4 * 1024**3)      # 4 GB headroom per GPU
+            alloc = max(0, free - 4 * 1024**3)
             max_memory[i] = f"{int(alloc / 1024**3)}GiB"
         max_memory["cpu"] = "80GiB"
         logger.info(f"max_memory per device  : {max_memory}")
@@ -766,7 +764,7 @@ def main():
             logger.info(f"  {dev} : {count} layers")
     log_gpu_memory("after model load")
 
-    # ── Re-inject loss function after dispatch (device_map can rewrap model) ─
+    # ── Re-inject loss function after dispatch ────────────────────────────
     logger.info("")
     logger.info("── Re-injecting standard CE loss (post-dispatch) ────")
     _inject_loss_function(model, label="post-dispatch")
@@ -790,9 +788,7 @@ def main():
     )
     model = get_peft_model(model, lora_config)
 
-    # ── Re-inject loss function a final time after PEFT wrapping ─────────
-    # PEFT wraps the model in PeftModel which adds another layer of indirection.
-    # We must patch all accessible paths again.
+    # ── Re-inject loss function after PEFT wrapping ───────────────────────
     logger.info("")
     logger.info("── Re-injecting standard CE loss (post-PEFT) ────────")
     _inject_loss_function(model, label="post-PEFT")
@@ -808,9 +804,6 @@ def main():
     log_gpu_memory("after LoRA init")
 
     # ── Final vocab alignment check (post-PEFT) ──────────────────────────
-    # After PEFT wraps lm_head in LoraLinear, re-read the actual output
-    # embedding size and re-assert everything is still consistent.
-    # Also clamp any label IDs in the dataset that exceed actual_vocab-1.
     logger.info("")
     logger.info("── Vocab alignment (post-PEFT final check) ──────────")
     _post_peft_vocab = model.get_output_embeddings().weight.shape[0]
@@ -828,7 +821,6 @@ def main():
         )
         model.config.vocab_size = _post_peft_vocab
 
-    # Ensure labels will never reference an ID >= lm_head output dim
     _max_valid_label = _post_peft_vocab - 1
     logger.info(f"  Max valid label ID   : {_max_valid_label:,}")
     logger.info("  Vocab alignment PASSED (post-PEFT)")
@@ -865,6 +857,8 @@ def main():
         learning_rate=args.lr,
         lr_scheduler_type="cosine",
         warmup_steps=args.warmup_steps,
+        # FIX 3: gradient clipping — prevents loss explosion on bad batches
+        max_grad_norm=1.0,
         optim="adamw_torch",
         bf16=True,
         fp16=False,
@@ -886,6 +880,7 @@ def main():
     for k, v in {
         "epochs":           args.epochs,
         "lr":               args.lr,
+        "max_grad_norm":    1.0,
         "batch_size":       args.batch_size,
         "grad_accum":       args.grad_accum,
         "effective_batch":  args.batch_size * args.grad_accum,
@@ -899,46 +894,32 @@ def main():
         logger.info(f"  {k:<25}: {v}")
 
     # ── Data collator ─────────────────────────────────────────────────────
+    # FIX 4: pad_to_multiple_of=64 to align with vocab padding step
     data_collator = DataCollatorForSeq2Seq(
         tokenizer=tokenizer,
         model=model,
         padding=True,
-        pad_to_multiple_of=8,
+        pad_to_multiple_of=64,
         label_pad_token_id=IGNORE_INDEX,
     )
 
-    # ── Trainer ───────────────────────────────────────────────────────────
     # ── Device-aware Trainer subclass ─────────────────────────────────────
-    # SECOND LINE OF DEFENCE against the cross-device loss crash.
-    #
-    # Even with the device-aware loss function, HuggingFace Trainer moves the
-    # entire batch to self.args.device (cuda:0) before calling model(**inputs).
-    # In a sharded MoE model the lm_head lives on cuda:1, so logits come back
-    # on cuda:1 while labels are still on cuda:0.
-    #
-    # We override _prepare_inputs to detect where the lm_head actually lives
-    # and move labels there, so they are co-located with logits when the loss
-    # function is called.
-
     class DeviceAwareTrainer(Trainer):
         """Trainer that moves labels to the lm_head device before forward."""
 
         def _get_lm_head_device(self):
-            """Return the device the lm_head (output embedding) lives on."""
             try:
                 return next(self.model.get_output_embeddings().parameters()).device
             except Exception:
                 return None
 
         def _prepare_inputs(self, inputs):
-            # Let the base class do its normal preparation (moves to cuda:0)
             inputs = super()._prepare_inputs(inputs)
 
             lm_device = self._get_lm_head_device()
             if lm_device is None:
                 return inputs
 
-            # Move labels to lm_head device if they differ
             if "labels" in inputs:
                 current = inputs["labels"].device
                 if current != lm_device:
@@ -1028,6 +1009,7 @@ def main():
         "target_modules":        ["lm_head"],
         "epochs":                args.epochs,
         "learning_rate":         args.lr,
+        "max_grad_norm":         1.0,
         "batch_size":            args.batch_size,
         "gradient_accumulation": args.grad_accum,
         "effective_batch_size":  args.batch_size * args.grad_accum,
