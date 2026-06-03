@@ -201,28 +201,40 @@ def _make_device_aware_ce_loss():
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
 
-        # ── Step 2: device alignment — THE CORE FIX ──────────────────────
-        # logits live on the lm_head device (may be cuda:1 in sharded model).
-        # labels come from the Trainer and live on cuda:0.
-        # Move labels to match logits — never the other way, since logits
-        # are the larger tensor and moving them would break the shard layout.
+        # ── Step 2: device alignment ──────────────────────────────────────
+        # logits live on lm_head device (may be cuda:1 in sharded model).
+        # labels come from Trainer on cuda:0. Move labels to logits device.
         logits_device = shift_logits.device
         if shift_labels.device != logits_device:
             shift_labels = shift_labels.to(logits_device)
 
-        # ── Step 3: vocab size ────────────────────────────────────────────
-        if vocab_size is None:
-            vocab_size = shift_logits.size(-1)
+        # ── Step 3: vocab size — ALWAYS read from logits shape ────────────
+        # NEVER use the vocab_size kwarg passed in from gpt-oss forward().
+        # That value is model.config.vocab_size which may be the PRE-padding
+        # value or the tokenizer len, neither of which matches the actual
+        # padded lm_head output dim (padded to multiple of 64).
+        # shift_logits.size(-1) is always the true n_classes the CUDA kernel
+        # will use — using anything else causes the assertion failure.
+        vocab_size = shift_logits.size(-1)
 
-        # ── Step 4: standard CE ───────────────────────────────────────────
+        # ── Step 4: clamp any label IDs that are out of range ─────────────
+        # Belt-and-suspenders: even after dataset-level clamping, mask any
+        # surviving OOB labels so we never trigger the CUDA assertion here.
+        oob_mask = (shift_labels != -100) & (
+            (shift_labels < 0) | (shift_labels >= vocab_size)
+        )
+        if oob_mask.any():
+            shift_labels = shift_labels.clone()
+            shift_labels[oob_mask] = -100
+
+        # ── Step 5: standard CE ───────────────────────────────────────────
         loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
         loss = loss_fct(
             shift_logits.view(-1, vocab_size),
             shift_labels.view(-1).long(),
         )
 
-        # Move loss back to cuda:0 so Trainer can accumulate it correctly
-        # (Trainer always expects loss on its primary device)
+        # Move loss back to cuda:0 so Trainer can accumulate it
         return loss.to("cuda:0")
 
     return _device_aware_ce_loss
@@ -458,19 +470,54 @@ def tokenise_record(record: dict, tokenizer, max_seq_len: int):
     }
 
 
-def build_hf_dataset(records: list, tokenizer, max_seq_len: int, split_name: str):
+def build_hf_dataset(records: list, tokenizer, max_seq_len: int, split_name: str,
+                      vocab_size: int = None):
+    """
+    Tokenise records and build a HuggingFace Dataset.
+
+    vocab_size: if provided, any label ID >= vocab_size is clamped to
+                IGNORE_INDEX (-100) so it is masked from the loss.
+                This catches the "t >= 0 && t < n_classes" CUDA assertion
+                caused by special tokens (bos_token_id=199998) that may
+                exceed the model's padded vocab size.
+    """
     from datasets import Dataset
 
-    tokenised, skipped = [], 0
+    tokenised, skipped, clamped_records = [], 0, 0
     for record in records:
         result = tokenise_record(record, tokenizer, max_seq_len)
         if result is None:
             skipped += 1
-        else:
-            tokenised.append(result)
+            continue
+
+        # ── Label clamping: mask any token ID outside [0, vocab_size) ────
+        if vocab_size is not None:
+            new_labels = []
+            had_oob = False
+            for lbl in result["labels"]:
+                if lbl != IGNORE_INDEX and (lbl < 0 or lbl >= vocab_size):
+                    new_labels.append(IGNORE_INDEX)
+                    had_oob = True
+                else:
+                    new_labels.append(lbl)
+            if had_oob:
+                result["labels"] = new_labels
+                clamped_records += 1
+
+        # Skip records where clamping removed ALL labels
+        if all(lbl == IGNORE_INDEX for lbl in result["labels"]):
+            skipped += 1
+            continue
+
+        tokenised.append(result)
 
     if skipped:
-        logger.warning(f"[{split_name}] Skipped {skipped} records")
+        logger.warning(f"[{split_name}] Skipped {skipped} records (no valid labels)")
+    if clamped_records:
+        logger.warning(
+            f"[{split_name}] Clamped out-of-vocab labels in {clamped_records} records "
+            f"(vocab_size={vocab_size:,})"
+        )
     if not tokenised:
         logger.error(f"[{split_name}] Zero usable records — aborting")
         raise SystemExit(1)
@@ -481,11 +528,21 @@ def build_hf_dataset(records: list, tokenizer, max_seq_len: int, split_name: str
         max((lbl for lbl in t["labels"] if lbl != IGNORE_INDEX), default=0)
         for t in tokenised
     )
+
+    # Hard check: after clamping, no label should exceed vocab_size
+    if vocab_size is not None and max_label_id >= vocab_size:
+        logger.error(
+            f"[{split_name}] FATAL: max_label_id={max_label_id} >= vocab_size={vocab_size} "
+            f"after clamping — this WILL cause CUDA assertion failure"
+        )
+        raise SystemExit(1)
+
     logger.info(
         f"[{split_name}] {len(tokenised):,} records | "
         f"seq len  min={min(lengths)}  max={max(lengths)}  "
         f"mean={sum(lengths)/len(lengths):.0f} | "
-        f"max_input_id={max_input_id}  max_label_id={max_label_id}"
+        f"max_input_id={max_input_id}  max_label_id={max_label_id} | "
+        f"vocab_size={vocab_size if vocab_size else 'unchecked'}"
     )
     return Dataset.from_list(tokenised)
 
@@ -587,22 +644,66 @@ def main():
     logger.info(f"Model dtype       : {next(model.parameters()).dtype}")
 
     # ── Vocab alignment — resize BEFORE LoRA wrapping ────────────────────
+    #
+    # THREE root causes for "t >= 0 && t < n_classes" CUDA assertion:
+    #
+    # (A) tie_word_embeddings=True: PEFT replaces lm_head.weight with a new
+    #     LoraLinear tensor, but embed_tokens still holds the OLD shared tensor.
+    #     After resize, embed_tokens and lm_head are DIFFERENT sizes.
+    #     Logit dim = old embed_tokens vocab; labels can reach new len(tokenizer).
+    #     Those IDs exceed n_classes → CUDA assertion.
+    #     FIX: untie BEFORE resize AND before get_peft_model().
+    #
+    # (B) resize_token_embeddings() without pad_to_multiple_of=64:
+    #     CUDA kernels assume vocab is aligned to 64. Without padding,
+    #     n_classes reported to nll_loss is wrong → assertion.
+    #     FIX: always pass pad_to_multiple_of=64.
+    #
+    # (C) config.vocab_size set to len(tokenizer) instead of actual padded size:
+    #     After padding, actual weight dim > len(tokenizer). If config.vocab_size
+    #     < actual dim, the loss function clips logits incorrectly.
+    #     FIX: read config.vocab_size back from weight.shape[0] after resize.
+    #
     logger.info("")
     logger.info("── Vocab & lm_head alignment ────────────────────────")
-    logger.info(f"  tokenizer vocab  : {len(tokenizer):,}")
-    logger.info(f"  model config vocab: {model.config.vocab_size:,}")
-    logger.info(f"  lm_head shape    : {model.get_output_embeddings().weight.shape}")
+    logger.info(f"  tokenizer.vocab_size : {tokenizer.vocab_size:,}")
+    logger.info(f"  len(tokenizer)       : {len(tokenizer):,}")
+    logger.info(f"  model.config.vocab   : {model.config.vocab_size:,}")
+    logger.info(f"  embed_tokens shape   : {model.get_input_embeddings().weight.shape}")
+    logger.info(f"  lm_head shape        : {model.get_output_embeddings().weight.shape}")
+    logger.info(f"  tie_word_embeddings  : {model.config.tie_word_embeddings}")
 
+    # Step 1: Untie embeddings FIRST
+    # Must happen before resize and before PEFT wrapping.
+    # Call resize at current size with pad_to_multiple_of to physically
+    # decouple the weight tensors without changing vocab yet.
     model.config.tie_word_embeddings = False
-    if len(tokenizer) != model.config.vocab_size:
-        logger.info(f"  Resizing embeddings: {model.config.vocab_size:,} → {len(tokenizer):,}")
-        model.config.vocab_size = len(tokenizer)
-        model.resize_token_embeddings(len(tokenizer))
-    else:
-        model.config.vocab_size = len(tokenizer)
-        logger.info("  Vocab sizes already aligned — no resize needed")
+    _current_vocab = model.get_output_embeddings().weight.shape[0]
+    model.resize_token_embeddings(_current_vocab, pad_to_multiple_of=64)
+    logger.info("  Embeddings untied (tie_word_embeddings=False)")
 
-    logger.info(f"  lm_head shape after resize: {model.get_output_embeddings().weight.shape}")
+    # Step 2: Resize to fit tokenizer, padded to multiple of 64
+    model.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=64)
+
+    # Step 3: Read back ACTUAL padded vocab from weight shape — this is
+    # the true n_classes that the CUDA kernel will use.
+    actual_vocab = model.get_output_embeddings().weight.shape[0]
+    model.config.vocab_size = actual_vocab
+
+    logger.info(f"  target (len tokenizer)   : {len(tokenizer):,}")
+    logger.info(f"  actual (padded, step=64)  : {actual_vocab:,}")
+    logger.info(f"  embed_tokens shape after  : {model.get_input_embeddings().weight.shape}")
+    logger.info(f"  lm_head shape after       : {model.get_output_embeddings().weight.shape}")
+    logger.info(f"  model.config.vocab_size   : {model.config.vocab_size:,}")
+
+    # Hard assertions — if these fail, training WILL crash with CUDA assertion
+    assert model.get_input_embeddings().weight.shape[0] == actual_vocab, \
+        f"embed_tokens {model.get_input_embeddings().weight.shape[0]} != {actual_vocab}"
+    assert model.get_output_embeddings().weight.shape[0] == actual_vocab, \
+        f"lm_head {model.get_output_embeddings().weight.shape[0]} != {actual_vocab}"
+    assert model.config.vocab_size == actual_vocab, \
+        f"config.vocab_size {model.config.vocab_size} != {actual_vocab}"
+    logger.info(f"  Vocab alignment PASSED (vocab={actual_vocab:,})")
 
     # ── CRITICAL FIX: Replace custom loss_function BEFORE GPU dispatch ────
     # gpt-oss-20b has a custom loss_function attribute that its forward()
@@ -706,21 +807,31 @@ def main():
     log_trainable_parameters(model)
     log_gpu_memory("after LoRA init")
 
-    # ── Final vocab alignment check ───────────────────────────────────────
+    # ── Final vocab alignment check (post-PEFT) ──────────────────────────
+    # After PEFT wraps lm_head in LoraLinear, re-read the actual output
+    # embedding size and re-assert everything is still consistent.
+    # Also clamp any label IDs in the dataset that exceed actual_vocab-1.
     logger.info("")
-    logger.info("── Vocab alignment (final check) ────────────────────")
+    logger.info("── Vocab alignment (post-PEFT final check) ──────────")
+    _post_peft_vocab = model.get_output_embeddings().weight.shape[0]
     logger.info(f"  tokenizer.vocab_size : {tokenizer.vocab_size:,}")
     logger.info(f"  len(tokenizer)       : {len(tokenizer):,}")
     logger.info(f"  model.config.vocab   : {model.config.vocab_size:,}")
+    logger.info(f"  lm_head actual vocab : {_post_peft_vocab:,}")
     logger.info(f"  pad_token_id         : {tokenizer.pad_token_id}")
     logger.info(f"  eos_token_id         : {tokenizer.eos_token_id}")
 
-    if len(tokenizer) > model.config.vocab_size:
-        logger.warning("Vocab mismatch detected post-LoRA — resizing again")
-        model.resize_token_embeddings(len(tokenizer))
-        model.config.vocab_size = len(tokenizer)
+    if _post_peft_vocab != model.config.vocab_size:
+        logger.warning(
+            f"  lm_head vocab ({_post_peft_vocab}) != config.vocab_size "
+            f"({model.config.vocab_size}) after PEFT — fixing config"
+        )
+        model.config.vocab_size = _post_peft_vocab
 
-    logger.info("  ✅ Vocab alignment PASSED")
+    # Ensure labels will never reference an ID >= lm_head output dim
+    _max_valid_label = _post_peft_vocab - 1
+    logger.info(f"  Max valid label ID   : {_max_valid_label:,}")
+    logger.info("  Vocab alignment PASSED (post-PEFT)")
 
     # ── Load datasets ─────────────────────────────────────────────────────
     logger.info("")
@@ -733,8 +844,14 @@ def main():
 
     logger.info("")
     logger.info("── Tokenising ───────────────────────────────────────")
-    train_dataset = build_hf_dataset(train_records, tokenizer, args.max_seq_len, "train")
-    val_dataset   = build_hf_dataset(val_records,   tokenizer, args.max_seq_len, "validation")
+    train_dataset = build_hf_dataset(
+        train_records, tokenizer, args.max_seq_len, "train",
+        vocab_size=_post_peft_vocab,
+    )
+    val_dataset   = build_hf_dataset(
+        val_records, tokenizer, args.max_seq_len, "validation",
+        vocab_size=_post_peft_vocab,
+    )
 
     # ── Training arguments ────────────────────────────────────────────────
     logger.info("")
