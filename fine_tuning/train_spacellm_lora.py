@@ -181,33 +181,67 @@ logger = logging.getLogger("SpaceLLM")
 # Setting it to None causes 'NoneType object is not callable'.
 # We replace it with this standard shifted cross-entropy callable instead.
 
-def _standard_ce_loss(logits, labels, vocab_size=None, **kwargs):
+def _make_device_aware_ce_loss():
     """
-    Standard causal-LM cross-entropy loss.
-    Signature is intentionally permissive (**kwargs) to absorb any extra
-    arguments the gpt-oss forward pass might pass in.
+    Returns a device-aware cross-entropy loss function.
+
+    ROOT CAUSE THIS FIXES:
+      gpt-oss-20b is a MoE model sharded across multiple GPUs via device_map.
+      The lm_head (producing logits) lands on e.g. cuda:1, while HuggingFace
+      Trainer always places the batch (including labels) on cuda:0.
+      PyTorch's nll_loss then crashes with:
+        "Expected all tensors to be on the same device, but found target on
+         cuda:0 and other tensors on cuda:1"
+      The fix: always move labels onto whatever device logits are on, BEFORE
+      computing loss. This is safe because logits are the authoritative output
+      device in a sharded model.
     """
-    # shift so that token n predicts token n+1
-    shift_logits = logits[..., :-1, :].contiguous()
-    shift_labels = labels[..., 1:].contiguous()
+    def _device_aware_ce_loss(logits, labels, vocab_size=None, **kwargs):
+        # ── Step 1: shift for causal LM ──────────────────────────────────
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
 
-    # vocab_size might be passed as a kwarg by gpt-oss; use it if given
-    if vocab_size is None:
-        vocab_size = shift_logits.size(-1)
+        # ── Step 2: device alignment — THE CORE FIX ──────────────────────
+        # logits live on the lm_head device (may be cuda:1 in sharded model).
+        # labels come from the Trainer and live on cuda:0.
+        # Move labels to match logits — never the other way, since logits
+        # are the larger tensor and moving them would break the shard layout.
+        logits_device = shift_logits.device
+        if shift_labels.device != logits_device:
+            shift_labels = shift_labels.to(logits_device)
 
-    loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-    return loss_fct(
-        shift_logits.view(-1, vocab_size),
-        shift_labels.view(-1).long(),
-    )
+        # ── Step 3: vocab size ────────────────────────────────────────────
+        if vocab_size is None:
+            vocab_size = shift_logits.size(-1)
+
+        # ── Step 4: standard CE ───────────────────────────────────────────
+        loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+        loss = loss_fct(
+            shift_logits.view(-1, vocab_size),
+            shift_labels.view(-1).long(),
+        )
+
+        # Move loss back to cuda:0 so Trainer can accumulate it correctly
+        # (Trainer always expects loss on its primary device)
+        return loss.to("cuda:0")
+
+    return _device_aware_ce_loss
 
 
-def _inject_loss_function(model, loss_fn, label=""):
+# Module-level singleton — created once, injected everywhere
+_DEVICE_AWARE_CE_LOSS = _make_device_aware_ce_loss()
+
+
+def _inject_loss_function(model, loss_fn=None, label=""):
     """
     Walk all likely locations where gpt-oss stores its loss_function
     and replace every one we find with loss_fn.
+    Defaults to the device-aware CE loss if loss_fn is not provided.
     Returns True if at least one replacement was made.
     """
+    if loss_fn is None:
+        loss_fn = _DEVICE_AWARE_CE_LOSS
+
     replaced = False
     candidates = [model]
     if hasattr(model, "base_model"):
@@ -577,7 +611,7 @@ def main():
     # shifted cross-entropy that matches the expected call signature.
     logger.info("")
     logger.info("── Injecting standard CE loss (pre-dispatch) ────────")
-    found = _inject_loss_function(model, _standard_ce_loss, label="pre-dispatch")
+    found = _inject_loss_function(model, label="pre-dispatch")
     if not found:
         logger.warning("  loss_function attribute not found at this stage — will retry after dispatch")
 
@@ -634,7 +668,7 @@ def main():
     # ── Re-inject loss function after dispatch (device_map can rewrap model) ─
     logger.info("")
     logger.info("── Re-injecting standard CE loss (post-dispatch) ────")
-    _inject_loss_function(model, _standard_ce_loss, label="post-dispatch")
+    _inject_loss_function(model, label="post-dispatch")
 
     model.config.use_cache = False
     model.gradient_checkpointing_enable()
@@ -660,7 +694,7 @@ def main():
     # We must patch all accessible paths again.
     logger.info("")
     logger.info("── Re-injecting standard CE loss (post-PEFT) ────────")
-    _inject_loss_function(model, _standard_ce_loss, label="post-PEFT")
+    _inject_loss_function(model, label="post-PEFT")
 
     try:
         lm_head = model.get_output_embeddings()
@@ -757,7 +791,45 @@ def main():
     )
 
     # ── Trainer ───────────────────────────────────────────────────────────
-    trainer = Trainer(
+    # ── Device-aware Trainer subclass ─────────────────────────────────────
+    # SECOND LINE OF DEFENCE against the cross-device loss crash.
+    #
+    # Even with the device-aware loss function, HuggingFace Trainer moves the
+    # entire batch to self.args.device (cuda:0) before calling model(**inputs).
+    # In a sharded MoE model the lm_head lives on cuda:1, so logits come back
+    # on cuda:1 while labels are still on cuda:0.
+    #
+    # We override _prepare_inputs to detect where the lm_head actually lives
+    # and move labels there, so they are co-located with logits when the loss
+    # function is called.
+
+    class DeviceAwareTrainer(Trainer):
+        """Trainer that moves labels to the lm_head device before forward."""
+
+        def _get_lm_head_device(self):
+            """Return the device the lm_head (output embedding) lives on."""
+            try:
+                return next(self.model.get_output_embeddings().parameters()).device
+            except Exception:
+                return None
+
+        def _prepare_inputs(self, inputs):
+            # Let the base class do its normal preparation (moves to cuda:0)
+            inputs = super()._prepare_inputs(inputs)
+
+            lm_device = self._get_lm_head_device()
+            if lm_device is None:
+                return inputs
+
+            # Move labels to lm_head device if they differ
+            if "labels" in inputs:
+                current = inputs["labels"].device
+                if current != lm_device:
+                    inputs["labels"] = inputs["labels"].to(lm_device)
+
+            return inputs
+
+    trainer = DeviceAwareTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
@@ -767,10 +839,10 @@ def main():
     )
 
     # ── Final loss_function patch after Trainer init ──────────────────────
-    # Trainer may internally copy/wrap the model; patch one more time.
     logger.info("")
     logger.info("── Final loss_function patch (post-Trainer init) ────")
-    _inject_loss_function(trainer.model, _standard_ce_loss, label="post-Trainer")
+    _inject_loss_function(trainer.model, label="post-Trainer")
+    logger.info(f"  lm_head device   : {trainer._get_lm_head_device()}")
 
     # ── Train ─────────────────────────────────────────────────────────────
     logger.info("")
