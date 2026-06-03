@@ -291,11 +291,11 @@ def parse_args():
     p.add_argument("--epochs",                 type=int,   default=3)
     p.add_argument("--batch_size",             type=int,   default=1)
     p.add_argument("--grad_accum",             type=int,   default=16)
-    # FIX 1: lr lowered from 2e-4 to 2e-5 — primary fix for loss spikes
-    p.add_argument("--lr",                     type=float, default=2e-5)
+    # FIX 1: lr lowered from 2e-4 to 5e-6 — primary fix for loss spikes
+    p.add_argument("--lr",                     type=float, default=5e-6)
     p.add_argument("--max_seq_len",            type=int,   default=2048)
     # FIX 2: warmup_steps increased from 100 to 200 — gentler ramp at lower LR
-    p.add_argument("--warmup_steps",           type=int,   default=200)
+    p.add_argument("--warmup_steps",           type=int,   default=350)
     p.add_argument("--save_steps",             type=int,   default=500)
     p.add_argument("--eval_steps",             type=int,   default=500)
     p.add_argument("--logging_steps",          type=int,   default=20)
@@ -858,7 +858,7 @@ def main():
         lr_scheduler_type="cosine",
         warmup_steps=args.warmup_steps,
         # FIX 3: gradient clipping — prevents loss explosion on bad batches
-        max_grad_norm=1.0,
+        max_grad_norm=0.5,
         optim="adamw_torch",
         bf16=True,
         fp16=False,
