@@ -21,56 +21,29 @@ Output layout:
   └── logs/
 
 To load after training:
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModelForCausalLM, AutoTokenizer, Mxfp4Config
     from peft import PeftModel
     import torch
     base  = AutoModelForCausalLM.from_pretrained(
                 "openai/gpt-oss-20b",
                 quantization_config=Mxfp4Config(dequantize=True),
-                device_map="cpu")
-    model = model.to("cuda")
+                device_map="auto")
     model = PeftModel.from_pretrained(base, "./outputs/spacellm_lora_final")
     tok   = AutoTokenizer.from_pretrained("./outputs/spacellm_lora_final")
 """
 
 # ── TRITON PATCH — must be the very first thing before any other import ───────
-#
-# Triton's CudaUtils driver JIT-compiles a small C extension (cuda_utils.c)
-# on first init, which requires Python.h from python3.12-dev. When those
-# headers are absent, gcc fails and the entire MXFP4 weight loading chain
-# errors out. The patch below replaces the two Triton internals that trigger
-# this compilation with harmless no-ops, so the rest of the stack never
-# attempts to call gcc.
-#
-# Scope of impact:
-#   - Triton JIT kernels are disabled (we don't call any directly).
-#   - The MXFP4 swizzle path in transformers falls back to pure PyTorch ops.
-#   - torch.compile / inductor paths that internally call Triton also become
-#     no-ops, but we are not using those here.
-#
 import sys
 import types
+
 
 def _patch_triton():
     """
     Install a lightweight stub for triton.backends.nvidia.driver before
-    the real triton package loads. Two entry points need to be patched:
-
-      1. triton.runtime.build._build        — the gcc subprocess call
-      2. triton.backends.nvidia.driver.CudaUtils.__init__  — the caller
-
-    Strategy: inject a fake 'triton' top-level package whose sub-modules
-    export just enough surface area to satisfy the import chain inside
-    transformers/mxfp4.py and triton/runtime/driver.py, returning stub
-    objects everywhere a real driver or compiled module would be expected.
+    the real triton package loads.
     """
 
-    # ── Stub classes ──────────────────────────────────────────────────────
-
     class _StubDriver:
-        """Pretends to be the Triton CUDA driver. Every attribute access
-        returns another stub so callers that do driver.foo.bar() don't
-        crash with AttributeError."""
         def __getattr__(self, name):
             return _StubDriver()
         def __call__(self, *a, **kw):
@@ -85,7 +58,6 @@ def _patch_triton():
             return lambda *a, **kw: None
 
     class _ActiveDriverDescriptor:
-        """Replaces triton.runtime.driver.DriverManager.active property."""
         def __get__(self, obj, objtype=None):
             return _StubDriver()
         def __set__(self, obj, value):
@@ -98,50 +70,42 @@ def _patch_triton():
             self._active  = _StubDriver()
             self._default = _StubDriver()
 
-    # ── Build stub module tree ────────────────────────────────────────────
-
     def _make_module(name, parent=None):
         mod = types.ModuleType(name)
         sys.modules[name] = mod
         if parent:
-            # attach as attribute on parent so dotted access works
             leaf = name.split(".")[-1]
             setattr(parent, leaf, mod)
         return mod
 
-    # Only patch if triton is not already successfully imported
-    # (i.e. if someone has python3.12-dev installed, leave it alone)
     try:
-        import triton  # noqa: F401 — if this succeeds, no patch needed
-        return  # real triton is available, nothing to do
+        import triton  # noqa: F401
+        return
     except Exception:
-        pass  # expected — headers missing, proceed with stub
+        pass
 
     triton_mod          = _make_module("triton")
-    triton_runtime      = _make_module("triton.runtime",            triton_mod)
-    triton_runtime_drv  = _make_module("triton.runtime.driver",     triton_runtime)
-    triton_runtime_bld  = _make_module("triton.runtime.build",      triton_runtime)
-    triton_runtime_jit  = _make_module("triton.runtime.jit",        triton_runtime)
-    triton_backends     = _make_module("triton.backends",            triton_mod)
-    triton_backends_nv  = _make_module("triton.backends.nvidia",     triton_backends)
+    triton_runtime      = _make_module("triton.runtime",                triton_mod)
+    triton_runtime_drv  = _make_module("triton.runtime.driver",         triton_runtime)
+    triton_runtime_bld  = _make_module("triton.runtime.build",          triton_runtime)
+    triton_runtime_jit  = _make_module("triton.runtime.jit",            triton_runtime)
+    triton_backends     = _make_module("triton.backends",               triton_mod)
+    triton_backends_nv  = _make_module("triton.backends.nvidia",        triton_backends)
     triton_backends_drv = _make_module("triton.backends.nvidia.driver", triton_backends_nv)
 
-    # runtime.driver — exposes `driver` singleton
     drv_singleton = _StubDriverManager()
     triton_runtime_drv.driver = drv_singleton
 
-    # runtime.build — stub _build so nothing tries to call gcc
     def _stub_build(*a, **kw):
         return None
     triton_runtime_bld._build                  = _stub_build
     triton_runtime_bld.compile_module_from_src = lambda *a, **kw: types.ModuleType("_stub_cuda_utils")
+    triton_runtime_bld.load_module             = lambda *a, **kw: types.ModuleType("_stub_cuda_utils")
 
-    # runtime.jit — stub JITFunction so @triton.jit decorators don't crash
     class _StubJITFunction:
         def __init__(self, fn):
             self.fn = fn
         def __call__(self, *a, **kw):
-            # Forward to the underlying Python function so non-GPU callers work
             try:
                 return self.fn(*a, **kw)
             except Exception:
@@ -155,22 +119,14 @@ def _patch_triton():
         else (lambda f: _StubJITFunction(f))
     )
 
-    # backends.nvidia.driver — stub CudaUtils
     triton_backends_drv.CudaUtils = _StubCudaUtils
-
-    # top-level triton aliases
     triton_mod.runtime  = triton_runtime
     triton_mod.backends = triton_backends
-
-    # Also patch the cache-hit path: triton caches compiled .so files under
-    # ~/.triton/cache. If a stale broken .so exists, importing it would still
-    # fail. We redirect the cache loader to our stub too.
-    triton_runtime_bld.load_module = lambda *a, **kw: types.ModuleType("_stub_cuda_utils")
 
 
 _patch_triton()
 
-# ── Now it is safe to import everything else ──────────────────────────────────
+# ── Now safe to import everything else ───────────────────────────────────────
 
 import argparse
 import json
@@ -180,6 +136,9 @@ import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
+
+import torch
+import torch.nn as nn
 
 # ── Directory layout ──────────────────────────────────────────────────────────
 
@@ -216,6 +175,62 @@ logging.basicConfig(
 )
 logger = logging.getLogger("SpaceLLM")
 
+# ── Standard CE loss replacement ─────────────────────────────────────────────
+# CRITICAL FIX: gpt-oss-20b stores a custom loss_function on the model and
+# calls it as self.loss_function(logits, labels, ...) during forward().
+# Setting it to None causes 'NoneType object is not callable'.
+# We replace it with this standard shifted cross-entropy callable instead.
+
+def _standard_ce_loss(logits, labels, vocab_size=None, **kwargs):
+    """
+    Standard causal-LM cross-entropy loss.
+    Signature is intentionally permissive (**kwargs) to absorb any extra
+    arguments the gpt-oss forward pass might pass in.
+    """
+    # shift so that token n predicts token n+1
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+
+    # vocab_size might be passed as a kwarg by gpt-oss; use it if given
+    if vocab_size is None:
+        vocab_size = shift_logits.size(-1)
+
+    loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+    return loss_fct(
+        shift_logits.view(-1, vocab_size),
+        shift_labels.view(-1).long(),
+    )
+
+
+def _inject_loss_function(model, loss_fn, label=""):
+    """
+    Walk all likely locations where gpt-oss stores its loss_function
+    and replace every one we find with loss_fn.
+    Returns True if at least one replacement was made.
+    """
+    replaced = False
+    candidates = [model]
+    if hasattr(model, "base_model"):
+        candidates.append(model.base_model)
+    if hasattr(model, "base_model") and hasattr(model.base_model, "model"):
+        candidates.append(model.base_model.model)
+    # Also walk top-level children one level deep
+    for child in list(model.children()):
+        candidates.append(child)
+
+    for obj in candidates:
+        if obj is not None and hasattr(obj, "loss_function"):
+            old = getattr(obj, "loss_function")
+            if old is not loss_fn:          # avoid double-patching
+                setattr(obj, "loss_function", loss_fn)
+                replaced = True
+                logger.info(
+                    f"  ✅ Replaced loss_function on {type(obj).__name__}"
+                    + (f" ({label})" if label else "")
+                )
+    return replaced
+
+
 # ── CLI args ──────────────────────────────────────────────────────────────────
 
 def parse_args():
@@ -237,7 +252,6 @@ def parse_args():
 # ── GPU diagnostics ───────────────────────────────────────────────────────────
 
 def log_gpu_info():
-    """Log visible GPU names before torch is imported."""
     try:
         import subprocess
         result = subprocess.run(
@@ -251,12 +265,11 @@ def log_gpu_info():
                 idx, name, mem = line.split(",")
                 logger.info(f"  cuda:{idx.strip()} → {name.strip()}  ({int(mem.strip()):,} MiB)")
     except Exception:
-        pass  # nvidia-smi not available — will show after torch loads
+        pass
 
 
 def log_gpu_memory(label: str = ""):
     try:
-        import torch
         if not torch.cuda.is_available():
             logger.warning("No CUDA device — running on CPU")
             return
@@ -404,9 +417,6 @@ def tokenise_record(record: dict, tokenizer, max_seq_len: int):
     if all(lbl == IGNORE_INDEX for lbl in labels):
         return None
 
-    if all(lbl == IGNORE_INDEX for lbl in labels):
-        return None
-
     return {
         "input_ids":      input_ids,
         "attention_mask": full_enc["attention_mask"],
@@ -432,7 +442,6 @@ def build_hf_dataset(records: list, tokenizer, max_seq_len: int, split_name: str
         raise SystemExit(1)
 
     lengths = [len(t["input_ids"]) for t in tokenised]
-    # Debug: log max token ID seen so we can confirm nothing exceeds model vocab
     max_input_id = max(max(t["input_ids"]) for t in tokenised)
     max_label_id = max(
         max((lbl for lbl in t["labels"] if lbl != IGNORE_INDEX), default=0)
@@ -465,7 +474,6 @@ def main():
     logger.info("=" * 60)
 
     try:
-        import torch
         from transformers import (
             AutoModelForCausalLM,
             AutoTokenizer,
@@ -515,9 +523,9 @@ def main():
         tokenizer.pad_token_id = tokenizer.eos_token_id
         logger.info("pad_token set to eos_token")
 
-
     tokenizer.padding_side = "right"
     logger.info(f"Vocab size        : {tokenizer.vocab_size:,}")
+    logger.info(f"len(tokenizer)    : {len(tokenizer):,}")
     logger.info(f"Pad token         : '{tokenizer.pad_token}'  (id={tokenizer.pad_token_id})")
 
     if tokenizer.chat_template is not None:
@@ -525,24 +533,15 @@ def main():
     else:
         logger.warning("Chat template     : NOT FOUND")
 
-    # ── Model — dequantize MXFP4 → BF16 on load ──────────────────────────
-    # The checkpoint is MXFP4-quantized. Trainer rejects quantized models
-    # outright ("MXFP4 don't support training"). Passing dequantize=True
-    # converts every MXFP4 weight shard to plain BF16 during loading so the
-    # model lands in memory with no quantization config attached — making it
-    # fully compatible with Trainer and standard LoRA backprop.
-    # NOTE: do NOT set dtype= alongside quantization_config; Mxfp4Config
-    # controls the output dtype internally and the two args conflict.
+    # ── Model load — dequantize MXFP4 → BF16 on CPU ──────────────────────
     logger.info("")
-    logger.info(f"Loading model: {args.model_id}  [MXFP4 → BF16 dequantize → GPU]")
-    logger.info(f"device_map        : cpu  (dequantize on CPU, then .to(cuda) for training)")
-    logger.info(f"quantization      : Mxfp4Config(dequantize=True)  →  plain BF16")
+    logger.info(f"Loading model: {args.model_id}  [MXFP4 → BF16 dequantize on CPU]")
     t0 = time.time()
     try:
         model = AutoModelForCausalLM.from_pretrained(
             args.model_id,
             quantization_config=Mxfp4Config(dequantize=True),
-            device_map="cpu",           # dequantize safely on CPU first
+            device_map="cpu",
             trust_remote_code=True,
             ignore_mismatched_sizes=True,
         )
@@ -553,48 +552,65 @@ def main():
     logger.info(f"Model loaded + dequantized on CPU in {time.time() - t0:.1f}s")
     logger.info(f"Model dtype       : {next(model.parameters()).dtype}")
 
-    # Move to GPU(s) after dequantization is complete.
-    # accelerate's dispatch_model shards layers across all visible GPUs
-    # using a balanced memory map — avoids the cudaErrorIllegalAddress
-    # that occurs when dequantization kernels run across multiple GPUs.
-    #
-    # We auto-discover the decoder layer class name from the model so
-    # no_split_module_classes is always correct regardless of model variant.
+    # ── Vocab alignment — resize BEFORE LoRA wrapping ────────────────────
+    logger.info("")
+    logger.info("── Vocab & lm_head alignment ────────────────────────")
+    logger.info(f"  tokenizer vocab  : {len(tokenizer):,}")
+    logger.info(f"  model config vocab: {model.config.vocab_size:,}")
+    logger.info(f"  lm_head shape    : {model.get_output_embeddings().weight.shape}")
+
+    model.config.tie_word_embeddings = False
+    if len(tokenizer) != model.config.vocab_size:
+        logger.info(f"  Resizing embeddings: {model.config.vocab_size:,} → {len(tokenizer):,}")
+        model.config.vocab_size = len(tokenizer)
+        model.resize_token_embeddings(len(tokenizer))
+    else:
+        model.config.vocab_size = len(tokenizer)
+        logger.info("  Vocab sizes already aligned — no resize needed")
+
+    logger.info(f"  lm_head shape after resize: {model.get_output_embeddings().weight.shape}")
+
+    # ── CRITICAL FIX: Replace custom loss_function BEFORE GPU dispatch ────
+    # gpt-oss-20b has a custom loss_function attribute that its forward()
+    # calls directly. Setting it to None (previous approach) causes
+    # "NoneType object is not callable". We replace it with a standard
+    # shifted cross-entropy that matches the expected call signature.
+    logger.info("")
+    logger.info("── Injecting standard CE loss (pre-dispatch) ────────")
+    found = _inject_loss_function(model, _standard_ce_loss, label="pre-dispatch")
+    if not found:
+        logger.warning("  loss_function attribute not found at this stage — will retry after dispatch")
+
+    # ── Dispatch model across GPUs ────────────────────────────────────────
+    logger.info("")
     logger.info("Dispatching model across GPUs ...")
     t1 = time.time()
     try:
         from accelerate import dispatch_model, infer_auto_device_map
-        import inspect
 
-        # Auto-discover the decoder layer class: find all nn.Module subclasses
-        # whose name contains "layer" or "block" (case-insensitive) — these
-        # are the classes that must never be split across two GPUs.
-        import torch.nn as nn
+        # Auto-discover decoder layer class names (must not be split across GPUs)
         no_split = []
         for name, module in model.named_modules():
-            cls = type(module)
+            cls      = type(module)
             cls_name = cls.__name__.lower()
             if (
                 issubclass(cls, nn.Module)
                 and cls is not nn.Module
                 and ("layer" in cls_name or "block" in cls_name)
                 and cls.__name__ not in no_split
-                # exclude tiny utility layers (norm, activation, etc.)
                 and sum(p.numel() for p in module.parameters()) > 1_000_000
             ):
                 no_split.append(cls.__name__)
-        no_split = list(dict.fromkeys(no_split))  # deduplicate, preserve order
+        no_split = list(dict.fromkeys(no_split))
         logger.info(f"no_split_module_classes : {no_split}")
 
-        # Leave ~4GB headroom per GPU for activations + optimizer states
-        n_gpus = torch.cuda.device_count()
+        n_gpus     = torch.cuda.device_count()
         max_memory = {}
         for i in range(n_gpus):
-            props = torch.cuda.get_device_properties(i)
-            free  = torch.cuda.mem_get_info(i)[0]            # bytes currently free
-            alloc = max(0, free - 4 * 1024**3)               # reserve 4GB headroom
+            free  = torch.cuda.mem_get_info(i)[0]
+            alloc = max(0, free - 4 * 1024**3)      # 4 GB headroom per GPU
             max_memory[i] = f"{int(alloc / 1024**3)}GiB"
-        max_memory["cpu"] = "80GiB"                          # fallback offload
+        max_memory["cpu"] = "80GiB"
         logger.info(f"max_memory per device  : {max_memory}")
 
         device_map = infer_auto_device_map(
@@ -615,61 +631,19 @@ def main():
             logger.info(f"  {dev} : {count} layers")
     log_gpu_memory("after model load")
 
+    # ── Re-inject loss function after dispatch (device_map can rewrap model) ─
+    logger.info("")
+    logger.info("── Re-injecting standard CE loss (post-dispatch) ────")
+    _inject_loss_function(model, _standard_ce_loss, label="post-dispatch")
+
     model.config.use_cache = False
     model.gradient_checkpointing_enable()
     logger.info("Gradient checkpointing: enabled")
 
-    # ====================== FINAL STRONG FIX FOR gpt-oss-20b ======================
-    logger.info("")
-    logger.info("── Strong Vocab & lm_head Fix ───────────────────────")
-    
-    logger.info(f"Before - lm_head shape: {model.get_output_embeddings().weight.shape}")
-    logger.info(f"Tokenizer length      : {len(tokenizer):,}")
-    logger.info(f"Old config vocab_size : {model.config.vocab_size:,}")
-
-    # Core fixes
-    model.config.tie_word_embeddings = False
-    model.config.vocab_size = len(tokenizer)
-    model.resize_token_embeddings(len(tokenizer))
-
-    logger.info(f"After resize - lm_head shape: {model.get_output_embeddings().weight.shape}")
-
-    # === CRITICAL: Disable custom loss function (robust version) ===
-    disabled = False
-    # Try different possible paths where the loss_function might live
-    for attr_path in [
-        (model, "loss_function"),
-        (model, "base_model", "loss_function"),
-        (model, "base_model", "model", "loss_function"),
-        (getattr(model, "base_model", None), "model", "loss_function"),
-    ]:
-        try:
-            if len(attr_path) == 2:
-                obj, name = attr_path
-                if hasattr(obj, name):
-                    setattr(obj, name, None)
-                    disabled = True
-                    logger.info("✅ Disabled custom gpt_oss loss_function")
-                    break
-            elif len(attr_path) == 3:
-                obj1, name1, name2 = attr_path
-                if hasattr(obj1, name1):
-                    obj2 = getattr(obj1, name1)
-                    if hasattr(obj2, name2):
-                        setattr(obj2, name2, None)
-                        disabled = True
-                        logger.info("✅ Disabled custom gpt_oss loss_function")
-                        break
-        except:
-            continue
-
-    if not disabled:
-        logger.warning("Could not find custom loss_function to disable")
-
     # ── LoRA on lm_head ONLY ──────────────────────────────────────────────
     logger.info("")
     logger.info("Applying LoRA to lm_head ONLY — backbone stays frozen ...")
-    
+
     lora_config = LoraConfig(
         r=16,
         lora_alpha=32,
@@ -681,38 +655,40 @@ def main():
     )
     model = get_peft_model(model, lora_config)
 
-    # Final check
+    # ── Re-inject loss function a final time after PEFT wrapping ─────────
+    # PEFT wraps the model in PeftModel which adds another layer of indirection.
+    # We must patch all accessible paths again.
+    logger.info("")
+    logger.info("── Re-injecting standard CE loss (post-PEFT) ────────")
+    _inject_loss_function(model, _standard_ce_loss, label="post-PEFT")
+
     try:
         lm_head = model.get_output_embeddings()
         logger.info(f"Final lm_head shape after LoRA: {lm_head.weight.shape}")
-    except:
+    except Exception:
         logger.info("Could not inspect final lm_head shape")
 
     logger.info("")
     log_trainable_parameters(model)
     log_gpu_memory("after LoRA init")
-    # =========================================================================
-    # =========================================================================
-    # ── Datasets ──────────────────────────────────────────────────────────
-    # ── Vocab alignment diagnostic ───────────────────────────────────────
-    # config.vocab_size=201,088 > all token IDs — NO resize needed.
-    # Log all relevant sizes so we can confirm alignment.
-        # ── Vocab alignment diagnostic ───────────────────────────────────────
+
+    # ── Final vocab alignment check ───────────────────────────────────────
     logger.info("")
-    logger.info("── Vocab alignment ──────────────────────────────────")
+    logger.info("── Vocab alignment (final check) ────────────────────")
     logger.info(f"  tokenizer.vocab_size : {tokenizer.vocab_size:,}")
     logger.info(f"  len(tokenizer)       : {len(tokenizer):,}")
     logger.info(f"  model.config.vocab   : {model.config.vocab_size:,}")
     logger.info(f"  pad_token_id         : {tokenizer.pad_token_id}")
     logger.info(f"  eos_token_id         : {tokenizer.eos_token_id}")
-    
-    # After the fix we added earlier, this should always pass
+
     if len(tokenizer) > model.config.vocab_size:
-        logger.warning("Vocab mismatch detected - resizing again")
+        logger.warning("Vocab mismatch detected post-LoRA — resizing again")
         model.resize_token_embeddings(len(tokenizer))
-    
+        model.config.vocab_size = len(tokenizer)
+
     logger.info("  ✅ Vocab alignment PASSED")
 
+    # ── Load datasets ─────────────────────────────────────────────────────
     logger.info("")
     logger.info("── Loading datasets ─────────────────────────────────")
     train_records = load_jsonl(TRAIN_FILE)
@@ -780,31 +756,6 @@ def main():
         label_pad_token_id=IGNORE_INDEX,
     )
 
-    """    # ── Final Forward Sanity Check (Very Important) ─────────────────────
-    logger.info("")
-    logger.info("── Final Forward Sanity Check ───────────────────────")
-    try:
-        from torch.utils.data import DataLoader
-        small_dl = DataLoader(train_dataset.select(range(2)), batch_size=1, 
-                            collate_fn=data_collator)
-        test_batch = next(iter(small_dl))
-        test_batch = {k: v.to("cuda:0") if torch.is_tensor(v) else v 
-                     for k, v in test_batch.items()}
-
-        with torch.no_grad():
-            outputs = model(**test_batch)
-            logits_shape = outputs.logits.shape
-            max_label = test_batch["labels"].max().item()
-            logger.info(f"Logits shape       : {logits_shape}")
-            logger.info(f"Max label ID       : {max_label}")
-            logger.info(f"Config vocab_size  : {model.config.vocab_size}")
-            
-            if logits_shape[-1] != model.config.vocab_size:
-                logger.error(f"CRITICAL MISMATCH: logits vocab={logits_shape[-1]}, config={model.config.vocab_size}")
-    except Exception as e:
-        logger.warning(f"Sanity check failed: {e}") """
-    # =====================================================================
-
     # ── Trainer ───────────────────────────────────────────────────────────
     trainer = Trainer(
         model=model,
@@ -815,10 +766,11 @@ def main():
         data_collator=data_collator,
     )
 
-    # Try to bypass custom loss
-    if hasattr(model, "base_model") and hasattr(model.base_model.model, "loss_function"):
-        model.base_model.model.loss_function = None
-        logger.info("Disabled custom loss_function from gpt_oss model")
+    # ── Final loss_function patch after Trainer init ──────────────────────
+    # Trainer may internally copy/wrap the model; patch one more time.
+    logger.info("")
+    logger.info("── Final loss_function patch (post-Trainer init) ────")
+    _inject_loss_function(trainer.model, _standard_ce_loss, label="post-Trainer")
 
     # ── Train ─────────────────────────────────────────────────────────────
     logger.info("")
@@ -880,7 +832,7 @@ def main():
         "run_id":                RUN_ID,
         "base_model":            args.model_id,
         "strategy":              "LoRA on lm_head ONLY — backbone frozen — BF16",
-        "triton":                "available (python3.12-dev installed)",
+        "triton":                "stubbed (dequantize path used)",
         "lora_r":                16,
         "lora_alpha":            32,
         "lora_dropout":          0.05,
@@ -913,9 +865,8 @@ def main():
     logger.info(f"  Logs             →  {LOG_DIR}")
     logger.info("")
     logger.info("  To load for evaluation:")
-    logger.info("  from transformers import AutoModelForCausalLM, AutoTokenizer")
+    logger.info("  from transformers import AutoModelForCausalLM, AutoTokenizer, Mxfp4Config")
     logger.info("  from peft import PeftModel")
-    logger.info("  import torch")
     logger.info(f"  base  = AutoModelForCausalLM.from_pretrained(")
     logger.info(f"              '{args.model_id}',")
     logger.info(f"              quantization_config=Mxfp4Config(dequantize=True), device_map='auto')")
