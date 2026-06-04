@@ -1,0 +1,81 @@
+{
+  "created_at": "2026-06-04T10:01:40.731931Z",
+  "input": "/home/aditya/SpaceLLM/data_processing/DatasetA_core_QA_v2/cleaned_DatasetAv2.json",
+  "split_strategy": "curriculum_learning_by_difficulty",
+  "difficulty_map": {
+    "basic": "train",
+    "intermediate": "validate",
+    "advanced": "test"
+  },
+  "splits": {
+    "train": {
+      "file": "/home/aditya/SpaceLLM/data_processing/DatasetA_core_QA_v2/train.json",
+      "records": 5291,
+      "difficulty": "basic",
+      "stats": {
+        "total_records": 5291,
+        "unique_missions": 1059,
+        "unique_chains": 5266,
+        "by_aspect": {
+          "EXPERIMENTS": 1058,
+          "IMPACT": 1058,
+          "OBJECTIVE": 1059,
+          "RESULTS": 1058,
+          "TECHNOLOGY": 1058
+        },
+        "by_organization": {
+          "ESA": 450,
+          "ISRO": 1769,
+          "NASA": 3072
+        }
+      }
+    },
+    "validate": {
+      "file": "/home/aditya/SpaceLLM/data_processing/DatasetA_core_QA_v2/validate.json",
+      "records": 5291,
+      "difficulty": "intermediate",
+      "stats": {
+        "total_records": 5291,
+        "unique_missions": 1059,
+        "unique_chains": 5266,
+        "by_aspect": {
+          "EXPERIMENTS": 1058,
+          "IMPACT": 1058,
+          "OBJECTIVE": 1059,
+          "RESULTS": 1058,
+          "TECHNOLOGY": 1058
+        },
+        "by_organization": {
+          "ESA": 450,
+          "ISRO": 1769,
+          "NASA": 3072
+        }
+      }
+    },
+    "test": {
+      "file": "/home/aditya/SpaceLLM/data_processing/DatasetA_core_QA_v2/test.json",
+      "records": 5291,
+      "difficulty": "advanced",
+      "stats": {
+        "total_records": 5291,
+        "unique_missions": 1059,
+        "unique_chains": 5266,
+        "by_aspect": {
+          "EXPERIMENTS": 1058,
+          "IMPACT": 1058,
+          "OBJECTIVE": 1059,
+          "RESULTS": 1058,
+          "TECHNOLOGY": 1058
+        },
+        "by_organization": {
+          "ESA": 450,
+          "ISRO": 1769,
+          "NASA": 3072
+        }
+      }
+    }
+  },
+  "leakage_verified": true,
+  "coverage_verified": true,
+  "total_records": 15873
+}
