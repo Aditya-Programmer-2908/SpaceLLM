@@ -1,0 +1,26 @@
+# SpaceLLM — LoRA Fine-Tuning v2
+# Python 3.12
+# Install with: uv pip install -r requirements.txt
+#
+# Core ML
+torch>=2.3.0                        # BF16 training, multi-GPU dispatch
+torchvision                         # pulled in by torch ecosystem; kept explicit
+
+# HuggingFace stack
+transformers>=4.47.0                # Mxfp4Config, DataCollatorForSeq2Seq, Trainer
+datasets>=2.19.0                    # Dataset.from_list used in build_hf_dataset
+peft>=0.11.0                        # LoraConfig, get_peft_model, PeftModel
+accelerate>=0.30.0                  # dispatch_model, infer_auto_device_map
+tokenizers>=0.19.0                  # fast tokenizer backend for gpt-oss-20b
+
+# Plotting — training/eval/test graphs
+matplotlib>=3.8.0
+
+# Utilities (stdlib in 3.12 but pinned for reproducibility)
+tqdm>=4.66.0                        # progress bars inside Trainer
+numpy>=1.26.0                       # tensor ↔ numpy conversions in collator
+safetensors>=0.4.3                  # save/load LoRA adapter weights efficiently
+
+# Optional — faster tokenization & better CUDA memory management
+# triton>=2.3.0                     # stubbed in the script; install if available
+# flash-attn>=2.5.0                 # not required but speeds up attention layers
