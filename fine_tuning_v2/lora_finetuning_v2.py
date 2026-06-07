@@ -1,6 +1,6 @@
 """
-SpaceLLM — Optimized LoRA Fine-Tuning  v3
-==========================================
+SpaceLLM — Optimized LoRA Fine-Tuning  v2 (updated)
+=====================================================
 Model     : openai/gpt-oss-20b  (MoE, MXFP4 quantized checkpoint)
 Phase     : Experimentation
 Strategy  : Freeze full transformer backbone, apply LoRA ONLY to lm_head
