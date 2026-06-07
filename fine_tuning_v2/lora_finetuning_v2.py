@@ -188,7 +188,7 @@ for _d in (CKPT_DIR, FINAL_DIR, LOG_DIR, GRAPH_DIR):
 # ── Dataset paths ─────────────────────────────────────────────────────────────
 
 TRAIN_FILE = Path("/mnt/DATA/saurabh/aditya/SpaceLLM/data_processing/DatasetA_core_QA_v2/train.json")
-VAL_FILE   = Path("/mnt/DATA/saurabh/aditya/SpaceLLM/data_processing/DatasetA_core_QA_v2/validation.json")
+VAL_FILE   = Path("/mnt/DATA/saurabh/aditya/SpaceLLM/data_processing/DatasetA_core_QA_v2/validate.json")
 TEST_FILE  = Path("/mnt/DATA/saurabh/aditya/SpaceLLM/data_processing/DatasetA_core_QA_v2/test.json")
 
 # ── Logging ───────────────────────────────────────────────────────────────────
