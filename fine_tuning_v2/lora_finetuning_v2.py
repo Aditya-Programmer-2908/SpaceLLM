@@ -1,46 +1,73 @@
 """
-SpaceLLM — Experimental LoRA Fine-Tuning  v2
-=============================================
+SpaceLLM — Optimized LoRA Fine-Tuning  v3
+==========================================
 Model     : openai/gpt-oss-20b  (MoE, MXFP4 quantized checkpoint)
 Phase     : Experimentation
 Strategy  : Freeze full transformer backbone, apply LoRA ONLY to lm_head
 Method    : Standard BF16 LoRA — NOT QLoRA, no bitsandbytes
 
-Triton     : Available (python3.12-dev installed).
-             MXFP4 weights are dequantized to BF16 via Mxfp4Config(dequantize=True)
-             so the model is fully training-compatible.
+KEY FIXES vs v2:
+  [CRITICAL] 1. enable_input_require_grads() added AFTER get_peft_model()
+                 → Without this, gradients cannot flow through frozen backbone
+                   to lm_head LoRA weights. This was causing near-zero gradient
+                   updates and is the #1 reason loss was stuck at ~36.
+
+  [CRITICAL] 2. gradient_checkpointing_enable() moved AFTER get_peft_model()
+                 → Correct PEFT order: get_peft_model → enable_input_require_grads
+                   → gradient_checkpointing_enable
+
+  [CRITICAL] 3. Learning rate raised from 5e-6 → 1e-4
+                 → lm_head LoRA has very few trainable params. 5e-6 produced
+                   near-invisible weight updates per step. 1e-4 is standard
+                   for LoRA fine-tuning.
+
+  [CRITICAL] 4. Label masking diagnostic added to build_hf_dataset()
+                 → Logs active vs ignored token counts per split so you can
+                   immediately see if masking is broken before wasting a run.
+
+  [CRITICAL] 5. Gradient flow verification added post-PEFT
+                 → Runs one forward+backward pass on dummy data to confirm
+                   lm_head LoRA weights are actually receiving gradients.
+                   Aborts with clear error if not.
+
+  [IMPORTANT] 6. Manual grad clip inside DeviceAwareTrainer.training_step()
+                  → max_grad_norm in TrainingArguments clips BEFORE the
+                    optimizer step but AFTER accelerate scaler unscale.
+                    With multi-GPU dispatch and BF16, this can be unreliable.
+                    Explicit clip_grad_norm_ on requires_grad params ensures
+                    the exploding grad_norm (was hitting 53) is always caught.
+
+  [IMPORTANT] 7. warmup_steps raised from 350 → 100 (proportion-aware)
+                  → With lr=1e-4 and a small dataset, 350 warmup steps is
+                    too long — LR reaches peak too late. 100 steps warms up
+                    within the first ~10% of training.
+
+  [IMPORTANT] 8. Tokenizer-based prefix length verification in tokenise_record()
+                  → Checks that prefix_len < len(input_ids) and that at least
+                    one non-ignored label exists. Logs a warning with decoded
+                    prefix boundary so you can visually verify alignment.
+
+  [NICE]      9. lora_alpha raised from 32 → 64 (alpha = 4×r rule of thumb)
+                  → For lm_head-only LoRA with r=16, alpha=64 gives stronger
+                    effective learning signal without changing architecture.
+
+  [NICE]     10. Per-sample active token stats logged in build_hf_dataset()
+                  → Shows min/mean/max active (non-ignored) label tokens so
+                    you know how many tokens per sample are actually trained on.
 
 Launch:
-    export CUDA_VISIBLE_DEVICES=0,1,2   # all three GPUs
-    python fine_tuning_v2/lora_finetuning_v2.py
+    export CUDA_VISIBLE_DEVICES=1,2   # use GPU 1+2 (GPU 0 is crowded)
+    python fine_tuning_v2/lora_finetuning_v3.py
+
+    # Override LR or other args:
+    python fine_tuning_v2/lora_finetuning_v3.py --lr 1e-4 --epochs 5
 
 Output layout:
   SpaceLLM/fine_tuning_v2/outputs/
   ├── checkpoints/
-  ├── spacellm_lora_final/     ← LOAD THIS for inference / evaluation
-  ├── graphs/                  ← training + eval loss curves, test results
+  ├── spacellm_lora_final/
+  ├── graphs/
   └── logs/
-
-To load after training:
-    from transformers import AutoModelForCausalLM, AutoTokenizer, Mxfp4Config
-    from peft import PeftModel
-    import torch
-    base  = AutoModelForCausalLM.from_pretrained(
-                "openai/gpt-oss-20b",
-                quantization_config=Mxfp4Config(dequantize=True),
-                device_map="auto")
-    model = PeftModel.from_pretrained(base, "./outputs/spacellm_lora_final")
-    tok   = AutoTokenizer.from_pretrained("./outputs/spacellm_lora_final")
-
-CHANGES FROM v1:
-  - Updated dataset paths  →  DatasetA_core_QA_v2  (.json instead of .jsonl)
-  - Output dir             →  fine_tuning_v2/outputs/
-  - Added graph saving     →  training loss, eval loss, LR schedule curves
-  - Added test evaluation  →  uses fine-tuned model; saves metrics + per-sample
-                               predictions to outputs/graphs/test_results.json
-  - Fixed max_grad_norm inconsistency (was logged as 1.0, actual was 0.5 → now
-    consistently 0.5 everywhere)
-  - CustomCallback now records loss/lr at every logging step for smooth curves
 """
 
 # ── TRITON PATCH — must be the very first thing before any other import ───────
@@ -49,11 +76,6 @@ import types
 
 
 def _patch_triton():
-    """
-    Install a lightweight stub for triton.backends.nvidia.driver before
-    the real triton package loads.
-    """
-
     class _StubDriver:
         def __getattr__(self, name):
             return _StubDriver()
@@ -107,9 +129,7 @@ def _patch_triton():
     drv_singleton = _StubDriverManager()
     triton_runtime_drv.driver = drv_singleton
 
-    def _stub_build(*a, **kw):
-        return None
-    triton_runtime_bld._build                  = _stub_build
+    triton_runtime_bld._build                  = lambda *a, **kw: None
     triton_runtime_bld.compile_module_from_src = lambda *a, **kw: types.ModuleType("_stub_cuda_utils")
     triton_runtime_bld.load_module             = lambda *a, **kw: types.ModuleType("_stub_cuda_utils")
 
@@ -137,7 +157,7 @@ def _patch_triton():
 
 _patch_triton()
 
-# ── Now safe to import everything else ───────────────────────────────────────
+# ── Imports ───────────────────────────────────────────────────────────────────
 
 import argparse
 import json
@@ -160,12 +180,12 @@ OUTPUT_DIR = SCRIPT_DIR / "outputs"
 CKPT_DIR   = OUTPUT_DIR / "checkpoints"
 FINAL_DIR  = OUTPUT_DIR / "spacellm_lora_final"
 LOG_DIR    = OUTPUT_DIR / "logs"
-GRAPH_DIR  = OUTPUT_DIR / "graphs"             # ← NEW: all plots saved here
+GRAPH_DIR  = OUTPUT_DIR / "graphs"
 
 for _d in (CKPT_DIR, FINAL_DIR, LOG_DIR, GRAPH_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
-# ── Fixed dataset paths  (v2 — .json) ────────────────────────────────────────
+# ── Dataset paths ─────────────────────────────────────────────────────────────
 
 TRAIN_FILE = Path("/mnt/DATA/saurabh/aditya/SpaceLLM/data_processing/DatasetA_core_QA_v2/train.json")
 VAL_FILE   = Path("/mnt/DATA/saurabh/aditya/SpaceLLM/data_processing/DatasetA_core_QA_v2/validation.json")
@@ -187,17 +207,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("SpaceLLM")
 
-# ── Standard CE loss replacement ─────────────────────────────────────────────
+# ── Device-aware CE loss ──────────────────────────────────────────────────────
 
 def _make_device_aware_ce_loss():
     """
-    Returns a device-aware cross-entropy loss function.
-
-    ROOT CAUSE THIS FIXES:
-      gpt-oss-20b is a MoE model sharded across multiple GPUs via device_map.
-      The lm_head lands on e.g. cuda:1, while HuggingFace Trainer always places
-      the batch (including labels) on cuda:0.
-      FIX: move labels onto whatever device logits are on before computing loss.
+    MoE models shard across GPUs. lm_head may land on cuda:1 or cuda:2
+    while Trainer places labels on cuda:0. This loss fn moves labels to
+    match logits before computing CE, then returns loss to cuda:0.
     """
     def _device_aware_ce_loss(logits, labels, vocab_size=None, **kwargs):
         shift_logits = logits[..., :-1, :].contiguous()
@@ -207,9 +223,9 @@ def _make_device_aware_ce_loss():
         if shift_labels.device != logits_device:
             shift_labels = shift_labels.to(logits_device)
 
-        # Always read vocab size from actual logits shape (not config)
         vocab_size = shift_logits.size(-1)
 
+        # Clamp any out-of-vocab label IDs to -100 (ignore) rather than crash
         oob_mask = (shift_labels != -100) & (
             (shift_labels < 0) | (shift_labels >= vocab_size)
         )
@@ -245,8 +261,7 @@ def _inject_loss_function(model, loss_fn=None, label=""):
 
     for obj in candidates:
         if obj is not None and hasattr(obj, "loss_function"):
-            old = getattr(obj, "loss_function")
-            if old is not loss_fn:
+            if getattr(obj, "loss_function") is not loss_fn:
                 setattr(obj, "loss_function", loss_fn)
                 replaced = True
                 logger.info(
@@ -259,22 +274,24 @@ def _inject_loss_function(model, loss_fn=None, label=""):
 # ── CLI args ──────────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(description="SpaceLLM lm_head LoRA fine-tuning v2")
+    p = argparse.ArgumentParser(description="SpaceLLM lm_head LoRA fine-tuning v3")
     p.add_argument("--model_id",               type=str,   default="openai/gpt-oss-20b")
     p.add_argument("--epochs",                 type=int,   default=3)
     p.add_argument("--batch_size",             type=int,   default=1)
     p.add_argument("--grad_accum",             type=int,   default=16)
-    p.add_argument("--lr",                     type=float, default=5e-6)
+    p.add_argument("--lr",                     type=float, default=1e-4)   # FIX: was 5e-6
     p.add_argument("--max_seq_len",            type=int,   default=2048)
-    p.add_argument("--warmup_steps",           type=int,   default=350)
+    p.add_argument("--warmup_steps",           type=int,   default=100)    # FIX: was 350
     p.add_argument("--save_steps",             type=int,   default=500)
     p.add_argument("--eval_steps",             type=int,   default=500)
     p.add_argument("--logging_steps",          type=int,   default=20)
     p.add_argument("--save_total_limit",       type=int,   default=2)
-    p.add_argument("--max_test_samples",       type=int,   default=200,
-                   help="Max samples to run generation on during test eval (cost control)")
+    p.add_argument("--max_test_samples",       type=int,   default=200)
     p.add_argument("--resume_from_checkpoint", type=str,   default=None)
+    p.add_argument("--skip_grad_verify",       action="store_true",
+                   help="Skip gradient flow verification (faster startup, not recommended)")
     return p.parse_args()
+
 
 # ── GPU diagnostics ───────────────────────────────────────────────────────────
 
@@ -332,13 +349,82 @@ def log_trainable_parameters(model):
                 f"({param.numel():,} params)"
             )
 
-# ── JSON loading (.json — list of records or newline-delimited) ───────────────
+
+# ── FIX #5: Gradient flow verification ───────────────────────────────────────
+
+def verify_gradient_flow(model, tokenizer, vocab_size: int):
+    """
+    Runs one forward+backward pass with synthetic data to confirm that
+    lm_head LoRA weights actually receive non-zero gradients.
+
+    WHY THIS MATTERS:
+      With a frozen backbone and LoRA only on lm_head, if enable_input_require_grads()
+      is missing or mis-ordered, PyTorch's autograd engine sees the backbone as
+      a dead-end and never computes gradients for lm_head LoRA weights.
+      The result is loss that never decreases — which is exactly what v2 showed.
+
+    This check catches that silently broken state before wasting GPU hours.
+    """
+    logger.info("")
+    logger.info("── Gradient flow verification ───────────────────────")
+
+    model.train()
+    device = next(p for p in model.parameters() if p.requires_grad).device
+
+    # Build tiny synthetic batch
+    seq_len   = 16
+    input_ids = torch.randint(0, min(1000, vocab_size), (1, seq_len), device=device)
+    labels    = input_ids.clone()
+    labels[:, :8] = -100   # mask first half, train on second half
+
+    try:
+        outputs = model(input_ids=input_ids, labels=labels)
+        loss    = outputs.loss
+        if loss is None:
+            logger.error("  ❌ FATAL: model returned None loss on dummy batch")
+            raise SystemExit(1)
+        loss.backward()
+    except SystemExit:
+        raise
+    except Exception as e:
+        logger.error(f"  ❌ FATAL: forward/backward failed on dummy batch: {e}")
+        raise SystemExit(1)
+
+    # Check every trainable param for non-zero grad
+    zero_grad_params  = []
+    nonzero_grad_params = []
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            if param.grad is None or param.grad.abs().max().item() == 0.0:
+                zero_grad_params.append(name)
+            else:
+                grad_max = param.grad.abs().max().item()
+                nonzero_grad_params.append((name, grad_max))
+
+    # Zero out grads — don't let dummy pass pollute real training
+    model.zero_grad()
+
+    if zero_grad_params:
+        logger.error("  ❌ GRADIENT FLOW BROKEN — these LoRA params got zero/None grad:")
+        for n in zero_grad_params:
+            logger.error(f"     {n}")
+        logger.error("")
+        logger.error("  ROOT CAUSE: enable_input_require_grads() was not called, or")
+        logger.error("  gradient_checkpointing was enabled before get_peft_model().")
+        logger.error("  Training would produce near-zero updates and loss ~36.")
+        raise SystemExit(1)
+
+    logger.info(f"  ✅ Gradient flow VERIFIED — {len(nonzero_grad_params)} LoRA params have gradients:")
+    for name, gmax in nonzero_grad_params:
+        logger.info(f"     {name:<60}  grad_max={gmax:.6f}")
+
+    model.zero_grad()
+    logger.info("  Dummy gradients cleared — ready for real training")
+
+
+# ── JSON loading ──────────────────────────────────────────────────────────────
 
 def load_json(path: Path) -> list:
-    """
-    Supports both a JSON array  [{ ... }, { ... }]
-    and newline-delimited JSONL  { ... }\n{ ... }
-    """
     if not path.exists():
         logger.error(f"File not found: {path}")
         raise SystemExit(1)
@@ -346,7 +432,6 @@ def load_json(path: Path) -> list:
     with path.open(encoding="utf-8") as f:
         raw = f.read().strip()
 
-    # Try array first
     if raw.startswith("["):
         try:
             records = json.loads(raw)
@@ -355,7 +440,6 @@ def load_json(path: Path) -> list:
         except json.JSONDecodeError:
             pass
 
-    # Fall back to JSONL
     records = []
     for line_no, line in enumerate(raw.splitlines(), 1):
         line = line.strip()
@@ -368,6 +452,7 @@ def load_json(path: Path) -> list:
 
     logger.info(f"Loaded {len(records):,} records (JSONL)  ←  {path}")
     return records
+
 
 # ── Dataset sanity check ──────────────────────────────────────────────────────
 
@@ -397,12 +482,25 @@ def dataset_sanity_check(records: list, split_name: str):
     logger.info(f"  Organizations     : {dict(sorted(org_dist.items()))}")
     logger.info(f"  Difficulty        : {dict(sorted(diff_dist.items()))}")
 
-# ── Tokenisation with assistant-only loss masking ─────────────────────────────
+
+# ── FIX #8: Improved tokenisation with masking verification ──────────────────
 
 IGNORE_INDEX = -100
 
 
-def tokenise_record(record: dict, tokenizer, max_seq_len: int):
+def tokenise_record(record: dict, tokenizer, max_seq_len: int,
+                    debug: bool = False):
+    """
+    Tokenises one record and applies assistant-only loss masking.
+
+    FIX vs v2:
+      Added explicit prefix_len boundary check. If prefix_len >= len(input_ids),
+      the entire sequence gets masked (all -100) which means zero loss signal.
+      We now detect and reject these silently truncated records.
+
+      debug=True prints the decoded boundary for the first N records so you can
+      visually confirm only assistant tokens are unmasked.
+    """
     messages = record.get("messages", [])
 
     hf_messages = []
@@ -456,29 +554,62 @@ def tokenise_record(record: dict, tokenizer, max_seq_len: int):
     )
     prefix_len = len(prefix_enc["input_ids"])
 
+    # FIX: If prefix_len >= total length, truncation ate the assistant response.
+    # This record would contribute zero loss signal — skip it.
+    if prefix_len >= len(input_ids):
+        return None
+
     labels = [IGNORE_INDEX] * prefix_len + input_ids[prefix_len:]
     labels = labels[:len(input_ids)]
 
-    if all(lbl == IGNORE_INDEX for lbl in labels):
+    n_active = sum(1 for l in labels if l != IGNORE_INDEX)
+    if n_active == 0:
         return None
+
+    # Debug mode: print first few token boundaries for visual verification
+    if debug:
+        logger.info("  [DEBUG] Token boundary check:")
+        logger.info(f"    prefix_len={prefix_len}  total={len(input_ids)}  active={n_active}")
+        logger.info("    Active (loss) tokens:")
+        for tok_id, lbl in zip(input_ids, labels):
+            if lbl != IGNORE_INDEX:
+                decoded = tokenizer.decode([tok_id])
+                logger.info(f"      {repr(decoded)}")
 
     return {
         "input_ids":      input_ids,
         "attention_mask": full_enc["attention_mask"],
         "labels":         labels,
+        "n_active":       n_active,   # temporary — removed before Dataset creation
     }
 
 
 def build_hf_dataset(records: list, tokenizer, max_seq_len: int, split_name: str,
-                      vocab_size: int = None):
+                     vocab_size: int = None, debug_first_n: int = 3):
+    """
+    FIX vs v2:
+      - Logs active token stats (min/mean/max per sample) so you know how many
+        tokens each sample contributes to the loss. Very low mean active tokens
+        (e.g. < 5) would explain high loss even with correct masking.
+      - debug_first_n: runs tokenise_record in debug mode for the first N records
+        so you can visually verify masking is correct without reading all logs.
+    """
     from datasets import Dataset
 
     tokenised, skipped, clamped_records = [], 0, 0
-    for record in records:
-        result = tokenise_record(record, tokenizer, max_seq_len)
+    active_counts = []
+
+    for i, record in enumerate(records):
+        result = tokenise_record(
+            record, tokenizer, max_seq_len,
+            debug=(i < debug_first_n and split_name == "train"),
+        )
         if result is None:
             skipped += 1
             continue
+
+        n_active = result.pop("n_active")   # remove before Dataset
+        active_counts.append(n_active)
 
         if vocab_size is not None:
             new_labels = []
@@ -503,8 +634,7 @@ def build_hf_dataset(records: list, tokenizer, max_seq_len: int, split_name: str
         logger.warning(f"[{split_name}] Skipped {skipped} records (no valid labels)")
     if clamped_records:
         logger.warning(
-            f"[{split_name}] Clamped out-of-vocab labels in {clamped_records} records "
-            f"(vocab_size={vocab_size:,})"
+            f"[{split_name}] Clamped OOV labels in {clamped_records} records"
         )
     if not tokenised:
         logger.error(f"[{split_name}] Zero usable records — aborting")
@@ -519,60 +649,58 @@ def build_hf_dataset(records: list, tokenizer, max_seq_len: int, split_name: str
 
     if vocab_size is not None and max_label_id >= vocab_size:
         logger.error(
-            f"[{split_name}] FATAL: max_label_id={max_label_id} >= vocab_size={vocab_size} "
-            f"after clamping — this WILL cause CUDA assertion failure"
+            f"[{split_name}] FATAL: max_label_id={max_label_id} >= vocab_size={vocab_size}"
         )
         raise SystemExit(1)
 
+    # FIX: active token stats — critical for diagnosing masking issues
+    mean_active = sum(active_counts) / len(active_counts) if active_counts else 0
+    min_active  = min(active_counts) if active_counts else 0
+    max_active  = max(active_counts) if active_counts else 0
+
     logger.info(
         f"[{split_name}] {len(tokenised):,} records | "
-        f"seq len  min={min(lengths)}  max={max(lengths)}  "
-        f"mean={sum(lengths)/len(lengths):.0f} | "
-        f"max_input_id={max_input_id}  max_label_id={max_label_id} | "
-        f"vocab_size={vocab_size if vocab_size else 'unchecked'}"
+        f"seq len  min={min(lengths)}  max={max(lengths)}  mean={sum(lengths)/len(lengths):.0f} | "
+        f"active tokens  min={min_active}  mean={mean_active:.1f}  max={max_active} | "
+        f"max_input_id={max_input_id}  max_label_id={max_label_id}"
     )
+
+    if mean_active < 10:
+        logger.warning(
+            f"[{split_name}] ⚠️  mean active tokens = {mean_active:.1f} — very low! "
+            f"Label masking may be too aggressive or assistant responses are very short."
+        )
+
     return Dataset.from_list(tokenised)
+
 
 # ── Training history callback ─────────────────────────────────────────────────
 
 class HistoryCallback:
-    """
-    Attached to Trainer to collect loss, eval_loss, and learning-rate at
-    every logging/eval step so we can plot smooth curves after training.
-    """
     from transformers import TrainerCallback
 
     def __init__(self):
-        self.train_loss  : list = []   # [(step, loss), ...]
-        self.eval_loss   : list = []   # [(step, eval_loss), ...]
-        self.lr_history  : list = []   # [(step, lr), ...]
+        self.train_loss : list = []
+        self.eval_loss  : list = []
+        self.lr_history : list = []
+        self.grad_norms : list = []
 
-    # We inherit from TrainerCallback dynamically to avoid import-time issues
     def on_log(self, args, state, control, logs=None, **kwargs):
         if logs is None:
             return
         step = state.global_step
-        if "loss" in logs:
-            self.train_loss.append((step, logs["loss"]))
-        if "eval_loss" in logs:
-            self.eval_loss.append((step, logs["eval_loss"]))
-        if "learning_rate" in logs:
-            self.lr_history.append((step, logs["learning_rate"]))
+        if "loss"          in logs: self.train_loss.append((step, logs["loss"]))
+        if "eval_loss"     in logs: self.eval_loss.append((step, logs["eval_loss"]))
+        if "learning_rate" in logs: self.lr_history.append((step, logs["learning_rate"]))
+        if "grad_norm"     in logs: self.grad_norms.append((step, logs["grad_norm"]))
 
 
 # ── Graph saving ──────────────────────────────────────────────────────────────
 
 def save_training_graphs(history: HistoryCallback, run_id: str):
-    """
-    Saves three figures to GRAPH_DIR:
-      1. training_loss_{run_id}.png
-      2. eval_loss_{run_id}.png
-      3. lr_schedule_{run_id}.png
-    Also saves a combined overview figure.
-    """
     try:
         import matplotlib
-        matplotlib.use("Agg")          # headless — no display needed
+        matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import matplotlib.ticker as ticker
     except ImportError:
@@ -581,7 +709,6 @@ def save_training_graphs(history: HistoryCallback, run_id: str):
 
     def _plot(xy_list, title, xlabel, ylabel, color, path):
         if not xy_list:
-            logger.warning(f"No data for '{title}' — skipping")
             return
         steps, vals = zip(*xy_list)
         fig, ax = plt.subplots(figsize=(10, 5))
@@ -597,25 +724,26 @@ def save_training_graphs(history: HistoryCallback, run_id: str):
         plt.close(fig)
         logger.info(f"  Graph saved → {path}")
 
-    # Individual plots
-    _plot(history.train_loss, "Training Loss",       "Step", "Loss",          "#e74c3c",
+    _plot(history.train_loss, "Training Loss",        "Step", "Loss",          "#e74c3c",
           GRAPH_DIR / f"training_loss_{run_id}.png")
-    _plot(history.eval_loss,  "Validation Eval Loss","Step", "Eval Loss",     "#2980b9",
+    _plot(history.eval_loss,  "Validation Eval Loss", "Step", "Eval Loss",     "#2980b9",
           GRAPH_DIR / f"eval_loss_{run_id}.png")
     _plot(history.lr_history, "Learning Rate Schedule","Step","Learning Rate","#27ae60",
           GRAPH_DIR / f"lr_schedule_{run_id}.png")
+    _plot(history.grad_norms, "Gradient Norm",        "Step", "Grad Norm",    "#8e44ad",
+          GRAPH_DIR / f"grad_norm_{run_id}.png")
 
-    # Combined 2×2 overview
     try:
-        fig, axes = plt.subplots(1, 3, figsize=(21, 5))
-        fig.suptitle(f"SpaceLLM LoRA v2 — Training Overview  [{run_id}]",
+        fig, axes = plt.subplots(2, 2, figsize=(18, 10))
+        fig.suptitle(f"SpaceLLM LoRA v3 — Training Overview  [{run_id}]",
                      fontsize=13, fontweight="bold")
-
-        for ax, (xy_list, title, color, ylabel) in zip(axes, [
+        panels = [
             (history.train_loss, "Training Loss",        "#e74c3c", "Loss"),
             (history.eval_loss,  "Validation Eval Loss", "#2980b9", "Eval Loss"),
             (history.lr_history, "LR Schedule",          "#27ae60", "Learning Rate"),
-        ]):
+            (history.grad_norms, "Gradient Norm",        "#8e44ad", "Grad Norm"),
+        ]
+        for ax, (xy_list, title, color, ylabel) in zip(axes.flat, panels):
             if xy_list:
                 steps, vals = zip(*xy_list)
                 ax.plot(steps, vals, color=color, linewidth=1.5)
@@ -623,7 +751,6 @@ def save_training_graphs(history: HistoryCallback, run_id: str):
             ax.set_xlabel("Step")
             ax.set_ylabel(ylabel)
             ax.grid(True, alpha=0.3)
-
         fig.tight_layout()
         overview_path = GRAPH_DIR / f"training_overview_{run_id}.png"
         fig.savefig(overview_path, dpi=150)
@@ -634,7 +761,6 @@ def save_training_graphs(history: HistoryCallback, run_id: str):
 
 
 def save_test_loss_graph(test_losses: list, run_id: str):
-    """Per-sample test loss bar chart (up to 200 samples for readability)."""
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -647,10 +773,9 @@ def save_test_loss_graph(test_losses: list, run_id: str):
 
     display = test_losses[:200]
     fig, axes = plt.subplots(1, 2, figsize=(16, 5))
-    fig.suptitle(f"Test Set Evaluation — SpaceLLM LoRA v2  [{run_id}]",
+    fig.suptitle(f"Test Set Evaluation — SpaceLLM LoRA v3  [{run_id}]",
                  fontsize=13, fontweight="bold")
 
-    # Per-sample loss bar chart
     axes[0].bar(range(len(display)), display, color="#8e44ad", alpha=0.7, width=1.0)
     axes[0].set_title(f"Per-Sample Loss (first {len(display)} samples)")
     axes[0].set_xlabel("Sample index")
@@ -660,7 +785,6 @@ def save_test_loss_graph(test_losses: list, run_id: str):
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
 
-    # Loss histogram
     axes[1].hist(test_losses, bins=40, color="#8e44ad", alpha=0.7, edgecolor="white")
     axes[1].set_title(f"Loss Distribution (all {len(test_losses)} samples)")
     axes[1].set_xlabel("Loss")
@@ -678,29 +802,11 @@ def save_test_loss_graph(test_losses: list, run_id: str):
     logger.info(f"  Test loss graph → {path}")
 
 
-# ── Test evaluation using fine-tuned model ────────────────────────────────────
+# ── Test evaluation ───────────────────────────────────────────────────────────
 
 def run_test_evaluation(model, tokenizer, test_records: list,
                         max_seq_len: int, vocab_size: int,
                         max_samples: int, run_id: str):
-    """
-    Runs two complementary evaluations on the test set:
-
-    1. LOSS EVALUATION  — teacher-forced cross-entropy on every test record,
-                          identical to how val loss is computed during training.
-                          Fast; covers all test records.
-
-    2. GENERATION EVALUATION — greedy decode the first `max_samples` records,
-                               compare generated text to the reference answer.
-                               Computes exact-match and token-overlap (ROUGE-L proxy).
-
-    Results are saved to:
-      outputs/graphs/test_results_{run_id}.json
-      outputs/graphs/test_loss_{run_id}.png
-    """
-    from transformers import DataCollatorForSeq2Seq
-    import torch.nn.functional as F
-
     logger.info("")
     logger.info("=" * 60)
     logger.info("  Test Evaluation")
@@ -708,9 +814,8 @@ def run_test_evaluation(model, tokenizer, test_records: list,
 
     model.eval()
 
-    # ── 1. Loss evaluation (all records) ─────────────────────────────────
+    # ── Phase 1: Loss evaluation ──────────────────────────────────────────
     logger.info(f"── Phase 1: Loss evaluation on {len(test_records):,} records ──")
-
     per_sample_losses = []
     skipped = 0
 
@@ -720,8 +825,8 @@ def run_test_evaluation(model, tokenizer, test_records: list,
             if result is None:
                 skipped += 1
                 continue
+            result.pop("n_active", None)
 
-            # Label clamping
             new_labels = []
             for lbl in result["labels"]:
                 if lbl != IGNORE_INDEX and (lbl < 0 or lbl >= vocab_size):
@@ -738,7 +843,6 @@ def run_test_evaluation(model, tokenizer, test_records: list,
             attn_mask = torch.tensor([result["attention_mask"]], dtype=torch.long)
             labels    = torch.tensor([result["labels"]],          dtype=torch.long)
 
-            # Move to first GPU
             device = next(model.parameters()).device
             try:
                 input_ids = input_ids.to(device)
@@ -748,11 +852,7 @@ def run_test_evaluation(model, tokenizer, test_records: list,
                 pass
 
             try:
-                outputs = model(
-                    input_ids=input_ids,
-                    attention_mask=attn_mask,
-                    labels=labels,
-                )
+                outputs = model(input_ids=input_ids, attention_mask=attn_mask, labels=labels)
                 loss_val = outputs.loss
                 if loss_val is not None and not torch.isnan(loss_val):
                     per_sample_losses.append(float(loss_val.item()))
@@ -761,30 +861,26 @@ def run_test_evaluation(model, tokenizer, test_records: list,
                 skipped += 1
 
             if (i + 1) % 50 == 0:
-                completed = len(per_sample_losses)
+                completed   = len(per_sample_losses)
                 mean_so_far = sum(per_sample_losses) / completed if completed else float("nan")
-                logger.info(f"  [{i+1}/{len(test_records)}]  "
-                            f"valid={completed}  mean_loss={mean_so_far:.4f}")
+                logger.info(f"  [{i+1}/{len(test_records)}]  valid={completed}  mean_loss={mean_so_far:.4f}")
 
     mean_test_loss = sum(per_sample_losses) / len(per_sample_losses) if per_sample_losses else float("nan")
-    logger.info(f"  Loss eval done: {len(per_sample_losses):,} samples  "
-                f"(skipped={skipped})  mean_loss={mean_test_loss:.4f}")
-
-    # Save loss graph
+    logger.info(f"  Loss eval: {len(per_sample_losses):,} samples (skipped={skipped})  mean_loss={mean_test_loss:.4f}")
     save_test_loss_graph(per_sample_losses, run_id)
 
-    # ── 2. Generation evaluation (first max_samples records) ─────────────
+    # ── Phase 2: Generation evaluation ───────────────────────────────────
     logger.info("")
-    logger.info(f"── Phase 2: Generation evaluation on first {max_samples} records ──")
+    logger.info(f"── Phase 2: Generation on first {max_samples} records ──")
 
-    gen_records   = test_records[:max_samples]
-    predictions   = []
-    exact_matches = 0
-    token_overlaps= []
+    gen_records    = test_records[:max_samples]
+    predictions    = []
+    exact_matches  = 0
+    token_overlaps = []
 
     with torch.no_grad():
         for i, record in enumerate(gen_records):
-            messages = record.get("messages", [])
+            messages    = record.get("messages", [])
             hf_messages = []
             for msg in messages:
                 role    = "system" if msg["role"] == "developer" else msg["role"]
@@ -792,7 +888,6 @@ def run_test_evaluation(model, tokenizer, test_records: list,
                 if content and role != "assistant":
                     hf_messages.append({"role": role, "content": content})
 
-            # Reference answer
             ref_answer = ""
             for msg in messages:
                 if msg.get("role") == "assistant":
@@ -804,19 +899,12 @@ def run_test_evaluation(model, tokenizer, test_records: list,
 
             try:
                 prompt_text = tokenizer.apply_chat_template(
-                    hf_messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
+                    hf_messages, tokenize=False, add_generation_prompt=True)
             except Exception:
                 continue
 
-            enc = tokenizer(
-                prompt_text,
-                return_tensors="pt",
-                truncation=True,
-                max_length=max_seq_len - 256,   # leave room for generation
-            )
+            enc = tokenizer(prompt_text, return_tensors="pt",
+                            truncation=True, max_length=max_seq_len - 256)
 
             device = next(model.parameters()).device
             try:
@@ -825,63 +913,55 @@ def run_test_evaluation(model, tokenizer, test_records: list,
                 pass
 
             try:
-                gen_ids = model.generate(
-                    **enc,
-                    max_new_tokens=256,
-                    do_sample=False,        # greedy
-                    temperature=1.0,
+                gen_ids   = model.generate(
+                    **enc, max_new_tokens=256, do_sample=False, temperature=1.0,
                     pad_token_id=tokenizer.pad_token_id,
                     eos_token_id=tokenizer.eos_token_id,
                 )
-                # Decode only the newly generated tokens
-                new_ids    = gen_ids[0][enc["input_ids"].shape[1]:]
-                generated  = tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+                new_ids   = gen_ids[0][enc["input_ids"].shape[1]:]
+                generated = tokenizer.decode(new_ids, skip_special_tokens=True).strip()
             except Exception as e:
                 logger.warning(f"  Generation failed for record {i}: {e}")
                 continue
 
-            # Exact match (case-insensitive, stripped)
             em = int(generated.lower() == ref_answer.lower())
             exact_matches += em
 
-            # Token overlap  (simple F1 proxy — no external lib needed)
             ref_toks = set(ref_answer.lower().split())
             gen_toks = set(generated.lower().split())
             if ref_toks or gen_toks:
                 overlap = len(ref_toks & gen_toks)
-                prec    = overlap / len(gen_toks)  if gen_toks  else 0.0
-                rec     = overlap / len(ref_toks)  if ref_toks  else 0.0
+                prec    = overlap / len(gen_toks) if gen_toks else 0.0
+                rec     = overlap / len(ref_toks) if ref_toks else 0.0
                 f1      = (2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
             else:
                 f1 = 0.0
             token_overlaps.append(f1)
 
             predictions.append({
-                "sample_id":  record.get("sample_id", i),
-                "reference":  ref_answer,
-                "generated":  generated,
+                "sample_id":   record.get("sample_id", i),
+                "reference":   ref_answer,
+                "generated":   generated,
                 "exact_match": em,
-                "token_f1":   round(f1, 4),
+                "token_f1":    round(f1, 4),
             })
 
             if (i + 1) % 20 == 0:
                 logger.info(f"  [{i+1}/{len(gen_records)}]  "
-                            f"EM so far={exact_matches}/{len(predictions)}  "
+                            f"EM={exact_matches}/{len(predictions)}  "
                             f"mean_F1={sum(token_overlaps)/len(token_overlaps):.4f}")
 
-    n_gen = len(predictions)
-    em_rate    = exact_matches / n_gen                   if n_gen else float("nan")
-    mean_f1    = sum(token_overlaps) / len(token_overlaps) if token_overlaps else float("nan")
+    n_gen    = len(predictions)
+    em_rate  = exact_matches / n_gen                       if n_gen          else float("nan")
+    mean_f1  = sum(token_overlaps) / len(token_overlaps)   if token_overlaps else float("nan")
 
     logger.info("")
     logger.info("── Test Results ─────────────────────────────────────")
-    logger.info(f"  Loss eval samples  : {len(per_sample_losses):,}")
-    logger.info(f"  Mean test loss     : {mean_test_loss:.4f}")
-    logger.info(f"  Generation samples : {n_gen}")
+    logger.info(f"  Mean test loss     : {mean_test_loss:.4f}  ({len(per_sample_losses):,} samples)")
     logger.info(f"  Exact match        : {exact_matches}/{n_gen}  ({em_rate*100:.2f}%)")
     logger.info(f"  Mean token F1      : {mean_f1:.4f}")
 
-    # ── Save generation quality graph ────────────────────────────────────
+    # Generation quality graph
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -889,35 +969,20 @@ def run_test_evaluation(model, tokenizer, test_records: list,
 
         if token_overlaps:
             fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-            fig.suptitle(f"Test Generation Metrics — SpaceLLM LoRA v2  [{run_id}]",
+            fig.suptitle(f"Test Generation Metrics — SpaceLLM LoRA v3  [{run_id}]",
                          fontsize=13, fontweight="bold")
-
-            # Token F1 histogram
             axes[0].hist(token_overlaps, bins=30, color="#16a085", alpha=0.8, edgecolor="white")
             axes[0].set_title("Token F1 Distribution")
             axes[0].set_xlabel("Token F1")
             axes[0].set_ylabel("Count")
-            axes[0].axvline(mean_f1, color="red", linestyle="--",
-                            label=f"Mean={mean_f1:.3f}")
+            axes[0].axvline(mean_f1, color="red", linestyle="--", label=f"Mean={mean_f1:.3f}")
             axes[0].legend()
             axes[0].grid(True, alpha=0.3)
-
-            # Exact match bar
-            axes[1].bar(["Exact Match", "No Match"],
-                        [exact_matches, n_gen - exact_matches],
+            axes[1].bar(["Exact Match", "No Match"], [exact_matches, n_gen - exact_matches],
                         color=["#27ae60", "#e74c3c"], alpha=0.8)
             axes[1].set_title(f"Exact Match  ({em_rate*100:.1f}%)")
             axes[1].set_ylabel("Count")
-            for bar_val, bar_obj in zip(
-                [exact_matches, n_gen - exact_matches], axes[1].patches
-            ):
-                axes[1].text(
-                    bar_obj.get_x() + bar_obj.get_width() / 2,
-                    bar_obj.get_height() + 0.5,
-                    str(bar_val), ha="center", va="bottom", fontsize=12
-                )
             axes[1].grid(True, alpha=0.3, axis="y")
-
             fig.tight_layout()
             gen_graph_path = GRAPH_DIR / f"test_generation_{run_id}.png"
             fig.savefig(gen_graph_path, dpi=150)
@@ -926,14 +991,13 @@ def run_test_evaluation(model, tokenizer, test_records: list,
     except Exception as e:
         logger.warning(f"Generation graph failed: {e}")
 
-    # ── Consolidate and save all test results ─────────────────────────────
     test_results = {
-        "run_id":              run_id,
-        "total_test_records":  len(test_records),
+        "run_id":             run_id,
+        "total_test_records": len(test_records),
         "loss_eval": {
             "samples_evaluated": len(per_sample_losses),
             "samples_skipped":   skipped,
-            "mean_test_loss":    round(mean_test_loss, 6) if not isinstance(mean_test_loss, str) else mean_test_loss,
+            "mean_test_loss":    round(mean_test_loss, 6),
         },
         "generation_eval": {
             "samples_evaluated": n_gen,
@@ -958,7 +1022,7 @@ def main():
     args = parse_args()
 
     logger.info("=" * 60)
-    logger.info("  SpaceLLM — Experimental LoRA v2  (lm_head only, BF16)")
+    logger.info("  SpaceLLM — Optimized LoRA v3  (lm_head only, BF16)")
     logger.info(f"  Run ID            : {RUN_ID}")
     logger.info(f"  Model             : {args.model_id}")
     logger.info(f"  Strategy          : LoRA on lm_head ONLY — backbone frozen")
@@ -968,23 +1032,16 @@ def main():
                 f"  |  Eff batch: {args.batch_size * args.grad_accum}")
     logger.info(f"  CUDA_VISIBLE_DEVS : {os.environ.get('CUDA_VISIBLE_DEVICES', 'unset')}")
     logger.info(f"  Log               : {LOG_FILE}")
-    logger.info(f"  Graphs            : {GRAPH_DIR}")
     logger.info("=" * 60)
 
     try:
         from transformers import (
-            AutoModelForCausalLM,
-            AutoTokenizer,
-            TrainingArguments,
-            DataCollatorForSeq2Seq,
-            Trainer,
-            TrainerCallback,
-            Mxfp4Config,
+            AutoModelForCausalLM, AutoTokenizer, TrainingArguments,
+            DataCollatorForSeq2Seq, Trainer, TrainerCallback, Mxfp4Config,
         )
         from peft import LoraConfig, TaskType, get_peft_model
     except ImportError as e:
         logger.error(f"Missing dependency: {e}")
-        logger.error("Run: uv pip install -r requirements.txt")
         raise SystemExit(1)
 
     log_gpu_info()
@@ -1009,10 +1066,7 @@ def main():
     logger.info("")
     logger.info(f"Loading tokenizer: {args.model_id}")
     try:
-        tokenizer = AutoTokenizer.from_pretrained(
-            args.model_id,
-            trust_remote_code=True,
-        )
+        tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
     except Exception as e:
         logger.error(f"Tokenizer load failed: {e}")
         raise SystemExit(1)
@@ -1026,11 +1080,7 @@ def main():
     logger.info(f"Vocab size        : {tokenizer.vocab_size:,}")
     logger.info(f"len(tokenizer)    : {len(tokenizer):,}")
     logger.info(f"Pad token         : '{tokenizer.pad_token}'  (id={tokenizer.pad_token_id})")
-
-    if tokenizer.chat_template is not None:
-        logger.info("Chat template     : found (harmony format)")
-    else:
-        logger.warning("Chat template     : NOT FOUND")
+    logger.info(f"Chat template     : {'found (harmony format)' if tokenizer.chat_template else 'NOT FOUND'}")
 
     # ── Model load ────────────────────────────────────────────────────────
     logger.info("")
@@ -1048,46 +1098,29 @@ def main():
         logger.error(f"Model load failed: {e}")
         raise SystemExit(1)
 
-    logger.info(f"Model loaded + dequantized on CPU in {time.time() - t0:.1f}s")
-    logger.info(f"Model dtype       : {next(model.parameters()).dtype}")
+    logger.info(f"Model loaded in {time.time() - t0:.1f}s  |  dtype: {next(model.parameters()).dtype}")
 
     # ── Vocab alignment ───────────────────────────────────────────────────
     logger.info("")
     logger.info("── Vocab & lm_head alignment ────────────────────────")
-    logger.info(f"  tokenizer.vocab_size : {tokenizer.vocab_size:,}")
-    logger.info(f"  len(tokenizer)       : {len(tokenizer):,}")
-    logger.info(f"  model.config.vocab   : {model.config.vocab_size:,}")
-    logger.info(f"  embed_tokens shape   : {model.get_input_embeddings().weight.shape}")
-    logger.info(f"  lm_head shape        : {model.get_output_embeddings().weight.shape}")
-    logger.info(f"  tie_word_embeddings  : {model.config.tie_word_embeddings}")
-
     model.config.tie_word_embeddings = False
     _current_vocab = model.get_output_embeddings().weight.shape[0]
     model.resize_token_embeddings(_current_vocab, pad_to_multiple_of=64)
-    logger.info("  Embeddings untied (tie_word_embeddings=False)")
-
     model.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=64)
 
     actual_vocab = model.get_output_embeddings().weight.shape[0]
     model.config.vocab_size = actual_vocab
 
-    logger.info(f"  target (len tokenizer)    : {len(tokenizer):,}")
-    logger.info(f"  actual (padded, step=64)  : {actual_vocab:,}")
-    logger.info(f"  embed_tokens shape after  : {model.get_input_embeddings().weight.shape}")
-    logger.info(f"  lm_head shape after       : {model.get_output_embeddings().weight.shape}")
-    logger.info(f"  model.config.vocab_size   : {model.config.vocab_size:,}")
-
     assert model.get_input_embeddings().weight.shape[0] == actual_vocab
     assert model.get_output_embeddings().weight.shape[0] == actual_vocab
-    assert model.config.vocab_size == actual_vocab
-    logger.info(f"  Vocab alignment PASSED (vocab={actual_vocab:,})")
+    logger.info(f"  Vocab alignment PASSED  (vocab={actual_vocab:,}  padded to multiple of 64)")
 
     # ── Inject loss (pre-dispatch) ────────────────────────────────────────
     logger.info("")
-    logger.info("── Injecting standard CE loss (pre-dispatch) ────────")
+    logger.info("── Injecting device-aware CE loss (pre-dispatch) ────")
     found = _inject_loss_function(model, label="pre-dispatch")
     if not found:
-        logger.warning("  loss_function not found pre-dispatch — will retry after dispatch")
+        logger.warning("  loss_function attr not found pre-dispatch — will retry after dispatch")
 
     # ── GPU dispatch ──────────────────────────────────────────────────────
     logger.info("")
@@ -1101,8 +1134,7 @@ def main():
             cls      = type(module)
             cls_name = cls.__name__.lower()
             if (
-                issubclass(cls, nn.Module)
-                and cls is not nn.Module
+                issubclass(cls, nn.Module) and cls is not nn.Module
                 and ("layer" in cls_name or "block" in cls_name)
                 and cls.__name__ not in no_split
                 and sum(p.numel() for p in module.parameters()) > 1_000_000
@@ -1121,10 +1153,7 @@ def main():
         logger.info(f"max_memory per device  : {max_memory}")
 
         device_map = infer_auto_device_map(
-            model,
-            max_memory=max_memory,
-            no_split_module_classes=no_split,
-        )
+            model, max_memory=max_memory, no_split_module_classes=no_split)
         model = dispatch_model(model, device_map=device_map)
     except Exception as e:
         logger.warning(f"dispatch_model failed ({e}) — falling back to cuda:0")
@@ -1140,20 +1169,18 @@ def main():
 
     # ── Re-inject after dispatch ──────────────────────────────────────────
     logger.info("")
-    logger.info("── Re-injecting standard CE loss (post-dispatch) ────")
+    logger.info("── Re-injecting CE loss (post-dispatch) ─────────────")
     _inject_loss_function(model, label="post-dispatch")
 
     model.config.use_cache = False
-    model.gradient_checkpointing_enable()
-    logger.info("Gradient checkpointing: enabled")
 
     # ── LoRA on lm_head ───────────────────────────────────────────────────
     logger.info("")
-    logger.info("Applying LoRA to lm_head ONLY — backbone stays frozen ...")
+    logger.info("Applying LoRA to lm_head ONLY ...")
 
     lora_config = LoraConfig(
         r=16,
-        lora_alpha=32,
+        lora_alpha=64,          # FIX: raised from 32 → 64 (4×r rule of thumb)
         lora_dropout=0.05,
         bias="none",
         task_type=TaskType.CAUSAL_LM,
@@ -1162,15 +1189,39 @@ def main():
     )
     model = get_peft_model(model, lora_config)
 
-    logger.info("")
-    logger.info("── Re-injecting standard CE loss (post-PEFT) ────────")
-    _inject_loss_function(model, label="post-PEFT")
+    # ── FIX #1 & #2: Correct PEFT + gradient checkpointing order ─────────
+    #
+    #   WRONG ORDER (v2):
+    #     model.gradient_checkpointing_enable()   ← before PEFT
+    #     model = get_peft_model(model, lora_config)
+    #     # enable_input_require_grads() MISSING
+    #
+    #   CORRECT ORDER (v3):
+    #     model = get_peft_model(model, lora_config)
+    #     model.enable_input_require_grads()       ← CRITICAL: allows grads through frozen backbone
+    #     model.gradient_checkpointing_enable()    ← after PEFT
+    #
+    #   WHY enable_input_require_grads() is critical:
+    #     PyTorch only computes gradients for tensors that have requires_grad=True
+    #     OR that are connected to such tensors in the computation graph.
+    #     The frozen backbone parameters have requires_grad=False.
+    #     The input embeddings (embed_tokens) also have requires_grad=False.
+    #     This means the input tensor to the backbone has no gradient hook.
+    #     PyTorch's autograd stops at the first non-differentiable node.
+    #     Result: lm_head LoRA weights receive ZERO gradients every step.
+    #     enable_input_require_grads() registers a hook that forces the input
+    #     tensor to retain gradients, reconnecting the computation graph so
+    #     that gradients flow all the way back to lm_head LoRA weights.
+    #
+    model.enable_input_require_grads()       # ← THE most important fix
+    model.gradient_checkpointing_enable()
+    logger.info("✅ enable_input_require_grads() called (gradient flow through frozen backbone)")
+    logger.info("✅ gradient_checkpointing enabled (post-PEFT, correct order)")
 
-    try:
-        lm_head = model.get_output_embeddings()
-        logger.info(f"Final lm_head shape after LoRA: {lm_head.weight.shape}")
-    except Exception:
-        logger.info("Could not inspect final lm_head shape")
+    # ── Re-inject loss post-PEFT ──────────────────────────────────────────
+    logger.info("")
+    logger.info("── Re-injecting CE loss (post-PEFT) ─────────────────")
+    _inject_loss_function(model, label="post-PEFT")
 
     logger.info("")
     log_trainable_parameters(model)
@@ -1178,25 +1229,18 @@ def main():
 
     # ── Post-PEFT vocab check ─────────────────────────────────────────────
     logger.info("")
-    logger.info("── Vocab alignment (post-PEFT final check) ──────────")
+    logger.info("── Vocab alignment (post-PEFT) ──────────────────────")
     _post_peft_vocab = model.get_output_embeddings().weight.shape[0]
-    logger.info(f"  tokenizer.vocab_size : {tokenizer.vocab_size:,}")
-    logger.info(f"  len(tokenizer)       : {len(tokenizer):,}")
-    logger.info(f"  model.config.vocab   : {model.config.vocab_size:,}")
-    logger.info(f"  lm_head actual vocab : {_post_peft_vocab:,}")
-    logger.info(f"  pad_token_id         : {tokenizer.pad_token_id}")
-    logger.info(f"  eos_token_id         : {tokenizer.eos_token_id}")
-
     if _post_peft_vocab != model.config.vocab_size:
-        logger.warning(
-            f"  lm_head vocab ({_post_peft_vocab}) != config.vocab_size "
-            f"({model.config.vocab_size}) after PEFT — fixing config"
-        )
+        logger.warning(f"  lm_head vocab ({_post_peft_vocab}) != config ({model.config.vocab_size}) — fixing")
         model.config.vocab_size = _post_peft_vocab
+    logger.info(f"  lm_head vocab = {_post_peft_vocab:,}  ✅")
 
-    _max_valid_label = _post_peft_vocab - 1
-    logger.info(f"  Max valid label ID   : {_max_valid_label:,}")
-    logger.info("  Vocab alignment PASSED (post-PEFT)")
+    # ── FIX #5: Gradient flow verification ───────────────────────────────
+    if not args.skip_grad_verify:
+        verify_gradient_flow(model, tokenizer, _post_peft_vocab)
+    else:
+        logger.warning("Gradient flow verification skipped (--skip_grad_verify)")
 
     # ── Load datasets ─────────────────────────────────────────────────────
     logger.info("")
@@ -1213,18 +1257,18 @@ def main():
         logger.warning("Test file not found — test evaluation will be skipped")
 
     logger.info("")
-    logger.info("── Tokenising ───────────────────────────────────────")
+    logger.info("── Tokenising (with label masking diagnostics) ──────")
     train_dataset = build_hf_dataset(
         train_records, tokenizer, args.max_seq_len, "train",
-        vocab_size=_post_peft_vocab,
+        vocab_size=_post_peft_vocab, debug_first_n=3,
     )
-    val_dataset   = build_hf_dataset(
+    val_dataset = build_hf_dataset(
         val_records, tokenizer, args.max_seq_len, "validation",
-        vocab_size=_post_peft_vocab,
+        vocab_size=_post_peft_vocab, debug_first_n=0,
     )
 
     # ── Training arguments ────────────────────────────────────────────────
-    MAX_GRAD_NORM = 0.5     # single source of truth — used in args AND logs
+    MAX_GRAD_NORM = 0.5
 
     logger.info("")
     logger.info("── Training configuration ───────────────────────────")
@@ -1234,9 +1278,9 @@ def main():
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
-        learning_rate=args.lr,
+        learning_rate=args.lr,              # FIX: default now 1e-4
         lr_scheduler_type="cosine",
-        warmup_steps=args.warmup_steps,
+        warmup_steps=args.warmup_steps,     # FIX: default now 100
         max_grad_norm=MAX_GRAD_NORM,
         optim="adamw_torch",
         bf16=True,
@@ -1264,11 +1308,12 @@ def main():
         "grad_accum":       args.grad_accum,
         "effective_batch":  args.batch_size * args.grad_accum,
         "warmup_steps":     args.warmup_steps,
+        "lora_r":           16,
+        "lora_alpha":       64,
         "optimizer":        "adamw_torch",
         "scheduler":        "cosine",
         "bf16":             True,
         "max_seq_len":      args.max_seq_len,
-        "device_map":       "cpu→GPU dispatch (accelerate)",
     }.items():
         logger.info(f"  {k:<25}: {v}")
 
@@ -1281,18 +1326,32 @@ def main():
         label_pad_token_id=IGNORE_INDEX,
     )
 
-    # ── Training history callback ─────────────────────────────────────────
+    # ── History callback ──────────────────────────────────────────────────
     history = HistoryCallback()
 
-    # Attach TrainerCallback interface dynamically
     class _TrainingHistoryCallback(TrainerCallback):
         def on_log(self, args, state, control, logs=None, **kwargs):
             history.on_log(args, state, control, logs=logs, **kwargs)
 
     history_callback = _TrainingHistoryCallback()
 
-    # ── Device-aware Trainer ──────────────────────────────────────────────
+    # ── FIX #6: DeviceAwareTrainer with explicit grad clipping ───────────
     class DeviceAwareTrainer(Trainer):
+        """
+        Two improvements over v2:
+
+        1. _prepare_inputs() moves labels to lm_head device (unchanged from v2).
+
+        2. training_step() adds an explicit clip_grad_norm_ call on all
+           requires_grad parameters AFTER loss.backward() and BEFORE the
+           optimizer step. This is in addition to max_grad_norm in
+           TrainingArguments because with multi-GPU dispatch + BF16 +
+           accelerate's gradient scaler, the HF Trainer clip can sometimes
+           miss LoRA params that live on a non-primary device.
+
+           This is why grad_norm was hitting 53 in v2 despite max_grad_norm=0.5
+           in TrainingArguments.
+        """
         def _get_lm_head_device(self):
             try:
                 return next(self.model.get_output_embeddings().parameters()).device
@@ -1304,10 +1363,24 @@ def main():
             lm_device = self._get_lm_head_device()
             if lm_device is None:
                 return inputs
-            if "labels" in inputs:
-                if inputs["labels"].device != lm_device:
-                    inputs["labels"] = inputs["labels"].to(lm_device)
+            if "labels" in inputs and inputs["labels"].device != lm_device:
+                inputs["labels"] = inputs["labels"].to(lm_device)
             return inputs
+
+        def training_step(self, model, inputs, num_items_in_batch=None):
+            # Standard HF training step (handles loss, backward, scaler)
+            if num_items_in_batch is not None:
+                loss = super().training_step(model, inputs, num_items_in_batch)
+            else:
+                loss = super().training_step(model, inputs)
+
+            # FIX #6: Explicit grad clip on all trainable params
+            # This guarantees clipping regardless of accelerate/scaler state
+            trainable_params = [p for p in model.parameters() if p.requires_grad and p.grad is not None]
+            if trainable_params:
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=MAX_GRAD_NORM)
+
+            return loss
 
     trainer = DeviceAwareTrainer(
         model=model,
@@ -1319,7 +1392,7 @@ def main():
         callbacks=[history_callback],
     )
 
-    # ── Final loss patch after Trainer init ──────────────────────────────
+    # ── Final loss patch post-Trainer init ───────────────────────────────
     logger.info("")
     logger.info("── Final loss_function patch (post-Trainer init) ────")
     _inject_loss_function(trainer.model, label="post-Trainer")
@@ -1347,19 +1420,17 @@ def main():
         interrupted_dir = CKPT_DIR / "interrupted"
         trainer.save_model(str(interrupted_dir))
         tokenizer.save_pretrained(str(interrupted_dir))
-        logger.info(f"Saved to: {interrupted_dir}")
-        # Still save graphs on interrupt
-        logger.info("Saving training graphs (partial) ...")
         save_training_graphs(history, RUN_ID)
+        logger.info(f"Saved to: {interrupted_dir}")
         raise SystemExit(0)
     except Exception as e:
         logger.error(f"Training failed: {e}", exc_info=True)
         raise SystemExit(1)
 
     elapsed = time.time() - t_start
-    logger.info(f"Training complete in {elapsed / 60:.1f} min  ({elapsed:.0f}s)")
+    logger.info(f"Training complete in {elapsed / 60:.1f} min")
 
-    # ── Save training graphs ──────────────────────────────────────────────
+    # ── Save graphs ───────────────────────────────────────────────────────
     logger.info("")
     logger.info("── Saving training graphs ───────────────────────────")
     save_training_graphs(history, RUN_ID)
@@ -1369,19 +1440,15 @@ def main():
     trainer.log_metrics("train", train_metrics)
     trainer.save_metrics("train", train_metrics)
 
-    train_metrics_file = LOG_DIR / f"train_metrics_{RUN_ID}.json"
-    with train_metrics_file.open("w") as f:
+    with (LOG_DIR / f"train_metrics_{RUN_ID}.json").open("w") as f:
         json.dump(train_metrics, f, indent=2)
-    logger.info(f"Train metrics → {train_metrics_file}")
 
     logger.info("Running final validation evaluation ...")
     eval_metrics = trainer.evaluate()
     trainer.log_metrics("eval", eval_metrics)
 
-    eval_metrics_file = LOG_DIR / f"eval_metrics_{RUN_ID}.json"
-    with eval_metrics_file.open("w") as f:
+    with (LOG_DIR / f"eval_metrics_{RUN_ID}.json").open("w") as f:
         json.dump(eval_metrics, f, indent=2)
-    logger.info(f"Eval metrics  → {eval_metrics_file}")
 
     # ── Save final LoRA adapters ──────────────────────────────────────────
     logger.info("")
@@ -1393,25 +1460,32 @@ def main():
     test_results = None
     if test_records:
         test_results = run_test_evaluation(
-            model=trainer.model,
-            tokenizer=tokenizer,
-            test_records=test_records,
-            max_seq_len=args.max_seq_len,
-            vocab_size=_post_peft_vocab,
-            max_samples=args.max_test_samples,
+            model=trainer.model, tokenizer=tokenizer,
+            test_records=test_records, max_seq_len=args.max_seq_len,
+            vocab_size=_post_peft_vocab, max_samples=args.max_test_samples,
             run_id=RUN_ID,
         )
     else:
         logger.warning("Skipping test evaluation — test.json not found")
 
-    # ── Adapter info JSON ─────────────────────────────────────────────────
+    # ── Adapter info ──────────────────────────────────────────────────────
     adapter_info = {
         "run_id":                RUN_ID,
+        "version":               "v3",
         "base_model":            args.model_id,
         "strategy":              "LoRA on lm_head ONLY — backbone frozen — BF16",
-        "triton":                "stubbed (dequantize path used)",
+        "key_fixes_vs_v2": [
+            "enable_input_require_grads() added after get_peft_model()",
+            "gradient_checkpointing_enable() moved after get_peft_model()",
+            "lr raised from 5e-6 to 1e-4",
+            "warmup_steps reduced from 350 to 100",
+            "lora_alpha raised from 32 to 64",
+            "explicit clip_grad_norm_ in training_step()",
+            "gradient flow verified before training starts",
+            "active token stats logged for masking diagnosis",
+        ],
         "lora_r":                16,
-        "lora_alpha":            32,
+        "lora_alpha":            64,
         "lora_dropout":          0.05,
         "target_modules":        ["lm_head"],
         "epochs":                args.epochs,
@@ -1426,17 +1500,17 @@ def main():
         "test_samples":          len(test_records),
         "train_metrics":         train_metrics,
         "eval_metrics":          eval_metrics,
-        "test_results_summary":  (
+        "test_results_summary": (
             {
-                "mean_test_loss":     test_results["loss_eval"]["mean_test_loss"],
-                "exact_match_rate":   test_results["generation_eval"]["exact_match_rate"],
-                "mean_token_f1":      test_results["generation_eval"]["mean_token_f1"],
+                "mean_test_loss":   test_results["loss_eval"]["mean_test_loss"],
+                "exact_match_rate": test_results["generation_eval"]["exact_match_rate"],
+                "mean_token_f1":    test_results["generation_eval"]["mean_token_f1"],
             } if test_results else None
         ),
-        "final_adapter_dir":     str(FINAL_DIR),
-        "checkpoints_dir":       str(CKPT_DIR),
-        "graphs_dir":            str(GRAPH_DIR),
-        "log_file":              str(LOG_FILE),
+        "final_adapter_dir": str(FINAL_DIR),
+        "checkpoints_dir":   str(CKPT_DIR),
+        "graphs_dir":        str(GRAPH_DIR),
+        "log_file":          str(LOG_FILE),
     }
     with (FINAL_DIR / "adapter_info.json").open("w") as f:
         json.dump(adapter_info, f, indent=2)
@@ -1446,7 +1520,7 @@ def main():
     # ── Final summary ─────────────────────────────────────────────────────
     logger.info("")
     logger.info("=" * 60)
-    logger.info("  SpaceLLM lm_head LoRA v2 — Training Complete")
+    logger.info("  SpaceLLM lm_head LoRA v3 — Training Complete")
     logger.info("=" * 60)
     logger.info(f"  Final adapters   →  {FINAL_DIR}")
     logger.info(f"  Checkpoints      →  {CKPT_DIR}")
@@ -1457,18 +1531,15 @@ def main():
         ge = test_results["generation_eval"]
         logger.info("")
         logger.info("  Test Results Summary:")
-        logger.info(f"    Mean test loss    : {le['mean_test_loss']:.4f}  "
-                    f"({le['samples_evaluated']:,} samples)")
+        logger.info(f"    Mean test loss    : {le['mean_test_loss']:.4f}  ({le['samples_evaluated']:,} samples)")
         if ge["exact_match_rate"] is not None:
-            logger.info(f"    Exact match       : {ge['exact_match_rate']*100:.2f}%  "
-                        f"({ge['exact_matches']}/{ge['samples_evaluated']})")
+            logger.info(f"    Exact match       : {ge['exact_match_rate']*100:.2f}%")
             logger.info(f"    Mean token F1     : {ge['mean_token_f1']:.4f}")
     logger.info("")
     logger.info("  To load for evaluation:")
     logger.info("    from transformers import AutoModelForCausalLM, AutoTokenizer, Mxfp4Config")
     logger.info("    from peft import PeftModel")
-    logger.info(f"    base  = AutoModelForCausalLM.from_pretrained(")
-    logger.info(f"                '{args.model_id}',")
+    logger.info(f"    base  = AutoModelForCausalLM.from_pretrained('{args.model_id}',")
     logger.info(f"                quantization_config=Mxfp4Config(dequantize=True), device_map='auto')")
     logger.info(f"    model = PeftModel.from_pretrained(base, '{FINAL_DIR}')")
     logger.info(f"    tok   = AutoTokenizer.from_pretrained('{FINAL_DIR}')")
