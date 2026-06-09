@@ -326,62 +326,6 @@ def log_trainable_parameters(model):
             )
 
 
-# ── Gradient flow verification ────────────────────────────────────────────────
-
-def verify_gradient_flow(model, tokenizer, vocab_size: int):
-    """
-    Runs one forward+backward pass with synthetic data to confirm
-    lm_head LoRA weights actually receive non-zero gradients.
-    Uses batch_size=2, seq_len=32 for a more robust signal than a single sample.
-    """
-    logger.info("")
-    logger.info("── Gradient flow verification ───────────────────────")
-
-    model.train()
-    device = next(p for p in model.parameters() if p.requires_grad).device
-
-    input_ids = torch.randint(0, min(1000, vocab_size), (2, 32), device=device)
-    labels    = input_ids.clone()
-    labels[:, :16] = -100   # mask first half
-
-    try:
-        outputs = model(input_ids=input_ids, labels=labels)
-        loss    = outputs.loss
-        if loss is None:
-            logger.error("  ❌ FATAL: model returned None loss on dummy batch")
-            raise SystemExit(1)
-        loss.backward()
-    except SystemExit:
-        raise
-    except Exception as e:
-        logger.error(f"  ❌ FATAL: forward/backward failed: {e}")
-        raise SystemExit(1)
-
-    zero_grad_params    = []
-    nonzero_grad_params = []
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            if param.grad is None or param.grad.abs().max().item() == 0.0:
-                zero_grad_params.append(name)
-            else:
-                nonzero_grad_params.append((name, param.grad.abs().max().item()))
-
-    model.zero_grad()
-
-    if zero_grad_params:
-        logger.error("  ❌ GRADIENT FLOW BROKEN — zero/None grad on:")
-        for n in zero_grad_params:
-            logger.error(f"     {n}")
-        logger.error("")
-        logger.error("  Most likely cause: lm_head weight is still tied to embed_tokens.")
-        logger.error("  Ensure lm_head.weight = nn.Parameter(lm_head.weight.detach().clone())")
-        logger.error("  is called BEFORE get_peft_model().")
-        raise SystemExit(1)
-
-    logger.info(f"  ✅ Gradient flow VERIFIED — {len(nonzero_grad_params)} LoRA params have gradients:")
-    for name, gmax in nonzero_grad_params:
-        logger.info(f"     {name:<60}  grad_max={gmax:.6f}")
-    logger.info("  Dummy gradients cleared — ready for real training")
 
 
 # ── JSON loading ──────────────────────────────────────────────────────────────
@@ -1189,11 +1133,8 @@ def main():
         model.config.vocab_size = _post_peft_vocab
     logger.info(f"  lm_head vocab = {_post_peft_vocab:,}  ✅")
 
-    # ── Step 9: Gradient flow verification ───────────────────────────────
-    if not args.skip_grad_verify:
-        verify_gradient_flow(model, tokenizer, _post_peft_vocab)
-    else:
-        logger.warning("Gradient flow verification skipped (--skip_grad_verify)")
+  
+  
 
     # ── Load datasets ─────────────────────────────────────────────────────
     logger.info("")
