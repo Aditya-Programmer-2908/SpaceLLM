@@ -1042,6 +1042,11 @@ def main():
     logger.info("")
     logger.info("── Vocab & lm_head alignment ────────────────────────")
     model.config.tie_word_embeddings = False
+
+    lm_head = model.get_output_embeddings()
+    lm_head.weight = nn.Parameter(lm_head.weight.detach().clone())
+    logger.info("✅ lm_head weight untied and cloned as independent tensor")
+
     _current_vocab = model.get_output_embeddings().weight.shape[0]
     model.resize_token_embeddings(_current_vocab, pad_to_multiple_of=64)
     model.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=64)
