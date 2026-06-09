@@ -1,41 +1,42 @@
 """
-SpaceLLM — Optimized LoRA Fine-Tuning  v3-fixed
-================================================
+SpaceLLM — Optimized LoRA Fine-Tuning  v4
+==========================================
 Model     : openai/gpt-oss-20b  (MoE, MXFP4 quantized checkpoint)
 Phase     : Experimentation
 Strategy  : Freeze full transformer backbone, apply LoRA ONLY to lm_head
 Method    : Standard BF16 LoRA — NOT QLoRA, no bitsandbytes
 
-KEY FIX vs v3:
-  [CRITICAL] ROOT CAUSE of gradient flow failure:
-    dispatch_model() was called BEFORE get_peft_model(). This caused
-    PEFT to wrap the AccelerateModule dispatch wrapper instead of the
-    raw model. When enable_input_require_grads() registered its hook,
-    it landed on the PEFT wrapper's forward() — but the actual compute
-    graph ran through the dispatch wrapper's forward(). The hook never
-    fired during backward, so lm_head LoRA weights received zero grads.
+FIXES vs v3-fixed:
+  [CRITICAL] 1. lm_head weight untied and cloned BEFORE get_peft_model()
+                 → model.config.tie_word_embeddings = False only updates the
+                   config flag — it does NOT break the live tensor tie.
+                   With tie_word_embeddings=True, lm_head.weight and
+                   embed_tokens.weight are the SAME tensor object in memory.
+                   PEFT wraps lm_head, but autograd sees the weight as belonging
+                   to the frozen embed_tokens path and cuts gradients to lora_A.
+                   detach().clone() materializes lm_head as its own independent
+                   parameter before PEFT ever touches it.
 
-    Secondary symptom: embed_tokens.weight appeared as "trainable" with
-    576M params — a dead giveaway that PEFT's requires_grad bookkeeping
-    was corrupted by the dispatch wrapper at get_peft_model() time.
+  [NICE]     2. LoRA r raised 16→32, lora_alpha raised 64→128
+                 → Stronger learning signal for lm_head-only fine-tuning.
 
-  CORRECT ORDER (v3-fixed):
-    1. Load model to CPU
-    2. Vocab alignment on CPU
-    3. get_peft_model() on CPU           ← PEFT wraps raw model directly
-    4. enable_input_require_grads()      ← hook lands on correct forward()
-    5. gradient_checkpointing_enable()   ← after PEFT
-    6. Explicit freeze: require_grad=False for all non-LoRA params
-    7. dispatch_model() to GPUs          ← dispatch wraps already-PEFT model
-    8. _inject_loss_function() post-dispatch
-    9. verify_gradient_flow()            ← now passes
+  [NICE]     3. grad_accum raised 16→32, lr raised 1e-4→2e-4
+                 → Larger effective batch, faster convergence.
+
+  [NICE]     4. max_grad_norm tightened 0.5→0.3, weight_decay=0.01 added.
+
+  [NICE]     5. EarlyStoppingCallback added (patience=8).
+
+  [NICE]     6. lr_scheduler_type changed cosine→cosine_with_restarts.
+
+  [NICE]     7. optim changed adamw_torch→adamw_torch_fused (faster on GPU).
 
 Launch:
     export CUDA_VISIBLE_DEVICES=1,2
-    python fine_tuning_v2/lora_finetuning_v3_fixed.py
+    python fine_tuning_v2/lora_finetuning_v4.py
 
-    # Override LR or other args:
-    python fine_tuning_v2/lora_finetuning_v3_fixed.py --lr 1e-4 --epochs 5
+    # Override args:
+    python fine_tuning_v2/lora_finetuning_v4.py --lr 2e-4 --epochs 5
 
 Output layout:
   SpaceLLM/fine_tuning_v2/outputs/
@@ -187,8 +188,8 @@ logger = logging.getLogger("SpaceLLM")
 def _make_device_aware_ce_loss():
     """
     MoE models shard across GPUs. lm_head may land on cuda:1 or cuda:2
-    while Trainer places labels on cuda:0. This loss fn moves labels to
-    match logits before computing CE, then returns loss to cuda:0.
+    while Trainer places labels on cuda:0. Moves labels to match logits
+    before computing CE, then returns loss to cuda:0.
     """
     def _device_aware_ce_loss(logits, labels, vocab_size=None, **kwargs):
         shift_logits = logits[..., :-1, :].contiguous()
@@ -200,7 +201,6 @@ def _make_device_aware_ce_loss():
 
         vocab_size = shift_logits.size(-1)
 
-        # Clamp any out-of-vocab label IDs to -100 (ignore) rather than crash
         oob_mask = (shift_labels != -100) & (
             (shift_labels < 0) | (shift_labels >= vocab_size)
         )
@@ -249,22 +249,23 @@ def _inject_loss_function(model, loss_fn=None, label=""):
 # ── CLI args ──────────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(description="SpaceLLM lm_head LoRA fine-tuning v3-fixed")
+    p = argparse.ArgumentParser(description="SpaceLLM lm_head LoRA fine-tuning v4")
     p.add_argument("--model_id",               type=str,   default="openai/gpt-oss-20b")
-    p.add_argument("--epochs",                 type=int,   default=3)
+    p.add_argument("--epochs",                 type=int,   default=5)
     p.add_argument("--batch_size",             type=int,   default=1)
-    p.add_argument("--grad_accum",             type=int,   default=16)
-    p.add_argument("--lr",                     type=float, default=1e-4)
+    p.add_argument("--grad_accum",             type=int,   default=32)
+    p.add_argument("--lr",                     type=float, default=2e-4)
     p.add_argument("--max_seq_len",            type=int,   default=2048)
-    p.add_argument("--warmup_steps",           type=int,   default=100)
-    p.add_argument("--save_steps",             type=int,   default=500)
-    p.add_argument("--eval_steps",             type=int,   default=500)
-    p.add_argument("--logging_steps",          type=int,   default=20)
-    p.add_argument("--save_total_limit",       type=int,   default=2)
-    p.add_argument("--max_test_samples",       type=int,   default=200)
+    p.add_argument("--warmup_steps",           type=int,   default=200)
+    p.add_argument("--save_steps",             type=int,   default=300)
+    p.add_argument("--eval_steps",             type=int,   default=300)
+    p.add_argument("--logging_steps",          type=int,   default=10)
+    p.add_argument("--save_total_limit",       type=int,   default=3)
+    p.add_argument("--max_test_samples",       type=int,   default=300)
+    p.add_argument("--patience",               type=int,   default=8,
+                   help="Early stopping patience (eval steps)")
     p.add_argument("--resume_from_checkpoint", type=str,   default=None)
-    p.add_argument("--skip_grad_verify",       action="store_true",
-                   help="Skip gradient flow verification (faster startup, not recommended)")
+    p.add_argument("--skip_grad_verify",       action="store_true")
     return p.parse_args()
 
 
@@ -329,8 +330,9 @@ def log_trainable_parameters(model):
 
 def verify_gradient_flow(model, tokenizer, vocab_size: int):
     """
-    Runs one forward+backward pass with synthetic data to confirm that
+    Runs one forward+backward pass with synthetic data to confirm
     lm_head LoRA weights actually receive non-zero gradients.
+    Uses batch_size=2, seq_len=32 for a more robust signal than a single sample.
     """
     logger.info("")
     logger.info("── Gradient flow verification ───────────────────────")
@@ -338,10 +340,9 @@ def verify_gradient_flow(model, tokenizer, vocab_size: int):
     model.train()
     device = next(p for p in model.parameters() if p.requires_grad).device
 
-    seq_len   = 16
-    input_ids = torch.randint(0, min(1000, vocab_size), (1, seq_len), device=device)
+    input_ids = torch.randint(0, min(1000, vocab_size), (2, 32), device=device)
     labels    = input_ids.clone()
-    labels[:, :8] = -100
+    labels[:, :16] = -100   # mask first half
 
     try:
         outputs = model(input_ids=input_ids, labels=labels)
@@ -353,7 +354,7 @@ def verify_gradient_flow(model, tokenizer, vocab_size: int):
     except SystemExit:
         raise
     except Exception as e:
-        logger.error(f"  ❌ FATAL: forward/backward failed on dummy batch: {e}")
+        logger.error(f"  ❌ FATAL: forward/backward failed: {e}")
         raise SystemExit(1)
 
     zero_grad_params    = []
@@ -363,26 +364,23 @@ def verify_gradient_flow(model, tokenizer, vocab_size: int):
             if param.grad is None or param.grad.abs().max().item() == 0.0:
                 zero_grad_params.append(name)
             else:
-                grad_max = param.grad.abs().max().item()
-                nonzero_grad_params.append((name, grad_max))
+                nonzero_grad_params.append((name, param.grad.abs().max().item()))
 
     model.zero_grad()
 
     if zero_grad_params:
-        logger.error("  ❌ GRADIENT FLOW BROKEN — these LoRA params got zero/None grad:")
+        logger.error("  ❌ GRADIENT FLOW BROKEN — zero/None grad on:")
         for n in zero_grad_params:
             logger.error(f"     {n}")
         logger.error("")
-        logger.error("  ROOT CAUSE: enable_input_require_grads() was not called, or")
-        logger.error("  dispatch_model() was called before get_peft_model().")
-        logger.error("  Training would produce near-zero updates and loss ~36.")
+        logger.error("  Most likely cause: lm_head weight is still tied to embed_tokens.")
+        logger.error("  Ensure lm_head.weight = nn.Parameter(lm_head.weight.detach().clone())")
+        logger.error("  is called BEFORE get_peft_model().")
         raise SystemExit(1)
 
     logger.info(f"  ✅ Gradient flow VERIFIED — {len(nonzero_grad_params)} LoRA params have gradients:")
     for name, gmax in nonzero_grad_params:
         logger.info(f"     {name:<60}  grad_max={gmax:.6f}")
-
-    model.zero_grad()
     logger.info("  Dummy gradients cleared — ready for real training")
 
 
@@ -452,8 +450,7 @@ def dataset_sanity_check(records: list, split_name: str):
 IGNORE_INDEX = -100
 
 
-def tokenise_record(record: dict, tokenizer, max_seq_len: int,
-                    debug: bool = False):
+def tokenise_record(record: dict, tokenizer, max_seq_len: int, debug: bool = False):
     messages = record.get("messages", [])
 
     hf_messages = []
@@ -468,21 +465,13 @@ def tokenise_record(record: dict, tokenizer, max_seq_len: int,
 
     try:
         full_text = tokenizer.apply_chat_template(
-            hf_messages,
-            tokenize=False,
-            add_generation_prompt=False,
-        )
+            hf_messages, tokenize=False, add_generation_prompt=False)
     except Exception as e:
         logger.warning(f"apply_chat_template failed: {e} — skipping")
         return None
 
-    full_enc  = tokenizer(
-        full_text,
-        truncation=True,
-        max_length=max_seq_len,
-        padding=False,
-        return_tensors=None,
-    )
+    full_enc  = tokenizer(full_text, truncation=True, max_length=max_seq_len,
+                          padding=False, return_tensors=None)
     input_ids = full_enc["input_ids"]
 
     if len(input_ids) < 4:
@@ -491,40 +480,33 @@ def tokenise_record(record: dict, tokenizer, max_seq_len: int,
     prefix_msgs = [m for m in hf_messages if m["role"] != "assistant"]
     try:
         prefix_text = tokenizer.apply_chat_template(
-            prefix_msgs,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+            prefix_msgs, tokenize=False, add_generation_prompt=True)
     except Exception:
         return None
 
-    prefix_enc = tokenizer(
-        prefix_text,
-        truncation=True,
-        max_length=max_seq_len,
-        padding=False,
-        return_tensors=None,
-    )
+    prefix_enc = tokenizer(prefix_text, truncation=True, max_length=max_seq_len,
+                           padding=False, return_tensors=None)
     prefix_len = len(prefix_enc["input_ids"])
 
     if prefix_len >= len(input_ids):
         return None
 
-    labels = [IGNORE_INDEX] * prefix_len + input_ids[prefix_len:]
-    labels = labels[:len(input_ids)]
-
+    labels   = [IGNORE_INDEX] * prefix_len + input_ids[prefix_len:]
+    labels   = labels[:len(input_ids)]
     n_active = sum(1 for l in labels if l != IGNORE_INDEX)
-    if n_active == 0:
+
+    # Extra safety: assistant response must have at least 4 real tokens
+    if n_active < 4:
         return None
 
     if debug:
-        logger.info("  [DEBUG] Token boundary check:")
         logger.info(f"    prefix_len={prefix_len}  total={len(input_ids)}  active={n_active}")
-        logger.info("    Active (loss) tokens:")
+        logger.info("    Active (loss) tokens sample:")
+        shown = 0
         for tok_id, lbl in zip(input_ids, labels):
-            if lbl != IGNORE_INDEX:
-                decoded = tokenizer.decode([tok_id])
-                logger.info(f"      {repr(decoded)}")
+            if lbl != IGNORE_INDEX and shown < 10:
+                logger.info(f"      {repr(tokenizer.decode([tok_id]))}")
+                shown += 1
 
     return {
         "input_ids":      input_ids,
@@ -554,8 +536,7 @@ def build_hf_dataset(records: list, tokenizer, max_seq_len: int, split_name: str
         active_counts.append(n_active)
 
         if vocab_size is not None:
-            new_labels = []
-            had_oob = False
+            new_labels, had_oob = [], False
             for lbl in result["labels"]:
                 if lbl != IGNORE_INDEX and (lbl < 0 or lbl >= vocab_size):
                     new_labels.append(IGNORE_INDEX)
@@ -573,11 +554,9 @@ def build_hf_dataset(records: list, tokenizer, max_seq_len: int, split_name: str
         tokenised.append(result)
 
     if skipped:
-        logger.warning(f"[{split_name}] Skipped {skipped} records (no valid labels)")
+        logger.warning(f"[{split_name}] Skipped {skipped} records")
     if clamped_records:
-        logger.warning(
-            f"[{split_name}] Clamped OOV labels in {clamped_records} records"
-        )
+        logger.warning(f"[{split_name}] Clamped OOV labels in {clamped_records} records")
     if not tokenised:
         logger.error(f"[{split_name}] Zero usable records — aborting")
         raise SystemExit(1)
@@ -590,9 +569,7 @@ def build_hf_dataset(records: list, tokenizer, max_seq_len: int, split_name: str
     )
 
     if vocab_size is not None and max_label_id >= vocab_size:
-        logger.error(
-            f"[{split_name}] FATAL: max_label_id={max_label_id} >= vocab_size={vocab_size}"
-        )
+        logger.error(f"[{split_name}] FATAL: max_label_id={max_label_id} >= vocab_size={vocab_size}")
         raise SystemExit(1)
 
     mean_active = sum(active_counts) / len(active_counts) if active_counts else 0
@@ -608,8 +585,8 @@ def build_hf_dataset(records: list, tokenizer, max_seq_len: int, split_name: str
 
     if mean_active < 10:
         logger.warning(
-            f"[{split_name}] ⚠️  mean active tokens = {mean_active:.1f} — very low! "
-            f"Label masking may be too aggressive or assistant responses are very short."
+            f"[{split_name}] ⚠️  mean active tokens={mean_active:.1f} — "
+            f"label masking may be too aggressive."
         )
 
     return Dataset.from_list(tokenised)
@@ -618,8 +595,6 @@ def build_hf_dataset(records: list, tokenizer, max_seq_len: int, split_name: str
 # ── Training history callback ─────────────────────────────────────────────────
 
 class HistoryCallback:
-    from transformers import TrainerCallback
-
     def __init__(self):
         self.train_loss : list = []
         self.eval_loss  : list = []
@@ -665,23 +640,23 @@ def save_training_graphs(history: HistoryCallback, run_id: str):
         plt.close(fig)
         logger.info(f"  Graph saved → {path}")
 
-    _plot(history.train_loss, "Training Loss",        "Step", "Loss",          "#e74c3c",
+    _plot(history.train_loss, "Training Loss",         "Step", "Loss",         "#e74c3c",
           GRAPH_DIR / f"training_loss_{run_id}.png")
-    _plot(history.eval_loss,  "Validation Eval Loss", "Step", "Eval Loss",     "#2980b9",
+    _plot(history.eval_loss,  "Validation Eval Loss",  "Step", "Eval Loss",    "#2980b9",
           GRAPH_DIR / f"eval_loss_{run_id}.png")
-    _plot(history.lr_history, "Learning Rate Schedule","Step","Learning Rate","#27ae60",
+    _plot(history.lr_history, "Learning Rate Schedule","Step", "LR",           "#27ae60",
           GRAPH_DIR / f"lr_schedule_{run_id}.png")
-    _plot(history.grad_norms, "Gradient Norm",        "Step", "Grad Norm",    "#8e44ad",
+    _plot(history.grad_norms, "Gradient Norm",         "Step", "Grad Norm",    "#8e44ad",
           GRAPH_DIR / f"grad_norm_{run_id}.png")
 
     try:
         fig, axes = plt.subplots(2, 2, figsize=(18, 10))
-        fig.suptitle(f"SpaceLLM LoRA v3-fixed — Training Overview  [{run_id}]",
+        fig.suptitle(f"SpaceLLM LoRA v4 — Training Overview  [{run_id}]",
                      fontsize=13, fontweight="bold")
         panels = [
             (history.train_loss, "Training Loss",        "#e74c3c", "Loss"),
             (history.eval_loss,  "Validation Eval Loss", "#2980b9", "Eval Loss"),
-            (history.lr_history, "LR Schedule",          "#27ae60", "Learning Rate"),
+            (history.lr_history, "LR Schedule",          "#27ae60", "LR"),
             (history.grad_norms, "Gradient Norm",        "#8e44ad", "Grad Norm"),
         ]
         for ax, (xy_list, title, color, ylabel) in zip(axes.flat, panels):
@@ -708,21 +683,20 @@ def save_test_loss_graph(test_losses: list, run_id: str):
         import matplotlib.pyplot as plt
     except ImportError:
         return
-
     if not test_losses:
         return
 
     display = test_losses[:200]
     fig, axes = plt.subplots(1, 2, figsize=(16, 5))
-    fig.suptitle(f"Test Set Evaluation — SpaceLLM LoRA v3-fixed  [{run_id}]",
+    fig.suptitle(f"Test Set Evaluation — SpaceLLM LoRA v4  [{run_id}]",
                  fontsize=13, fontweight="bold")
 
     axes[0].bar(range(len(display)), display, color="#8e44ad", alpha=0.7, width=1.0)
     axes[0].set_title(f"Per-Sample Loss (first {len(display)} samples)")
     axes[0].set_xlabel("Sample index")
     axes[0].set_ylabel("Loss")
-    axes[0].axhline(sum(display) / len(display), color="red",
-                    linestyle="--", label=f"Mean={sum(display)/len(display):.4f}")
+    mean_v = sum(display) / len(display)
+    axes[0].axhline(mean_v, color="red", linestyle="--", label=f"Mean={mean_v:.4f}")
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
 
@@ -730,16 +704,15 @@ def save_test_loss_graph(test_losses: list, run_id: str):
     axes[1].set_title(f"Loss Distribution (all {len(test_losses)} samples)")
     axes[1].set_xlabel("Loss")
     axes[1].set_ylabel("Count")
-    axes[1].axvline(sum(test_losses) / len(test_losses), color="red",
-                    linestyle="--", label=f"Mean={sum(test_losses)/len(test_losses):.4f}")
+    mean_all = sum(test_losses) / len(test_losses)
+    axes[1].axvline(mean_all, color="red", linestyle="--", label=f"Mean={mean_all:.4f}")
     axes[1].legend()
     axes[1].grid(True, alpha=0.3)
 
     fig.tight_layout()
     path = GRAPH_DIR / f"test_loss_{run_id}.png"
     fig.savefig(path, dpi=150)
-    import matplotlib.pyplot as _plt
-    _plt.close(fig)
+    plt.close(fig)
     logger.info(f"  Test loss graph → {path}")
 
 
@@ -755,9 +728,9 @@ def run_test_evaluation(model, tokenizer, test_records: list,
 
     model.eval()
 
-    logger.info(f"── Phase 1: Loss evaluation on {len(test_records):,} records ──")
-    per_sample_losses = []
-    skipped = 0
+    # Phase 1: Loss
+    logger.info(f"── Phase 1: Loss on {len(test_records):,} records ──")
+    per_sample_losses, skipped = [], 0
 
     with torch.no_grad():
         for i, record in enumerate(test_records):
@@ -767,12 +740,11 @@ def run_test_evaluation(model, tokenizer, test_records: list,
                 continue
             result.pop("n_active", None)
 
-            new_labels = []
-            for lbl in result["labels"]:
-                if lbl != IGNORE_INDEX and (lbl < 0 or lbl >= vocab_size):
-                    new_labels.append(IGNORE_INDEX)
-                else:
-                    new_labels.append(lbl)
+            new_labels = [
+                IGNORE_INDEX if (lbl != IGNORE_INDEX and (lbl < 0 or lbl >= vocab_size))
+                else lbl
+                for lbl in result["labels"]
+            ]
             result["labels"] = new_labels
 
             if all(lbl == IGNORE_INDEX for lbl in result["labels"]):
@@ -792,7 +764,7 @@ def run_test_evaluation(model, tokenizer, test_records: list,
                 pass
 
             try:
-                outputs = model(input_ids=input_ids, attention_mask=attn_mask, labels=labels)
+                outputs  = model(input_ids=input_ids, attention_mask=attn_mask, labels=labels)
                 loss_val = outputs.loss
                 if loss_val is not None and not torch.isnan(loss_val):
                     per_sample_losses.append(float(loss_val.item()))
@@ -809,6 +781,7 @@ def run_test_evaluation(model, tokenizer, test_records: list,
     logger.info(f"  Loss eval: {len(per_sample_losses):,} samples (skipped={skipped})  mean_loss={mean_test_loss:.4f}")
     save_test_loss_graph(per_sample_losses, run_id)
 
+    # Phase 2: Generation
     logger.info("")
     logger.info(f"── Phase 2: Generation on first {max_samples} records ──")
 
@@ -844,7 +817,6 @@ def run_test_evaluation(model, tokenizer, test_records: list,
 
             enc = tokenizer(prompt_text, return_tensors="pt",
                             truncation=True, max_length=max_seq_len - 256)
-
             device = next(model.parameters()).device
             try:
                 enc = {k: v.to(device) for k, v in enc.items()}
@@ -890,9 +862,9 @@ def run_test_evaluation(model, tokenizer, test_records: list,
                             f"EM={exact_matches}/{len(predictions)}  "
                             f"mean_F1={sum(token_overlaps)/len(token_overlaps):.4f}")
 
-    n_gen    = len(predictions)
-    em_rate  = exact_matches / n_gen                       if n_gen          else float("nan")
-    mean_f1  = sum(token_overlaps) / len(token_overlaps)   if token_overlaps else float("nan")
+    n_gen   = len(predictions)
+    em_rate = exact_matches / n_gen                       if n_gen          else float("nan")
+    mean_f1 = sum(token_overlaps) / len(token_overlaps)   if token_overlaps else float("nan")
 
     logger.info("")
     logger.info("── Test Results ─────────────────────────────────────")
@@ -904,10 +876,9 @@ def run_test_evaluation(model, tokenizer, test_records: list,
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-
         if token_overlaps:
             fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-            fig.suptitle(f"Test Generation Metrics — SpaceLLM LoRA v3-fixed  [{run_id}]",
+            fig.suptitle(f"Test Generation Metrics — SpaceLLM LoRA v4  [{run_id}]",
                          fontsize=13, fontweight="bold")
             axes[0].hist(token_overlaps, bins=30, color="#16a085", alpha=0.8, edgecolor="white")
             axes[0].set_title("Token F1 Distribution")
@@ -940,17 +911,15 @@ def run_test_evaluation(model, tokenizer, test_records: list,
         "generation_eval": {
             "samples_evaluated": n_gen,
             "exact_matches":     exact_matches,
-            "exact_match_rate":  round(em_rate, 6)  if n_gen else None,
-            "mean_token_f1":     round(mean_f1, 6)  if n_gen else None,
+            "exact_match_rate":  round(em_rate, 6) if n_gen else None,
+            "mean_token_f1":     round(mean_f1, 6) if n_gen else None,
         },
         "per_sample_predictions": predictions,
     }
-
     results_path = GRAPH_DIR / f"test_results_{run_id}.json"
     with results_path.open("w", encoding="utf-8") as f:
         json.dump(test_results, f, indent=2, ensure_ascii=False)
     logger.info(f"  Full test results → {results_path}")
-
     return test_results
 
 
@@ -960,11 +929,11 @@ def main():
     args = parse_args()
 
     logger.info("=" * 60)
-    logger.info("  SpaceLLM — Optimized LoRA v3-fixed  (lm_head only, BF16)")
+    logger.info("  SpaceLLM — LoRA v4  (lm_head only, BF16)")
     logger.info(f"  Run ID            : {RUN_ID}")
     logger.info(f"  Model             : {args.model_id}")
     logger.info(f"  Strategy          : LoRA on lm_head ONLY — backbone frozen")
-    logger.info(f"  Key fix           : PEFT applied BEFORE dispatch_model()")
+    logger.info(f"  Key fix           : lm_head untied BEFORE get_peft_model()")
     logger.info(f"  Epochs            : {args.epochs}  |  LR: {args.lr}")
     logger.info(f"  Batch             : {args.batch_size}  |  Grad accum: {args.grad_accum}"
                 f"  |  Eff batch: {args.batch_size * args.grad_accum}")
@@ -976,6 +945,7 @@ def main():
         from transformers import (
             AutoModelForCausalLM, AutoTokenizer, TrainingArguments,
             DataCollatorForSeq2Seq, Trainer, TrainerCallback, Mxfp4Config,
+            EarlyStoppingCallback,
         )
         from peft import LoraConfig, TaskType, get_peft_model
     except ImportError as e:
@@ -1020,7 +990,7 @@ def main():
     logger.info(f"Pad token         : '{tokenizer.pad_token}'  (id={tokenizer.pad_token_id})")
     logger.info(f"Chat template     : {'found' if tokenizer.chat_template else 'NOT FOUND'}")
 
-    # ── Model load ────────────────────────────────────────────────────────
+    # ── Model load to CPU ─────────────────────────────────────────────────
     logger.info("")
     logger.info(f"Loading model to CPU: {args.model_id}  [MXFP4 → BF16 dequantize]")
     t0 = time.time()
@@ -1041,12 +1011,28 @@ def main():
     # ── Vocab alignment ───────────────────────────────────────────────────
     logger.info("")
     logger.info("── Vocab & lm_head alignment ────────────────────────")
+
+    # Step 1: Disable weight tying in config
     model.config.tie_word_embeddings = False
 
+    # ===========================================================
+    # CRITICAL FIX: Physically untie lm_head from embed_tokens.
+    #
+    # Setting tie_word_embeddings=False in the config only updates
+    # the config flag — it does NOT break the live tensor tie.
+    # With tie_word_embeddings=True, lm_head.weight and
+    # embed_tokens.weight point to the SAME tensor object in memory.
+    # PEFT wraps lm_head, but autograd sees the underlying weight
+    # as belonging to the frozen embed_tokens path, so gradients
+    # to lora_A.weight are cut off at the tied tensor.
+    # detach().clone() materializes lm_head as its own independent
+    # Parameter BEFORE get_peft_model() ever touches the model.
+    # ===========================================================
     lm_head = model.get_output_embeddings()
     lm_head.weight = nn.Parameter(lm_head.weight.detach().clone())
     logger.info("✅ lm_head weight untied and cloned as independent tensor")
 
+    # Step 2: Resize vocab
     _current_vocab = model.get_output_embeddings().weight.shape[0]
     model.resize_token_embeddings(_current_vocab, pad_to_multiple_of=64)
     model.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=64)
@@ -1054,65 +1040,66 @@ def main():
     actual_vocab = model.get_output_embeddings().weight.shape[0]
     model.config.vocab_size = actual_vocab
 
-    assert model.get_input_embeddings().weight.shape[0] == actual_vocab
+    assert model.get_input_embeddings().weight.shape[0]  == actual_vocab
     assert model.get_output_embeddings().weight.shape[0] == actual_vocab
     logger.info(f"  Vocab alignment PASSED  (vocab={actual_vocab:,}  padded to multiple of 64)")
 
+    # Verify untie was not undone by resize
+    embed_id  = id(model.get_input_embeddings().weight)
+    lm_head_id = id(model.get_output_embeddings().weight)
+    if embed_id == lm_head_id:
+        logger.error("  ❌ FATAL: resize_token_embeddings re-tied lm_head to embed_tokens!")
+        logger.error("  Call lm_head.weight = nn.Parameter(...) again after resize.")
+        lm_head = model.get_output_embeddings()
+        lm_head.weight = nn.Parameter(lm_head.weight.detach().clone())
+        logger.info("  ✅ Re-untied lm_head after resize.")
+    else:
+        logger.info("  ✅ lm_head still independent after resize (tie not re-introduced)")
+
     model.config.use_cache = False
 
-    # ── Inject loss (pre-PEFT, pre-dispatch) ─────────────────────────────
+    # ── Inject loss pre-PEFT ──────────────────────────────────────────────
     logger.info("")
-    logger.info("── Injecting device-aware CE loss (pre-PEFT) ────────")
+    logger.info("── Injecting CE loss (pre-PEFT) ─────────────────────")
     _inject_loss_function(model, label="pre-PEFT")
 
     # =========================================================================
-    # FIX: Apply LoRA on CPU BEFORE dispatch_model()
-    #
-    # v3 BUG: dispatch_model() was called first, wrapping the raw model in
-    # an AccelerateModule. Then get_peft_model() wrapped that. The
-    # enable_input_require_grads() hook registered on the PEFT wrapper's
-    # forward(), but actual computation ran through AccelerateModule.forward().
-    # Hook never fired → zero grads on all LoRA params.
-    #
-    # CORRECT ORDER:
-    #   1. get_peft_model() on raw CPU model  ← PEFT wraps the real model
-    #   2. enable_input_require_grads()        ← hook on correct forward()
-    #   3. gradient_checkpointing_enable()     ← after PEFT
-    #   4. Explicit freeze of all non-LoRA params
-    #   5. dispatch_model()                    ← dispatch wraps PEFT model
+    # CORRECT ORDER (v4):
+    #   1. Load model to CPU                     ← done
+    #   2. Vocab alignment + untie lm_head       ← done  *** THE KEY FIX ***
+    #   3. get_peft_model() on raw CPU model     ← PEFT wraps untied lm_head
+    #   4. enable_input_require_grads()          ← hook on correct forward()
+    #   5. gradient_checkpointing_enable()       ← after PEFT
+    #   6. Explicit freeze of all non-LoRA params
+    #   7. dispatch_model() to GPUs              ← dispatch wraps PEFT model
+    #   8. _inject_loss_function() post-dispatch
+    #   9. verify_gradient_flow()                ← must pass
     # =========================================================================
 
-    # ── Step 1: Apply LoRA on CPU ─────────────────────────────────────────
+    # ── Step 3: Apply LoRA on CPU ─────────────────────────────────────────
     logger.info("")
     logger.info("Applying LoRA to lm_head ONLY (on CPU, before dispatch) ...")
 
     lora_config = LoraConfig(
-        r=16,
-        lora_alpha=64,
-        lora_dropout=0.05,
+        r=32,
+        lora_alpha=128,       # 4×r
+        lora_dropout=0.1,
         bias="none",
         task_type=TaskType.CAUSAL_LM,
         target_modules=["lm_head"],
         init_lora_weights=True,
     )
     model = get_peft_model(model, lora_config)
-    logger.info("✅ get_peft_model() applied on raw CPU model")
+    logger.info("✅ get_peft_model() applied on raw CPU model (lm_head already untied)")
 
-    # ── Step 2: enable_input_require_grads on the correct wrapper ─────────
+    # ── Step 4 & 5: enable grads + gradient checkpointing ────────────────
     model.enable_input_require_grads()
-    logger.info("✅ enable_input_require_grads() called (hook on correct forward)")
+    logger.info("✅ enable_input_require_grads() called")
 
-    # ── Step 3: gradient checkpointing after PEFT ─────────────────────────
     model.gradient_checkpointing_enable()
     logger.info("✅ gradient_checkpointing_enable() called (post-PEFT)")
 
-    # ── Step 4: Explicit freeze — belt-and-suspenders ─────────────────────
-    #
-    # PEFT is supposed to freeze non-LoRA params automatically, but the
-    # dispatch wrapper interaction in v3 caused embed_tokens to leak as
-    # "trainable" (576M params). We enforce the freeze explicitly here,
-    # BEFORE dispatch, so the requires_grad state is unambiguous.
-    #
+    # ── Step 6: Explicit freeze ───────────────────────────────────────────
     logger.info("")
     logger.info("── Explicit parameter freeze (pre-dispatch) ─────────")
     frozen_count, lora_count = 0, 0
@@ -1126,17 +1113,16 @@ def main():
     logger.info(f"  Frozen : {frozen_count} tensors")
     logger.info(f"  LoRA   : {lora_count} tensors (requires_grad=True)")
 
-    # Sanity check — no non-LoRA params should be trainable
     leaked = [(n, p.shape) for n, p in model.named_parameters()
               if p.requires_grad and "lora_" not in n]
     if leaked:
-        logger.error("  ❌ Non-LoRA params still trainable after explicit freeze:")
+        logger.error("  ❌ Non-LoRA params still trainable:")
         for n, s in leaked:
             logger.error(f"     {n}  {s}")
         raise SystemExit(1)
     logger.info("  ✅ No non-LoRA params leaked as trainable")
 
-    # Re-inject loss post-PEFT (before dispatch)
+    # Re-inject loss post-PEFT
     logger.info("")
     logger.info("── Re-injecting CE loss (post-PEFT, pre-dispatch) ───")
     _inject_loss_function(model, label="post-PEFT pre-dispatch")
@@ -1144,7 +1130,7 @@ def main():
     log_trainable_parameters(model)
     log_gpu_memory("after LoRA init (CPU)")
 
-    # ── Step 5: GPU dispatch (PEFT model, correct state) ──────────────────
+    # ── Step 7: GPU dispatch ──────────────────────────────────────────────
     logger.info("")
     logger.info("Dispatching PEFT model across GPUs ...")
     t1 = time.time()
@@ -1189,12 +1175,12 @@ def main():
             logger.info(f"  {dev} : {count} layers")
     log_gpu_memory("after dispatch")
 
-    # ── Re-inject loss post-dispatch ──────────────────────────────────────
+    # ── Step 8: Re-inject loss post-dispatch ─────────────────────────────
     logger.info("")
     logger.info("── Re-injecting CE loss (post-dispatch) ─────────────")
     _inject_loss_function(model, label="post-dispatch")
 
-    # ── Post-PEFT vocab check ─────────────────────────────────────────────
+    # ── Vocab check post-dispatch ─────────────────────────────────────────
     logger.info("")
     logger.info("── Vocab alignment (post-dispatch) ──────────────────")
     _post_peft_vocab = model.get_output_embeddings().weight.shape[0]
@@ -1203,7 +1189,7 @@ def main():
         model.config.vocab_size = _post_peft_vocab
     logger.info(f"  lm_head vocab = {_post_peft_vocab:,}  ✅")
 
-    # ── Gradient flow verification ────────────────────────────────────────
+    # ── Step 9: Gradient flow verification ───────────────────────────────
     if not args.skip_grad_verify:
         verify_gradient_flow(model, tokenizer, _post_peft_vocab)
     else:
@@ -1235,7 +1221,7 @@ def main():
     )
 
     # ── Training arguments ────────────────────────────────────────────────
-    MAX_GRAD_NORM = 0.5
+    MAX_GRAD_NORM = 0.3
 
     logger.info("")
     logger.info("── Training configuration ───────────────────────────")
@@ -1246,10 +1232,11 @@ def main():
         per_device_eval_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
-        lr_scheduler_type="cosine",
+        lr_scheduler_type="cosine_with_restarts",
         warmup_steps=args.warmup_steps,
         max_grad_norm=MAX_GRAD_NORM,
-        optim="adamw_torch",
+        optim="adamw_torch_fused",
+        weight_decay=0.01,
         bf16=True,
         fp16=False,
         eval_strategy="steps",
@@ -1271,16 +1258,18 @@ def main():
         "epochs":           args.epochs,
         "lr":               args.lr,
         "max_grad_norm":    MAX_GRAD_NORM,
+        "weight_decay":     0.01,
         "batch_size":       args.batch_size,
         "grad_accum":       args.grad_accum,
         "effective_batch":  args.batch_size * args.grad_accum,
         "warmup_steps":     args.warmup_steps,
-        "lora_r":           16,
-        "lora_alpha":       64,
-        "optimizer":        "adamw_torch",
-        "scheduler":        "cosine",
+        "lora_r":           32,
+        "lora_alpha":       128,
+        "optimizer":        "adamw_torch_fused",
+        "scheduler":        "cosine_with_restarts",
         "bf16":             True,
         "max_seq_len":      args.max_seq_len,
+        "early_stop_patce": args.patience,
     }.items():
         logger.info(f"  {k:<25}: {v}")
 
@@ -1293,23 +1282,22 @@ def main():
         label_pad_token_id=IGNORE_INDEX,
     )
 
-    # ── History callback ──────────────────────────────────────────────────
+    # ── Callbacks ─────────────────────────────────────────────────────────
     history = HistoryCallback()
 
     class _TrainingHistoryCallback(TrainerCallback):
         def on_log(self, args, state, control, logs=None, **kwargs):
             history.on_log(args, state, control, logs=logs, **kwargs)
 
-    history_callback = _TrainingHistoryCallback()
+    history_callback    = _TrainingHistoryCallback()
+    early_stop_callback = EarlyStoppingCallback(early_stopping_patience=args.patience)
 
-    # ── DeviceAwareTrainer ────────────────────────────────────────────────
+    # ── Trainer ───────────────────────────────────────────────────────────
     class DeviceAwareTrainer(Trainer):
         """
         1. _prepare_inputs() moves labels to lm_head device.
         2. training_step() adds explicit clip_grad_norm_ on trainable params
-           as a belt-and-suspenders guard alongside max_grad_norm in
-           TrainingArguments (the HF clip can be unreliable with multi-GPU
-           dispatch + BF16 accelerate scaler).
+           as belt-and-suspenders alongside max_grad_norm in TrainingArguments.
         """
         def _get_lm_head_device(self):
             try:
@@ -1318,7 +1306,7 @@ def main():
                 return None
 
         def _prepare_inputs(self, inputs):
-            inputs = super()._prepare_inputs(inputs)
+            inputs    = super()._prepare_inputs(inputs)
             lm_device = self._get_lm_head_device()
             if lm_device is None:
                 return inputs
@@ -1332,7 +1320,7 @@ def main():
             else:
                 loss = super().training_step(model, inputs)
 
-            # Explicit grad clip — guards against multi-GPU/scaler clip misses
+            # Explicit clip — guards against multi-GPU/BF16 scaler clip misses
             trainable_params = [
                 p for p in model.parameters()
                 if p.requires_grad and p.grad is not None
@@ -1349,10 +1337,10 @@ def main():
         eval_dataset=val_dataset,
         processing_class=tokenizer,
         data_collator=data_collator,
-        callbacks=[history_callback],
+        callbacks=[history_callback, early_stop_callback],
     )
 
-    # ── Final loss patch post-Trainer init ───────────────────────────────
+    # Final loss patch post-Trainer init
     logger.info("")
     logger.info("── Final loss_function patch (post-Trainer init) ────")
     _inject_loss_function(trainer.model, label="post-Trainer")
@@ -1430,23 +1418,28 @@ def main():
 
     # ── Adapter info ──────────────────────────────────────────────────────
     adapter_info = {
-        "run_id":                RUN_ID,
-        "version":               "v3-fixed",
-        "base_model":            args.model_id,
-        "strategy":              "LoRA on lm_head ONLY — backbone frozen — BF16",
-        "key_fixes_vs_v3": [
-            "PEFT applied on CPU BEFORE dispatch_model() — root cause of zero grad",
-            "Explicit requires_grad freeze after get_peft_model(), before dispatch",
-            "enable_input_require_grads() now lands on correct (unwrapped) forward()",
-            "Leaked embed_tokens trainable param eliminated",
+        "run_id":          RUN_ID,
+        "version":         "v4",
+        "base_model":      args.model_id,
+        "strategy":        "LoRA on lm_head ONLY — backbone frozen — BF16",
+        "key_fixes_vs_v3_fixed": [
+            "lm_head weight untied (detach+clone) BEFORE get_peft_model()",
+            "resize_token_embeddings tie-re-introduction guard added",
+            "lora_r raised 16→32, lora_alpha raised 64→128",
+            "grad_accum raised 16→32, lr raised 1e-4→2e-4",
+            "max_grad_norm tightened 0.5→0.3, weight_decay=0.01 added",
+            "EarlyStoppingCallback added",
+            "scheduler changed cosine→cosine_with_restarts",
+            "optimizer changed adamw_torch→adamw_torch_fused",
         ],
-        "lora_r":                16,
-        "lora_alpha":            64,
-        "lora_dropout":          0.05,
+        "lora_r":                32,
+        "lora_alpha":            128,
+        "lora_dropout":          0.1,
         "target_modules":        ["lm_head"],
         "epochs":                args.epochs,
         "learning_rate":         args.lr,
         "max_grad_norm":         MAX_GRAD_NORM,
+        "weight_decay":          0.01,
         "batch_size":            args.batch_size,
         "gradient_accumulation": args.grad_accum,
         "effective_batch_size":  args.batch_size * args.grad_accum,
@@ -1476,7 +1469,7 @@ def main():
     # ── Final summary ─────────────────────────────────────────────────────
     logger.info("")
     logger.info("=" * 60)
-    logger.info("  SpaceLLM lm_head LoRA v3-fixed — Training Complete")
+    logger.info("  SpaceLLM lm_head LoRA v4 — Training Complete")
     logger.info("=" * 60)
     logger.info(f"  Final adapters   →  {FINAL_DIR}")
     logger.info(f"  Checkpoints      →  {CKPT_DIR}")

@@ -1,6 +1,8 @@
 # Environment files
 .env
 **/.env
+.env2
+**/.env2
 
 # Log files
 *.log
