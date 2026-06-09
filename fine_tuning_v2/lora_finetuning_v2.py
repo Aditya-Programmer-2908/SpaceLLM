@@ -1,66 +1,41 @@
 """
-SpaceLLM — Optimized LoRA Fine-Tuning  v2 (updated)
-=====================================================
+SpaceLLM — Optimized LoRA Fine-Tuning  v3-fixed
+================================================
 Model     : openai/gpt-oss-20b  (MoE, MXFP4 quantized checkpoint)
 Phase     : Experimentation
 Strategy  : Freeze full transformer backbone, apply LoRA ONLY to lm_head
 Method    : Standard BF16 LoRA — NOT QLoRA, no bitsandbytes
 
-KEY FIXES vs v2:
-  [CRITICAL] 1. enable_input_require_grads() added AFTER get_peft_model()
-                 → Without this, gradients cannot flow through frozen backbone
-                   to lm_head LoRA weights. This was causing near-zero gradient
-                   updates and is the #1 reason loss was stuck at ~36.
+KEY FIX vs v3:
+  [CRITICAL] ROOT CAUSE of gradient flow failure:
+    dispatch_model() was called BEFORE get_peft_model(). This caused
+    PEFT to wrap the AccelerateModule dispatch wrapper instead of the
+    raw model. When enable_input_require_grads() registered its hook,
+    it landed on the PEFT wrapper's forward() — but the actual compute
+    graph ran through the dispatch wrapper's forward(). The hook never
+    fired during backward, so lm_head LoRA weights received zero grads.
 
-  [CRITICAL] 2. gradient_checkpointing_enable() moved AFTER get_peft_model()
-                 → Correct PEFT order: get_peft_model → enable_input_require_grads
-                   → gradient_checkpointing_enable
+    Secondary symptom: embed_tokens.weight appeared as "trainable" with
+    576M params — a dead giveaway that PEFT's requires_grad bookkeeping
+    was corrupted by the dispatch wrapper at get_peft_model() time.
 
-  [CRITICAL] 3. Learning rate raised from 5e-6 → 1e-4
-                 → lm_head LoRA has very few trainable params. 5e-6 produced
-                   near-invisible weight updates per step. 1e-4 is standard
-                   for LoRA fine-tuning.
-
-  [CRITICAL] 4. Label masking diagnostic added to build_hf_dataset()
-                 → Logs active vs ignored token counts per split so you can
-                   immediately see if masking is broken before wasting a run.
-
-  [CRITICAL] 5. Gradient flow verification added post-PEFT
-                 → Runs one forward+backward pass on dummy data to confirm
-                   lm_head LoRA weights are actually receiving gradients.
-                   Aborts with clear error if not.
-
-  [IMPORTANT] 6. Manual grad clip inside DeviceAwareTrainer.training_step()
-                  → max_grad_norm in TrainingArguments clips BEFORE the
-                    optimizer step but AFTER accelerate scaler unscale.
-                    With multi-GPU dispatch and BF16, this can be unreliable.
-                    Explicit clip_grad_norm_ on requires_grad params ensures
-                    the exploding grad_norm (was hitting 53) is always caught.
-
-  [IMPORTANT] 7. warmup_steps raised from 350 → 100 (proportion-aware)
-                  → With lr=1e-4 and a small dataset, 350 warmup steps is
-                    too long — LR reaches peak too late. 100 steps warms up
-                    within the first ~10% of training.
-
-  [IMPORTANT] 8. Tokenizer-based prefix length verification in tokenise_record()
-                  → Checks that prefix_len < len(input_ids) and that at least
-                    one non-ignored label exists. Logs a warning with decoded
-                    prefix boundary so you can visually verify alignment.
-
-  [NICE]      9. lora_alpha raised from 32 → 64 (alpha = 4×r rule of thumb)
-                  → For lm_head-only LoRA with r=16, alpha=64 gives stronger
-                    effective learning signal without changing architecture.
-
-  [NICE]     10. Per-sample active token stats logged in build_hf_dataset()
-                  → Shows min/mean/max active (non-ignored) label tokens so
-                    you know how many tokens per sample are actually trained on.
+  CORRECT ORDER (v3-fixed):
+    1. Load model to CPU
+    2. Vocab alignment on CPU
+    3. get_peft_model() on CPU           ← PEFT wraps raw model directly
+    4. enable_input_require_grads()      ← hook lands on correct forward()
+    5. gradient_checkpointing_enable()   ← after PEFT
+    6. Explicit freeze: require_grad=False for all non-LoRA params
+    7. dispatch_model() to GPUs          ← dispatch wraps already-PEFT model
+    8. _inject_loss_function() post-dispatch
+    9. verify_gradient_flow()            ← now passes
 
 Launch:
-    export CUDA_VISIBLE_DEVICES=1,2   # use GPU 1+2 (GPU 0 is crowded)
-    python fine_tuning_v2/lora_finetuning_v3.py
+    export CUDA_VISIBLE_DEVICES=1,2
+    python fine_tuning_v2/lora_finetuning_v3_fixed.py
 
     # Override LR or other args:
-    python fine_tuning_v2/lora_finetuning_v3.py --lr 1e-4 --epochs 5
+    python fine_tuning_v2/lora_finetuning_v3_fixed.py --lr 1e-4 --epochs 5
 
 Output layout:
   SpaceLLM/fine_tuning_v2/outputs/
@@ -274,14 +249,14 @@ def _inject_loss_function(model, loss_fn=None, label=""):
 # ── CLI args ──────────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(description="SpaceLLM lm_head LoRA fine-tuning v3")
+    p = argparse.ArgumentParser(description="SpaceLLM lm_head LoRA fine-tuning v3-fixed")
     p.add_argument("--model_id",               type=str,   default="openai/gpt-oss-20b")
     p.add_argument("--epochs",                 type=int,   default=3)
     p.add_argument("--batch_size",             type=int,   default=1)
     p.add_argument("--grad_accum",             type=int,   default=16)
-    p.add_argument("--lr",                     type=float, default=1e-4)   # FIX: was 5e-6
+    p.add_argument("--lr",                     type=float, default=1e-4)
     p.add_argument("--max_seq_len",            type=int,   default=2048)
-    p.add_argument("--warmup_steps",           type=int,   default=100)    # FIX: was 350
+    p.add_argument("--warmup_steps",           type=int,   default=100)
     p.add_argument("--save_steps",             type=int,   default=500)
     p.add_argument("--eval_steps",             type=int,   default=500)
     p.add_argument("--logging_steps",          type=int,   default=20)
@@ -350,20 +325,12 @@ def log_trainable_parameters(model):
             )
 
 
-# ── FIX #5: Gradient flow verification ───────────────────────────────────────
+# ── Gradient flow verification ────────────────────────────────────────────────
 
 def verify_gradient_flow(model, tokenizer, vocab_size: int):
     """
     Runs one forward+backward pass with synthetic data to confirm that
     lm_head LoRA weights actually receive non-zero gradients.
-
-    WHY THIS MATTERS:
-      With a frozen backbone and LoRA only on lm_head, if enable_input_require_grads()
-      is missing or mis-ordered, PyTorch's autograd engine sees the backbone as
-      a dead-end and never computes gradients for lm_head LoRA weights.
-      The result is loss that never decreases — which is exactly what v2 showed.
-
-    This check catches that silently broken state before wasting GPU hours.
     """
     logger.info("")
     logger.info("── Gradient flow verification ───────────────────────")
@@ -371,11 +338,10 @@ def verify_gradient_flow(model, tokenizer, vocab_size: int):
     model.train()
     device = next(p for p in model.parameters() if p.requires_grad).device
 
-    # Build tiny synthetic batch
     seq_len   = 16
     input_ids = torch.randint(0, min(1000, vocab_size), (1, seq_len), device=device)
     labels    = input_ids.clone()
-    labels[:, :8] = -100   # mask first half, train on second half
+    labels[:, :8] = -100
 
     try:
         outputs = model(input_ids=input_ids, labels=labels)
@@ -390,8 +356,7 @@ def verify_gradient_flow(model, tokenizer, vocab_size: int):
         logger.error(f"  ❌ FATAL: forward/backward failed on dummy batch: {e}")
         raise SystemExit(1)
 
-    # Check every trainable param for non-zero grad
-    zero_grad_params  = []
+    zero_grad_params    = []
     nonzero_grad_params = []
     for name, param in model.named_parameters():
         if param.requires_grad:
@@ -401,7 +366,6 @@ def verify_gradient_flow(model, tokenizer, vocab_size: int):
                 grad_max = param.grad.abs().max().item()
                 nonzero_grad_params.append((name, grad_max))
 
-    # Zero out grads — don't let dummy pass pollute real training
     model.zero_grad()
 
     if zero_grad_params:
@@ -410,7 +374,7 @@ def verify_gradient_flow(model, tokenizer, vocab_size: int):
             logger.error(f"     {n}")
         logger.error("")
         logger.error("  ROOT CAUSE: enable_input_require_grads() was not called, or")
-        logger.error("  gradient_checkpointing was enabled before get_peft_model().")
+        logger.error("  dispatch_model() was called before get_peft_model().")
         logger.error("  Training would produce near-zero updates and loss ~36.")
         raise SystemExit(1)
 
@@ -483,24 +447,13 @@ def dataset_sanity_check(records: list, split_name: str):
     logger.info(f"  Difficulty        : {dict(sorted(diff_dist.items()))}")
 
 
-# ── FIX #8: Improved tokenisation with masking verification ──────────────────
+# ── Tokenisation ──────────────────────────────────────────────────────────────
 
 IGNORE_INDEX = -100
 
 
 def tokenise_record(record: dict, tokenizer, max_seq_len: int,
                     debug: bool = False):
-    """
-    Tokenises one record and applies assistant-only loss masking.
-
-    FIX vs v2:
-      Added explicit prefix_len boundary check. If prefix_len >= len(input_ids),
-      the entire sequence gets masked (all -100) which means zero loss signal.
-      We now detect and reject these silently truncated records.
-
-      debug=True prints the decoded boundary for the first N records so you can
-      visually confirm only assistant tokens are unmasked.
-    """
     messages = record.get("messages", [])
 
     hf_messages = []
@@ -554,8 +507,6 @@ def tokenise_record(record: dict, tokenizer, max_seq_len: int,
     )
     prefix_len = len(prefix_enc["input_ids"])
 
-    # FIX: If prefix_len >= total length, truncation ate the assistant response.
-    # This record would contribute zero loss signal — skip it.
     if prefix_len >= len(input_ids):
         return None
 
@@ -566,7 +517,6 @@ def tokenise_record(record: dict, tokenizer, max_seq_len: int,
     if n_active == 0:
         return None
 
-    # Debug mode: print first few token boundaries for visual verification
     if debug:
         logger.info("  [DEBUG] Token boundary check:")
         logger.info(f"    prefix_len={prefix_len}  total={len(input_ids)}  active={n_active}")
@@ -580,20 +530,12 @@ def tokenise_record(record: dict, tokenizer, max_seq_len: int,
         "input_ids":      input_ids,
         "attention_mask": full_enc["attention_mask"],
         "labels":         labels,
-        "n_active":       n_active,   # temporary — removed before Dataset creation
+        "n_active":       n_active,
     }
 
 
 def build_hf_dataset(records: list, tokenizer, max_seq_len: int, split_name: str,
                      vocab_size: int = None, debug_first_n: int = 3):
-    """
-    FIX vs v2:
-      - Logs active token stats (min/mean/max per sample) so you know how many
-        tokens each sample contributes to the loss. Very low mean active tokens
-        (e.g. < 5) would explain high loss even with correct masking.
-      - debug_first_n: runs tokenise_record in debug mode for the first N records
-        so you can visually verify masking is correct without reading all logs.
-    """
     from datasets import Dataset
 
     tokenised, skipped, clamped_records = [], 0, 0
@@ -608,7 +550,7 @@ def build_hf_dataset(records: list, tokenizer, max_seq_len: int, split_name: str
             skipped += 1
             continue
 
-        n_active = result.pop("n_active")   # remove before Dataset
+        n_active = result.pop("n_active")
         active_counts.append(n_active)
 
         if vocab_size is not None:
@@ -653,7 +595,6 @@ def build_hf_dataset(records: list, tokenizer, max_seq_len: int, split_name: str
         )
         raise SystemExit(1)
 
-    # FIX: active token stats — critical for diagnosing masking issues
     mean_active = sum(active_counts) / len(active_counts) if active_counts else 0
     min_active  = min(active_counts) if active_counts else 0
     max_active  = max(active_counts) if active_counts else 0
@@ -735,7 +676,7 @@ def save_training_graphs(history: HistoryCallback, run_id: str):
 
     try:
         fig, axes = plt.subplots(2, 2, figsize=(18, 10))
-        fig.suptitle(f"SpaceLLM LoRA v3 — Training Overview  [{run_id}]",
+        fig.suptitle(f"SpaceLLM LoRA v3-fixed — Training Overview  [{run_id}]",
                      fontsize=13, fontweight="bold")
         panels = [
             (history.train_loss, "Training Loss",        "#e74c3c", "Loss"),
@@ -773,7 +714,7 @@ def save_test_loss_graph(test_losses: list, run_id: str):
 
     display = test_losses[:200]
     fig, axes = plt.subplots(1, 2, figsize=(16, 5))
-    fig.suptitle(f"Test Set Evaluation — SpaceLLM LoRA v3  [{run_id}]",
+    fig.suptitle(f"Test Set Evaluation — SpaceLLM LoRA v3-fixed  [{run_id}]",
                  fontsize=13, fontweight="bold")
 
     axes[0].bar(range(len(display)), display, color="#8e44ad", alpha=0.7, width=1.0)
@@ -814,7 +755,6 @@ def run_test_evaluation(model, tokenizer, test_records: list,
 
     model.eval()
 
-    # ── Phase 1: Loss evaluation ──────────────────────────────────────────
     logger.info(f"── Phase 1: Loss evaluation on {len(test_records):,} records ──")
     per_sample_losses = []
     skipped = 0
@@ -869,7 +809,6 @@ def run_test_evaluation(model, tokenizer, test_records: list,
     logger.info(f"  Loss eval: {len(per_sample_losses):,} samples (skipped={skipped})  mean_loss={mean_test_loss:.4f}")
     save_test_loss_graph(per_sample_losses, run_id)
 
-    # ── Phase 2: Generation evaluation ───────────────────────────────────
     logger.info("")
     logger.info(f"── Phase 2: Generation on first {max_samples} records ──")
 
@@ -961,7 +900,6 @@ def run_test_evaluation(model, tokenizer, test_records: list,
     logger.info(f"  Exact match        : {exact_matches}/{n_gen}  ({em_rate*100:.2f}%)")
     logger.info(f"  Mean token F1      : {mean_f1:.4f}")
 
-    # Generation quality graph
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -969,7 +907,7 @@ def run_test_evaluation(model, tokenizer, test_records: list,
 
         if token_overlaps:
             fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-            fig.suptitle(f"Test Generation Metrics — SpaceLLM LoRA v3  [{run_id}]",
+            fig.suptitle(f"Test Generation Metrics — SpaceLLM LoRA v3-fixed  [{run_id}]",
                          fontsize=13, fontweight="bold")
             axes[0].hist(token_overlaps, bins=30, color="#16a085", alpha=0.8, edgecolor="white")
             axes[0].set_title("Token F1 Distribution")
@@ -1022,11 +960,11 @@ def main():
     args = parse_args()
 
     logger.info("=" * 60)
-    logger.info("  SpaceLLM — Optimized LoRA v3  (lm_head only, BF16)")
+    logger.info("  SpaceLLM — Optimized LoRA v3-fixed  (lm_head only, BF16)")
     logger.info(f"  Run ID            : {RUN_ID}")
     logger.info(f"  Model             : {args.model_id}")
     logger.info(f"  Strategy          : LoRA on lm_head ONLY — backbone frozen")
-    logger.info(f"  Quantization      : Mxfp4Config(dequantize=True)  →  plain BF16")
+    logger.info(f"  Key fix           : PEFT applied BEFORE dispatch_model()")
     logger.info(f"  Epochs            : {args.epochs}  |  LR: {args.lr}")
     logger.info(f"  Batch             : {args.batch_size}  |  Grad accum: {args.grad_accum}"
                 f"  |  Eff batch: {args.batch_size * args.grad_accum}")
@@ -1080,11 +1018,11 @@ def main():
     logger.info(f"Vocab size        : {tokenizer.vocab_size:,}")
     logger.info(f"len(tokenizer)    : {len(tokenizer):,}")
     logger.info(f"Pad token         : '{tokenizer.pad_token}'  (id={tokenizer.pad_token_id})")
-    logger.info(f"Chat template     : {'found (harmony format)' if tokenizer.chat_template else 'NOT FOUND'}")
+    logger.info(f"Chat template     : {'found' if tokenizer.chat_template else 'NOT FOUND'}")
 
     # ── Model load ────────────────────────────────────────────────────────
     logger.info("")
-    logger.info(f"Loading model: {args.model_id}  [MXFP4 → BF16 dequantize on CPU]")
+    logger.info(f"Loading model to CPU: {args.model_id}  [MXFP4 → BF16 dequantize]")
     t0 = time.time()
     try:
         model = AutoModelForCausalLM.from_pretrained(
@@ -1115,16 +1053,95 @@ def main():
     assert model.get_output_embeddings().weight.shape[0] == actual_vocab
     logger.info(f"  Vocab alignment PASSED  (vocab={actual_vocab:,}  padded to multiple of 64)")
 
-    # ── Inject loss (pre-dispatch) ────────────────────────────────────────
-    logger.info("")
-    logger.info("── Injecting device-aware CE loss (pre-dispatch) ────")
-    found = _inject_loss_function(model, label="pre-dispatch")
-    if not found:
-        logger.warning("  loss_function attr not found pre-dispatch — will retry after dispatch")
+    model.config.use_cache = False
 
-    # ── GPU dispatch ──────────────────────────────────────────────────────
+    # ── Inject loss (pre-PEFT, pre-dispatch) ─────────────────────────────
     logger.info("")
-    logger.info("Dispatching model across GPUs ...")
+    logger.info("── Injecting device-aware CE loss (pre-PEFT) ────────")
+    _inject_loss_function(model, label="pre-PEFT")
+
+    # =========================================================================
+    # FIX: Apply LoRA on CPU BEFORE dispatch_model()
+    #
+    # v3 BUG: dispatch_model() was called first, wrapping the raw model in
+    # an AccelerateModule. Then get_peft_model() wrapped that. The
+    # enable_input_require_grads() hook registered on the PEFT wrapper's
+    # forward(), but actual computation ran through AccelerateModule.forward().
+    # Hook never fired → zero grads on all LoRA params.
+    #
+    # CORRECT ORDER:
+    #   1. get_peft_model() on raw CPU model  ← PEFT wraps the real model
+    #   2. enable_input_require_grads()        ← hook on correct forward()
+    #   3. gradient_checkpointing_enable()     ← after PEFT
+    #   4. Explicit freeze of all non-LoRA params
+    #   5. dispatch_model()                    ← dispatch wraps PEFT model
+    # =========================================================================
+
+    # ── Step 1: Apply LoRA on CPU ─────────────────────────────────────────
+    logger.info("")
+    logger.info("Applying LoRA to lm_head ONLY (on CPU, before dispatch) ...")
+
+    lora_config = LoraConfig(
+        r=16,
+        lora_alpha=64,
+        lora_dropout=0.05,
+        bias="none",
+        task_type=TaskType.CAUSAL_LM,
+        target_modules=["lm_head"],
+        init_lora_weights=True,
+    )
+    model = get_peft_model(model, lora_config)
+    logger.info("✅ get_peft_model() applied on raw CPU model")
+
+    # ── Step 2: enable_input_require_grads on the correct wrapper ─────────
+    model.enable_input_require_grads()
+    logger.info("✅ enable_input_require_grads() called (hook on correct forward)")
+
+    # ── Step 3: gradient checkpointing after PEFT ─────────────────────────
+    model.gradient_checkpointing_enable()
+    logger.info("✅ gradient_checkpointing_enable() called (post-PEFT)")
+
+    # ── Step 4: Explicit freeze — belt-and-suspenders ─────────────────────
+    #
+    # PEFT is supposed to freeze non-LoRA params automatically, but the
+    # dispatch wrapper interaction in v3 caused embed_tokens to leak as
+    # "trainable" (576M params). We enforce the freeze explicitly here,
+    # BEFORE dispatch, so the requires_grad state is unambiguous.
+    #
+    logger.info("")
+    logger.info("── Explicit parameter freeze (pre-dispatch) ─────────")
+    frozen_count, lora_count = 0, 0
+    for name, param in model.named_parameters():
+        if "lora_" in name:
+            param.requires_grad_(True)
+            lora_count += 1
+        else:
+            param.requires_grad_(False)
+            frozen_count += 1
+    logger.info(f"  Frozen : {frozen_count} tensors")
+    logger.info(f"  LoRA   : {lora_count} tensors (requires_grad=True)")
+
+    # Sanity check — no non-LoRA params should be trainable
+    leaked = [(n, p.shape) for n, p in model.named_parameters()
+              if p.requires_grad and "lora_" not in n]
+    if leaked:
+        logger.error("  ❌ Non-LoRA params still trainable after explicit freeze:")
+        for n, s in leaked:
+            logger.error(f"     {n}  {s}")
+        raise SystemExit(1)
+    logger.info("  ✅ No non-LoRA params leaked as trainable")
+
+    # Re-inject loss post-PEFT (before dispatch)
+    logger.info("")
+    logger.info("── Re-injecting CE loss (post-PEFT, pre-dispatch) ───")
+    _inject_loss_function(model, label="post-PEFT pre-dispatch")
+
+    log_trainable_parameters(model)
+    log_gpu_memory("after LoRA init (CPU)")
+
+    # ── Step 5: GPU dispatch (PEFT model, correct state) ──────────────────
+    logger.info("")
+    logger.info("Dispatching PEFT model across GPUs ...")
     t1 = time.time()
     try:
         from accelerate import dispatch_model, infer_auto_device_map
@@ -1165,78 +1182,23 @@ def main():
         dev_counts = Counter(str(v) for v in model.hf_device_map.values())
         for dev, count in sorted(dev_counts.items()):
             logger.info(f"  {dev} : {count} layers")
-    log_gpu_memory("after model load")
+    log_gpu_memory("after dispatch")
 
-    # ── Re-inject after dispatch ──────────────────────────────────────────
+    # ── Re-inject loss post-dispatch ──────────────────────────────────────
     logger.info("")
     logger.info("── Re-injecting CE loss (post-dispatch) ─────────────")
     _inject_loss_function(model, label="post-dispatch")
 
-    model.config.use_cache = False
-
-    # ── LoRA on lm_head ───────────────────────────────────────────────────
-    logger.info("")
-    logger.info("Applying LoRA to lm_head ONLY ...")
-
-    lora_config = LoraConfig(
-        r=16,
-        lora_alpha=64,          # FIX: raised from 32 → 64 (4×r rule of thumb)
-        lora_dropout=0.05,
-        bias="none",
-        task_type=TaskType.CAUSAL_LM,
-        target_modules=["lm_head"],
-        init_lora_weights=True,
-    )
-    model = get_peft_model(model, lora_config)
-
-    # ── FIX #1 & #2: Correct PEFT + gradient checkpointing order ─────────
-    #
-    #   WRONG ORDER (v2):
-    #     model.gradient_checkpointing_enable()   ← before PEFT
-    #     model = get_peft_model(model, lora_config)
-    #     # enable_input_require_grads() MISSING
-    #
-    #   CORRECT ORDER (v3):
-    #     model = get_peft_model(model, lora_config)
-    #     model.enable_input_require_grads()       ← CRITICAL: allows grads through frozen backbone
-    #     model.gradient_checkpointing_enable()    ← after PEFT
-    #
-    #   WHY enable_input_require_grads() is critical:
-    #     PyTorch only computes gradients for tensors that have requires_grad=True
-    #     OR that are connected to such tensors in the computation graph.
-    #     The frozen backbone parameters have requires_grad=False.
-    #     The input embeddings (embed_tokens) also have requires_grad=False.
-    #     This means the input tensor to the backbone has no gradient hook.
-    #     PyTorch's autograd stops at the first non-differentiable node.
-    #     Result: lm_head LoRA weights receive ZERO gradients every step.
-    #     enable_input_require_grads() registers a hook that forces the input
-    #     tensor to retain gradients, reconnecting the computation graph so
-    #     that gradients flow all the way back to lm_head LoRA weights.
-    #
-    model.enable_input_require_grads()       # ← THE most important fix
-    model.gradient_checkpointing_enable()
-    logger.info("✅ enable_input_require_grads() called (gradient flow through frozen backbone)")
-    logger.info("✅ gradient_checkpointing enabled (post-PEFT, correct order)")
-
-    # ── Re-inject loss post-PEFT ──────────────────────────────────────────
-    logger.info("")
-    logger.info("── Re-injecting CE loss (post-PEFT) ─────────────────")
-    _inject_loss_function(model, label="post-PEFT")
-
-    logger.info("")
-    log_trainable_parameters(model)
-    log_gpu_memory("after LoRA init")
-
     # ── Post-PEFT vocab check ─────────────────────────────────────────────
     logger.info("")
-    logger.info("── Vocab alignment (post-PEFT) ──────────────────────")
+    logger.info("── Vocab alignment (post-dispatch) ──────────────────")
     _post_peft_vocab = model.get_output_embeddings().weight.shape[0]
     if _post_peft_vocab != model.config.vocab_size:
         logger.warning(f"  lm_head vocab ({_post_peft_vocab}) != config ({model.config.vocab_size}) — fixing")
         model.config.vocab_size = _post_peft_vocab
     logger.info(f"  lm_head vocab = {_post_peft_vocab:,}  ✅")
 
-    # ── FIX #5: Gradient flow verification ───────────────────────────────
+    # ── Gradient flow verification ────────────────────────────────────────
     if not args.skip_grad_verify:
         verify_gradient_flow(model, tokenizer, _post_peft_vocab)
     else:
@@ -1257,7 +1219,7 @@ def main():
         logger.warning("Test file not found — test evaluation will be skipped")
 
     logger.info("")
-    logger.info("── Tokenising (with label masking diagnostics) ──────")
+    logger.info("── Tokenising ───────────────────────────────────────")
     train_dataset = build_hf_dataset(
         train_records, tokenizer, args.max_seq_len, "train",
         vocab_size=_post_peft_vocab, debug_first_n=3,
@@ -1278,9 +1240,9 @@ def main():
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
-        learning_rate=args.lr,              # FIX: default now 1e-4
+        learning_rate=args.lr,
         lr_scheduler_type="cosine",
-        warmup_steps=args.warmup_steps,     # FIX: default now 100
+        warmup_steps=args.warmup_steps,
         max_grad_norm=MAX_GRAD_NORM,
         optim="adamw_torch",
         bf16=True,
@@ -1335,22 +1297,14 @@ def main():
 
     history_callback = _TrainingHistoryCallback()
 
-    # ── FIX #6: DeviceAwareTrainer with explicit grad clipping ───────────
+    # ── DeviceAwareTrainer ────────────────────────────────────────────────
     class DeviceAwareTrainer(Trainer):
         """
-        Two improvements over v2:
-
-        1. _prepare_inputs() moves labels to lm_head device (unchanged from v2).
-
-        2. training_step() adds an explicit clip_grad_norm_ call on all
-           requires_grad parameters AFTER loss.backward() and BEFORE the
-           optimizer step. This is in addition to max_grad_norm in
-           TrainingArguments because with multi-GPU dispatch + BF16 +
-           accelerate's gradient scaler, the HF Trainer clip can sometimes
-           miss LoRA params that live on a non-primary device.
-
-           This is why grad_norm was hitting 53 in v2 despite max_grad_norm=0.5
-           in TrainingArguments.
+        1. _prepare_inputs() moves labels to lm_head device.
+        2. training_step() adds explicit clip_grad_norm_ on trainable params
+           as a belt-and-suspenders guard alongside max_grad_norm in
+           TrainingArguments (the HF clip can be unreliable with multi-GPU
+           dispatch + BF16 accelerate scaler).
         """
         def _get_lm_head_device(self):
             try:
@@ -1368,15 +1322,16 @@ def main():
             return inputs
 
         def training_step(self, model, inputs, num_items_in_batch=None):
-            # Standard HF training step (handles loss, backward, scaler)
             if num_items_in_batch is not None:
                 loss = super().training_step(model, inputs, num_items_in_batch)
             else:
                 loss = super().training_step(model, inputs)
 
-            # FIX #6: Explicit grad clip on all trainable params
-            # This guarantees clipping regardless of accelerate/scaler state
-            trainable_params = [p for p in model.parameters() if p.requires_grad and p.grad is not None]
+            # Explicit grad clip — guards against multi-GPU/scaler clip misses
+            trainable_params = [
+                p for p in model.parameters()
+                if p.requires_grad and p.grad is not None
+            ]
             if trainable_params:
                 torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=MAX_GRAD_NORM)
 
@@ -1471,18 +1426,14 @@ def main():
     # ── Adapter info ──────────────────────────────────────────────────────
     adapter_info = {
         "run_id":                RUN_ID,
-        "version":               "v3",
+        "version":               "v3-fixed",
         "base_model":            args.model_id,
         "strategy":              "LoRA on lm_head ONLY — backbone frozen — BF16",
-        "key_fixes_vs_v2": [
-            "enable_input_require_grads() added after get_peft_model()",
-            "gradient_checkpointing_enable() moved after get_peft_model()",
-            "lr raised from 5e-6 to 1e-4",
-            "warmup_steps reduced from 350 to 100",
-            "lora_alpha raised from 32 to 64",
-            "explicit clip_grad_norm_ in training_step()",
-            "gradient flow verified before training starts",
-            "active token stats logged for masking diagnosis",
+        "key_fixes_vs_v3": [
+            "PEFT applied on CPU BEFORE dispatch_model() — root cause of zero grad",
+            "Explicit requires_grad freeze after get_peft_model(), before dispatch",
+            "enable_input_require_grads() now lands on correct (unwrapped) forward()",
+            "Leaked embed_tokens trainable param eliminated",
         ],
         "lora_r":                16,
         "lora_alpha":            64,
@@ -1520,7 +1471,7 @@ def main():
     # ── Final summary ─────────────────────────────────────────────────────
     logger.info("")
     logger.info("=" * 60)
-    logger.info("  SpaceLLM lm_head LoRA v3 — Training Complete")
+    logger.info("  SpaceLLM lm_head LoRA v3-fixed — Training Complete")
     logger.info("=" * 60)
     logger.info(f"  Final adapters   →  {FINAL_DIR}")
     logger.info(f"  Checkpoints      →  {CKPT_DIR}")
