@@ -106,14 +106,37 @@ def main():
     tokenizer.padding_side = "left"   # better for generation
     logger.info(f"Tokenizer loaded  vocab={tokenizer.vocab_size:,}")
 
+    import torch.nn as nn
+
     base_model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
         quantization_config=Mxfp4Config(dequantize=True),
         device_map="auto",
         trust_remote_code=True,
     )
+
+    # Step 1 — Untie lm_head (same as training script)
+    base_model.config.tie_word_embeddings = False
+    lm_head = base_model.get_output_embeddings()
+    lm_head.weight = nn.Parameter(lm_head.weight.detach().clone())
+    logger.info("✅ lm_head untied")
+
+    # Step 2 — Resize to match training vocab (200064)
+    TRAINED_VOCAB_SIZE = 200064  # from error message
+    base_model.resize_token_embeddings(TRAINED_VOCAB_SIZE)
+    base_model.config.vocab_size = TRAINED_VOCAB_SIZE
+    logger.info(f"✅ Vocab resized to {TRAINED_VOCAB_SIZE}")
+
+    # Step 3 — Re-untie after resize (resize can re-tie)
+    lm_head = base_model.get_output_embeddings()
+    lm_head.weight = nn.Parameter(lm_head.weight.detach().clone())
+    logger.info("✅ lm_head re-untied after resize")
+
+    # Step 4 — Now load adapter
     model = PeftModel.from_pretrained(base_model, str(ADAPTER_DIR))
     model.eval()
+    logger.info("✅ LoRA adapter loaded successfully")
+
     logger.info(f"Model loaded in {time.time()-t0:.1f}s")
 
     # ── Load test data ─────────────────────────────────────────────
