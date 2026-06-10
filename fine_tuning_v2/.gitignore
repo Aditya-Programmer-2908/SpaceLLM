@@ -1,0 +1,8 @@
+outputs/checkpoints/
+outputs/spacellm_lora_final/
+outputs/logs/
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.ckpt
