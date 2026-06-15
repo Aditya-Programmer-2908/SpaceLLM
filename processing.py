@@ -21,8 +21,8 @@ from datetime import timedelta
 # ── Configuration ──────────────────────────────────────────────────────────────
 # OLLAMA_URL  = "http://172.16.5.121:11434/api/generate"
 OLLAMA_URL  = "http://127.0.0.1:11434/api/generate"
-MODEL       = "mistral-small3.1:24b"
-OUTPUT_FILE = "processed.json"
+MODEL       = "gpt-oss:20b"
+OUTPUT_FILE = "processed_gpt_oss.json"
 
 # All aspects — every mission gets all of these
 ASPECTS = [
