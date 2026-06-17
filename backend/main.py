@@ -49,12 +49,15 @@ async def lifespan(app: FastAPI):
     # ── Load base model exactly as fine-tuning script did ────────────────
     # Fine-tuning used Mxfp4Config(dequantize=True) → BF16 weights on CPU,
     # then dispatched to GPU. We mirror that exactly so adapter shapes match.
-    device = f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
-    log.info("Loading base model %s  [Mxfp4Config dequantize=True -> BF16] on %s ...", BASE_MODEL_ID, device)
+    # GPU 1 has ~44GB free. Native MXFP4 (no dequantize) only needs ~16GB.
+    # This avoids the BF16 dequantized model (~44GB) running out of memory.
+    # ignore_mismatched_sizes handles the lm_head vocab resize difference.
+    device = "cuda:0"   # CUDA_VISIBLE_DEVICES=1 makes GPU1 appear as cuda:0
+    log.info("Loading base model %s  [native MXFP4] on %s ...", BASE_MODEL_ID, device)
     _base = AutoModelForCausalLM.from_pretrained(
         BASE_MODEL_ID,
-        quantization_config=Mxfp4Config(dequantize=True),
-        device_map={"": device},   # pin entire model to one GPU — avoids MoE cross-device split
+        torch_dtype="auto",
+        device_map={"": device},
         trust_remote_code=True,
     )
     log.info("Base model loaded. dtype=%s", next(_base.parameters()).dtype)
@@ -91,6 +94,7 @@ async def lifespan(app: FastAPI):
         ADAPTER_MODEL_ID,
         trust_remote_code=True,
         is_trainable=False,
+        ignore_mismatched_sizes=True,
     )
     model.eval()
     log.info("SpaceLLM_v1 ready!")
