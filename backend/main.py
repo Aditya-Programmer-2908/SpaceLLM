@@ -60,23 +60,33 @@ async def lifespan(app: FastAPI):
     # a bleeding-edge transformers build not yet on PyPI).
     # NF4 gives equivalent memory savings (~22 GB → ~11 GB) and is
     # fully supported in transformers>=4.30 + bitsandbytes>=0.41.
+    compute_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     bnb_cfg = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,    # saves ~0.4 bits extra per weight
+        bnb_4bit_compute_dtype=compute_dtype,
+        bnb_4bit_use_double_quant=True,
     )
+
+    device = f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
+
+    # trust_remote_code=True fetches the gpt_oss architecture code from
+    # HuggingFace Hub at runtime, so it works regardless of which
+    # transformers version is installed locally.
+    from transformers import AutoConfig
+    config = AutoConfig.from_pretrained(BASE_MODEL_ID, trust_remote_code=True)
 
     _base = AutoModelForCausalLM.from_pretrained(
         BASE_MODEL_ID,
+        config=config,
         quantization_config=bnb_cfg,
-        device_map="auto",
+        device_map={"": device},
         trust_remote_code=True,
     )
     log.info("Base model loaded. Attaching LoRA adapter %s …", ADAPTER_MODEL_ID)
 
-    model     = PeftModel.from_pretrained(_base, ADAPTER_MODEL_ID)
-    tokenizer = AutoTokenizer.from_pretrained(ADAPTER_MODEL_ID)
+    model     = PeftModel.from_pretrained(_base, ADAPTER_MODEL_ID, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(ADAPTER_MODEL_ID, trust_remote_code=True)
     model.eval()
     log.info("=== SpaceLLM_v1 ready ✓ ===")
 
