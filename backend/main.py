@@ -1,40 +1,35 @@
-"""
-SpaceLLM Backend — FastAPI
-Serves:
-  POST /generate   → inference via SpaceLLM_v1 (LoRA over gpt-oss-20b)
-  POST /feedback   → stores RLHF/correction payloads for MAPE-K pipeline
-  GET  /health     → liveness check
-
-Run:
-  CUDA_VISIBLE_DEVICES=1 uvicorn main:app --host 0.0.0.0 --port 8000
-"""
-
 import json
 import logging
 import uuid
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
+
+# ── Login to HuggingFace first, before any other HF imports ──────────────
+from huggingface_hub import login
+login(token="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")
 
 import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from peft import PeftModel
 from pydantic import BaseModel, Field
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-
-# ── Logging ───────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
 )
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s - %(message)s")
 log = logging.getLogger("spacellm")
 
-# ── Config ────────────────────────────────────────────────────────────────
 FEEDBACK_LOG     = Path("feedback_log.jsonl")
 BASE_MODEL_ID    = "openai/gpt-oss-20b"
 ADAPTER_MODEL_ID = "AdityaPS/SpaceLLM_v1"
+HF_TOKEN         = "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"
 SYSTEM_PROMPT    = (
     "You are SpaceLLM, an expert AI assistant specialising in space missions, "
     "astronomy, aerospace engineering, and satellite operations. "
@@ -42,25 +37,18 @@ SYSTEM_PROMPT    = (
     "If a question is outside the space domain, politely redirect the user."
 )
 
-# ── Global model handles (populated in lifespan) ──────────────────────────
 model     = None
 tokenizer = None
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# Lifespan — load model AFTER uvicorn binds the port (not at import time)
-# ══════════════════════════════════════════════════════════════════════════
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global model, tokenizer
-    log.info("=== SpaceLLM startup: loading base model %s ===", BASE_MODEL_ID)
 
-    # ── Quantisation config ──────────────────────────────────────────────
-    # Uses bitsandbytes 4-bit NF4 instead of Mxfp4Config (which requires
-    # a bleeding-edge transformers build not yet on PyPI).
-    # NF4 gives equivalent memory savings (~22 GB → ~11 GB) and is
-    # fully supported in transformers>=4.30 + bitsandbytes>=0.41.
+    log.info("Loading base model %s ...", BASE_MODEL_ID)
+
     compute_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
     bnb_cfg = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
@@ -69,59 +57,65 @@ async def lifespan(app: FastAPI):
     )
 
     device = f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
+    log.info("Using device: %s", device)
 
-    # trust_remote_code=True fetches the gpt_oss architecture code from
-    # HuggingFace Hub at runtime, so it works regardless of which
-    # transformers version is installed locally.
-    from transformers import AutoConfig
-    config = AutoConfig.from_pretrained(BASE_MODEL_ID, trust_remote_code=True)
+    config = AutoConfig.from_pretrained(
+        BASE_MODEL_ID,
+        token=HF_TOKEN,
+        trust_remote_code=True,
+    )
 
     _base = AutoModelForCausalLM.from_pretrained(
         BASE_MODEL_ID,
         config=config,
         quantization_config=bnb_cfg,
         device_map={"": device},
+        token=HF_TOKEN,
         trust_remote_code=True,
     )
-    log.info("Base model loaded. Attaching LoRA adapter %s …", ADAPTER_MODEL_ID)
+    log.info("Base model loaded. Attaching adapter %s ...", ADAPTER_MODEL_ID)
 
-    model     = PeftModel.from_pretrained(_base, ADAPTER_MODEL_ID, trust_remote_code=True)
-    tokenizer = AutoTokenizer.from_pretrained(ADAPTER_MODEL_ID, trust_remote_code=True)
+    model = PeftModel.from_pretrained(
+        _base,
+        ADAPTER_MODEL_ID,
+        token=HF_TOKEN,
+        trust_remote_code=True,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        ADAPTER_MODEL_ID,
+        token=HF_TOKEN,
+        trust_remote_code=True,
+    )
     model.eval()
-    log.info("=== SpaceLLM_v1 ready ✓ ===")
+    log.info("SpaceLLM_v1 ready!")
 
-    yield   # ← server runs here
+    yield
 
-    log.info("SpaceLLM shutting down.")
+    log.info("Shutting down.")
     del model, tokenizer
     torch.cuda.empty_cache()
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# FastAPI app
-# ══════════════════════════════════════════════════════════════════════════
 app = FastAPI(title="SpaceLLM API", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],        # tighten in production
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-# ── Pydantic schemas ──────────────────────────────────────────────────────
 
 class ChatMessage(BaseModel):
     role:    Literal["system", "user", "assistant"]
     content: str
 
 class GenerateRequest(BaseModel):
-    messages:       list[ChatMessage] = Field(..., description="Conversation history.")
-    max_new_tokens: int   = Field(512, ge=1,   le=2048)
-    temperature:    float = Field(0.7, ge=0.0, le=2.0)
-    top_p:          float = Field(0.9, ge=0.0, le=1.0)
-    do_sample:      bool  = Field(True)
+    messages:       list[ChatMessage]
+    max_new_tokens: int   = 512
+    temperature:    float = 0.7
+    top_p:          float = 0.9
+    do_sample:      bool  = True
 
 class GenerateResponse(BaseModel):
     response:      str
@@ -140,36 +134,24 @@ class FeedbackResponse(BaseModel):
     feedback_id: str
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────
-
 @app.get("/health")
 def health():
     ready = model is not None and tokenizer is not None
-    return {
-        "status": "ok" if ready else "loading",
-        "model":  ADAPTER_MODEL_ID,
-        "ready":  ready,
-    }
+    return {"status": "ok" if ready else "loading", "model": ADAPTER_MODEL_ID, "ready": ready}
 
 
 @app.post("/generate", response_model=GenerateResponse)
 def generate(req: GenerateRequest):
     if model is None or tokenizer is None:
-        raise HTTPException(status_code=503, detail="Model still loading, retry shortly.")
+        raise HTTPException(status_code=503, detail="Model still loading.")
 
     msgs = [m.model_dump() for m in req.messages]
-
-    # Prepend system prompt if not already present
     if not msgs or msgs[0]["role"] != "system":
         msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + msgs
 
-    # Harmony chat template required by gpt-oss-20b
     try:
-        prompt = tokenizer.apply_chat_template(
-            msgs, tokenize=False, add_generation_prompt=True
-        )
+        prompt = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
     except Exception as exc:
-        log.error("Chat-template error: %s", exc)
         raise HTTPException(status_code=500, detail=f"Template error: {exc}")
 
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
@@ -179,16 +161,14 @@ def generate(req: GenerateRequest):
             **inputs,
             max_new_tokens=req.max_new_tokens,
             temperature=req.temperature if req.do_sample else 1.0,
-            top_p=req.top_p            if req.do_sample else 1.0,
+            top_p=req.top_p if req.do_sample else 1.0,
             do_sample=req.do_sample,
             pad_token_id=tokenizer.eos_token_id,
         )
 
     new_tokens    = output_ids[0][inputs["input_ids"].shape[1]:]
     response_text = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-
-    log.info("Generated %d tokens for %d-turn conversation.",
-             len(new_tokens), len(req.messages))
+    log.info("Generated %d tokens.", len(new_tokens))
     return GenerateResponse(response=response_text)
 
 
@@ -206,6 +186,5 @@ def feedback(req: FeedbackRequest):
     }
     with FEEDBACK_LOG.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")
-
-    log.info("Feedback %s recorded — type=%s", feedback_id, req.feedback_type)
+    log.info("Feedback %s logged.", feedback_id)
     return FeedbackResponse(status="logged", feedback_id=feedback_id)
