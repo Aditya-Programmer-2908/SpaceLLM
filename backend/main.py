@@ -49,11 +49,12 @@ async def lifespan(app: FastAPI):
     # ── Load base model exactly as fine-tuning script did ────────────────
     # Fine-tuning used Mxfp4Config(dequantize=True) → BF16 weights on CPU,
     # then dispatched to GPU. We mirror that exactly so adapter shapes match.
-    log.info("Loading base model %s  [Mxfp4Config dequantize=True → BF16] ...", BASE_MODEL_ID)
+    device = f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
+    log.info("Loading base model %s  [Mxfp4Config dequantize=True -> BF16] on %s ...", BASE_MODEL_ID, device)
     _base = AutoModelForCausalLM.from_pretrained(
         BASE_MODEL_ID,
         quantization_config=Mxfp4Config(dequantize=True),
-        device_map="auto",
+        device_map={"": device},   # pin entire model to one GPU — avoids MoE cross-device split
         trust_remote_code=True,
     )
     log.info("Base model loaded. dtype=%s", next(_base.parameters()).dtype)
