@@ -7,11 +7,12 @@ from pathlib import Path
 from typing import Literal
 
 import torch
+import torch.nn as nn
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from peft import PeftModel
-from pydantic import BaseModel, Field
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from pydantic import BaseModel
+from transformers import AutoModelForCausalLM, AutoTokenizer, Mxfp4Config, pipeline
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s - %(message)s")
 log = logging.getLogger("spacellm")
@@ -35,27 +36,55 @@ pipe      = None
 async def lifespan(app: FastAPI):
     global model, tokenizer, pipe
 
-    log.info("Loading base model %s ...", BASE_MODEL_ID)
-    device = f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
-    log.info("Device: %s", device)
+    log.info("Loading tokenizer from adapter: %s", ADAPTER_MODEL_ID)
+    tokenizer = AutoTokenizer.from_pretrained(ADAPTER_MODEL_ID, trust_remote_code=True)
 
-    # Load tokenizer from adapter first to get the correct vocab size
-    tokenizer = AutoTokenizer.from_pretrained(
-        ADAPTER_MODEL_ID,
-        trust_remote_code=True,
-    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token    = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokenizer.padding_side = "right"
+    log.info("Tokenizer vocab size: %d  |  len(tokenizer): %d",
+             tokenizer.vocab_size, len(tokenizer))
 
-    # Load base model and resize embeddings to match adapter vocab size
+    # ── Load base model exactly as fine-tuning script did ────────────────
+    # Fine-tuning used Mxfp4Config(dequantize=True) → BF16 weights on CPU,
+    # then dispatched to GPU. We mirror that exactly so adapter shapes match.
+    log.info("Loading base model %s  [Mxfp4Config dequantize=True → BF16] ...", BASE_MODEL_ID)
     _base = AutoModelForCausalLM.from_pretrained(
         BASE_MODEL_ID,
-        torch_dtype="auto",
+        quantization_config=Mxfp4Config(dequantize=True),
         device_map="auto",
         trust_remote_code=True,
     )
-    # Resize to match adapter vocab (200064 vs base 201088)
-    _base.resize_token_embeddings(len(tokenizer))
-    log.info("Base model loaded. Attaching LoRA adapter %s ...", ADAPTER_MODEL_ID)
+    log.info("Base model loaded. dtype=%s", next(_base.parameters()).dtype)
 
+    # ── Vocab alignment — mirrors fine-tuning script exactly ─────────────
+    # Fine-tuning did:
+    #   1. tie_word_embeddings = False
+    #   2. detach+clone lm_head weight
+    #   3. resize_token_embeddings(len(tokenizer), pad_to_multiple_of=64)
+    # We must reproduce the same vocab size so adapter weights match.
+    _base.config.tie_word_embeddings = False
+
+    lm_head = _base.get_output_embeddings()
+    lm_head.weight = nn.Parameter(lm_head.weight.detach().clone())
+    log.info("lm_head weight untied and cloned.")
+
+    _base.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=64)
+    actual_vocab = _base.get_output_embeddings().weight.shape[0]
+    _base.config.vocab_size = actual_vocab
+    log.info("Vocab after resize: %d  (padded to multiple of 64)", actual_vocab)
+
+    # Guard: if resize re-tied lm_head, untie again
+    if id(_base.get_input_embeddings().weight) == id(_base.get_output_embeddings().weight):
+        lm_head = _base.get_output_embeddings()
+        lm_head.weight = nn.Parameter(lm_head.weight.detach().clone())
+        log.info("Re-untied lm_head after resize.")
+
+    _base.config.use_cache = False
+
+    # ── Attach LoRA adapter ───────────────────────────────────────────────
+    log.info("Attaching LoRA adapter: %s", ADAPTER_MODEL_ID)
     model = PeftModel.from_pretrained(
         _base,
         ADAPTER_MODEL_ID,
@@ -63,6 +92,7 @@ async def lifespan(app: FastAPI):
         is_trainable=False,
     )
     model.eval()
+    log.info("SpaceLLM_v1 ready!")
 
     pipe = pipeline(
         "text-generation",
@@ -70,7 +100,6 @@ async def lifespan(app: FastAPI):
         tokenizer=tokenizer,
     )
 
-    log.info("SpaceLLM_v1 ready!")
     yield
 
     log.info("Shutting down.")
@@ -141,7 +170,12 @@ def generate(req: GenerateRequest):
         return_full_text=False,
     )
 
-    response_text = result[0]["generated_text"].strip()
+    response_text = result[0]["generated_text"]
+    if isinstance(response_text, list):
+        # pipeline returned list of dicts (chat format)
+        response_text = response_text[-1].get("content", "")
+    response_text = response_text.strip()
+
     log.info("Response generated (%d chars).", len(response_text))
     return GenerateResponse(response=response_text)
 
