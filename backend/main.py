@@ -39,10 +39,12 @@ async def lifespan(app: FastAPI):
     device = f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
     log.info("Device: %s", device)
 
+    # gpt-oss-20b is natively MXFP4 quantized on HF (~16GB VRAM needed).
+    # No bitsandbytes required — load as-is with torch_dtype="auto".
     _base = AutoModelForCausalLM.from_pretrained(
         BASE_MODEL_ID,
         torch_dtype="auto",
-        device_map={"": device},
+        device_map="auto",
         trust_remote_code=True,
     )
     log.info("Base model loaded. Attaching LoRA adapter %s ...", ADAPTER_MODEL_ID)
@@ -62,7 +64,6 @@ async def lifespan(app: FastAPI):
         "text-generation",
         model=model,
         tokenizer=tokenizer,
-        device_map={"": device},
     )
 
     log.info("SpaceLLM_v1 ready!")
