@@ -9,7 +9,7 @@ from typing import Literal
 
 # ── Login to HuggingFace first, before any other HF imports ──────────────
 from huggingface_hub import login
-login(token="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")
+login(token="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")
 
 import torch
 from fastapi import FastAPI, HTTPException
