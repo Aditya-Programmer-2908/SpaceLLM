@@ -6,12 +6,13 @@ Serves:
   GET  /health     → liveness check
 
 Run:
-  uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+  CUDA_VISIBLE_DEVICES=1 uvicorn main:app --host 0.0.0.0 --port 8000
 """
 
 import json
 import logging
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -21,11 +22,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from peft import PeftModel
 from pydantic import BaseModel, Field
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    Mxfp4Config,
-)
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 # ── Logging ───────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -34,51 +31,74 @@ logging.basicConfig(
 )
 log = logging.getLogger("spacellm")
 
-# ── Paths ─────────────────────────────────────────────────────────────────
-FEEDBACK_LOG = Path("feedback_log.jsonl")   # append-only JSONL for MAPE-K
-
-# ── Model IDs ─────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────
+FEEDBACK_LOG     = Path("feedback_log.jsonl")
 BASE_MODEL_ID    = "openai/gpt-oss-20b"
 ADAPTER_MODEL_ID = "AdityaPS/SpaceLLM_v1"
-
-# ── System prompt ─────────────────────────────────────────────────────────
-SYSTEM_PROMPT = (
+SYSTEM_PROMPT    = (
     "You are SpaceLLM, an expert AI assistant specialising in space missions, "
     "astronomy, aerospace engineering, and satellite operations. "
     "Provide accurate, concise, technically rigorous answers. "
     "If a question is outside the space domain, politely redirect the user."
 )
 
+# ── Global model handles (populated in lifespan) ──────────────────────────
+model     = None
+tokenizer = None
+
+
 # ══════════════════════════════════════════════════════════════════════════
-# Model loading  (done once at startup)
+# Lifespan — load model AFTER uvicorn binds the port (not at import time)
 # ══════════════════════════════════════════════════════════════════════════
-log.info("Loading base model %s …", BASE_MODEL_ID)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global model, tokenizer
+    log.info("=== SpaceLLM startup: loading base model %s ===", BASE_MODEL_ID)
 
-_base = AutoModelForCausalLM.from_pretrained(
-    BASE_MODEL_ID,
-    quantization_config=Mxfp4Config(dequantize=True),  # dequantise → BF16
-    device_map="auto",
-    trust_remote_code=True,
-)
+    # ── Quantisation config ──────────────────────────────────────────────
+    # Uses bitsandbytes 4-bit NF4 instead of Mxfp4Config (which requires
+    # a bleeding-edge transformers build not yet on PyPI).
+    # NF4 gives equivalent memory savings (~22 GB → ~11 GB) and is
+    # fully supported in transformers>=4.30 + bitsandbytes>=0.41.
+    bnb_cfg = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True,    # saves ~0.4 bits extra per weight
+    )
 
-log.info("Attaching LoRA adapter %s …", ADAPTER_MODEL_ID)
-model     = PeftModel.from_pretrained(_base, ADAPTER_MODEL_ID)
-tokenizer = AutoTokenizer.from_pretrained(ADAPTER_MODEL_ID)
-model.eval()
+    _base = AutoModelForCausalLM.from_pretrained(
+        BASE_MODEL_ID,
+        quantization_config=bnb_cfg,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+    log.info("Base model loaded. Attaching LoRA adapter %s …", ADAPTER_MODEL_ID)
 
-log.info("SpaceLLM_v1 ready ✓")
+    model     = PeftModel.from_pretrained(_base, ADAPTER_MODEL_ID)
+    tokenizer = AutoTokenizer.from_pretrained(ADAPTER_MODEL_ID)
+    model.eval()
+    log.info("=== SpaceLLM_v1 ready ✓ ===")
+
+    yield   # ← server runs here
+
+    log.info("SpaceLLM shutting down.")
+    del model, tokenizer
+    torch.cuda.empty_cache()
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # FastAPI app
 # ══════════════════════════════════════════════════════════════════════════
-app = FastAPI(title="SpaceLLM API", version="1.0.0")
+app = FastAPI(title="SpaceLLM API", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # tighten in production
+    allow_origins=["*"],        # tighten in production
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # ── Pydantic schemas ──────────────────────────────────────────────────────
 
@@ -87,12 +107,10 @@ class ChatMessage(BaseModel):
     content: str
 
 class GenerateRequest(BaseModel):
-    messages: list[ChatMessage] = Field(
-        ..., description="Conversation history (user/assistant turns)."
-    )
-    max_new_tokens: int  = Field(512,  ge=1,   le=2048)
-    temperature:    float = Field(0.7,  ge=0.0, le=2.0)
-    top_p:          float = Field(0.9,  ge=0.0, le=1.0)
+    messages:       list[ChatMessage] = Field(..., description="Conversation history.")
+    max_new_tokens: int   = Field(512, ge=1,   le=2048)
+    temperature:    float = Field(0.7, ge=0.0, le=2.0)
+    top_p:          float = Field(0.9, ge=0.0, le=1.0)
     do_sample:      bool  = Field(True)
 
 class GenerateResponse(BaseModel):
@@ -111,31 +129,34 @@ class FeedbackResponse(BaseModel):
     status:      str
     feedback_id: str
 
+
 # ── Endpoints ─────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model": ADAPTER_MODEL_ID}
+    ready = model is not None and tokenizer is not None
+    return {
+        "status": "ok" if ready else "loading",
+        "model":  ADAPTER_MODEL_ID,
+        "ready":  ready,
+    }
 
 
 @app.post("/generate", response_model=GenerateResponse)
 def generate(req: GenerateRequest):
-    """
-    Run inference through SpaceLLM_v1.
-    Prepends the system prompt if the caller didn't include one.
-    """
+    if model is None or tokenizer is None:
+        raise HTTPException(status_code=503, detail="Model still loading, retry shortly.")
+
     msgs = [m.model_dump() for m in req.messages]
 
-    # Ensure system prompt is present
+    # Prepend system prompt if not already present
     if not msgs or msgs[0]["role"] != "system":
         msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + msgs
 
-    # Apply harmony chat template (required by gpt-oss-20b)
+    # Harmony chat template required by gpt-oss-20b
     try:
         prompt = tokenizer.apply_chat_template(
-            msgs,
-            tokenize=False,
-            add_generation_prompt=True,
+            msgs, tokenize=False, add_generation_prompt=True
         )
     except Exception as exc:
         log.error("Chat-template error: %s", exc)
@@ -153,22 +174,16 @@ def generate(req: GenerateRequest):
             pad_token_id=tokenizer.eos_token_id,
         )
 
-    # Decode only the newly generated tokens
-    new_tokens = output_ids[0][inputs["input_ids"].shape[1]:]
+    new_tokens    = output_ids[0][inputs["input_ids"].shape[1]:]
     response_text = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
     log.info("Generated %d tokens for %d-turn conversation.",
              len(new_tokens), len(req.messages))
-
     return GenerateResponse(response=response_text)
 
 
 @app.post("/feedback", response_model=FeedbackResponse)
 def feedback(req: FeedbackRequest):
-    """
-    Persist RLHF feedback to an append-only JSONL file.
-    In the full MAPE-K pipeline this triggers the Analyse → Plan → Execute cycle.
-    """
     feedback_id = str(uuid.uuid4())
     record = {
         "feedback_id":   feedback_id,
@@ -179,10 +194,8 @@ def feedback(req: FeedbackRequest):
         "timestamp":     req.timestamp or datetime.now(timezone.utc).isoformat(),
         "conversation":  [m.model_dump() for m in req.conversation],
     }
-
     with FEEDBACK_LOG.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")
 
     log.info("Feedback %s recorded — type=%s", feedback_id, req.feedback_type)
-
     return FeedbackResponse(status="logged", feedback_id=feedback_id)
