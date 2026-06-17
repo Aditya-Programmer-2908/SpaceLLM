@@ -29,7 +29,7 @@ log = logging.getLogger("spacellm")
 FEEDBACK_LOG     = Path("feedback_log.jsonl")
 BASE_MODEL_ID    = "openai/gpt-oss-20b"
 ADAPTER_MODEL_ID = "AdityaPS/SpaceLLM_v1"
-HF_TOKEN         = "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"
+HF_TOKEN         = "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"
 SYSTEM_PROMPT    = (
     "You are SpaceLLM, an expert AI assistant specialising in space missions, "
     "astronomy, aerospace engineering, and satellite operations. "
