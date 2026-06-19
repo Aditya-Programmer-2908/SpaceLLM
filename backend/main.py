@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -171,6 +172,9 @@ def generate(req: GenerateRequest):
     if isinstance(response_text, list):
         response_text = response_text[-1].get("content", "")
     response_text = response_text.strip()
+
+    # Strip leading "final" artifacts from harmony chat template (may repeat)
+    response_text = re.sub(r'^(final)+', '', response_text, flags=re.IGNORECASE).strip()
 
     log.info("Response generated (%d chars).", len(response_text))
     return GenerateResponse(response=response_text)
