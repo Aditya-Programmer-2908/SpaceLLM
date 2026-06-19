@@ -124,7 +124,7 @@ class ChatMessage(BaseModel):
 
 class GenerateRequest(BaseModel):
     messages:       list[ChatMessage]
-    max_new_tokens: int   = 512
+    max_new_tokens: int   = 1536
     temperature:    float = 0.7
     top_p:          float = 0.9
     do_sample:      bool  = True
@@ -153,17 +153,34 @@ class FeedbackResponse(BaseModel):
 #   <|start|>assistant<|channel|>final<|message|> ... answer ... <|return|>
 #
 # We must extract content using these literal markers. Searching for the
-# plain English word "final" (the previous approach) is unsafe: space/launch
+# plain English word "final" (the original approach) is unsafe: space/launch
 # answers routinely contain that word in normal sentences (e.g. "final orbit
-# insertion", "final stage burn", "final launch window"). rfind("final")
-# would match the LAST such occurrence inside the real answer and discard
-# everything before it -- which is exactly why timelines/lists were coming
-# back truncated or blank.
+# insertion", "final stage burn"), so rfind("final") could match the LAST
+# such occurrence INSIDE the real answer and discard everything before it.
+#
+# IMPORTANT: this only works if the pipeline decode keeps the special
+# tokens. By default HF decodes with skip_special_tokens=True, which deletes
+# the "<|channel|>"/"<|message|>" wrapper tokens but leaves the bare channel
+# *name* ("analysis", "final") sitting in the text with no separator -- e.g.
+# "finalThe following is a snapshot...". We fix this at the source by
+# calling the pipeline with skip_special_tokens=False (see generate()) so
+# the literal markers survive and can be stripped properly here. The
+# leftover bare-word stripping below is kept only as a defensive fallback.
 HARMONY_FINAL_RE = re.compile(
     r"<\|channel\|>\s*final\s*<\|message\|>(.*?)(?:<\|end\|>|<\|return\|>|$)",
     re.IGNORECASE | re.DOTALL,
 )
 SPECIAL_TOKEN_RE = re.compile(r"<\|[^|]*\|>")
+# Only strips a leaked "final" channel-name label when it is glued to the
+# very start of the string with no markers around it (the exact bug
+# reported: "finalThe following is a snapshot..."). Anchored with ^ and
+# only matches at position 0, so it can never reach into the body of the
+# real answer and truncate content the way the old rfind("final") did.
+# The lowercase "final" channel label is glued directly to the capitalized
+# start of the real answer with no separator, so we match on that boundary
+# (a word boundary regex like \bfinal\b would NOT catch this, since "final"
+# and the following letter are both word characters).
+LEAKED_CHANNEL_LABEL_RE = re.compile(r"^final(?=[A-Z])")
 
 
 def clean_response(text: str) -> str:
@@ -180,9 +197,14 @@ def clean_response(text: str) -> str:
     if matches:
         # If the model emitted multiple "final" blocks, the last one wins.
         text = matches[-1]
+    else:
+        # No literal markers found (e.g. they were decoded away). Strip a
+        # leaked "analysis...final" label only if it's glued to the very
+        # start of the text -- this is anchored with ^, so it cannot match
+        # (and truncate) an occurrence of "final" inside the real answer.
+        text = LEAKED_CHANNEL_LABEL_RE.sub("", text, count=1)
 
-    # Defensively strip any leftover special tokens (covers both the
-    # harmony-marker case above and the "no markers found" fallback case).
+    # Defensively strip any leftover special tokens.
     text = SPECIAL_TOKEN_RE.sub("", text).strip()
 
     # Remove any residual meta-commentary lines that slipped through.
@@ -225,6 +247,10 @@ def generate(req: GenerateRequest):
         do_sample=req.do_sample,
         pad_token_id=tokenizer.eos_token_id,
         return_full_text=False,
+        # Keep <|channel|>/<|message|>/<|end|> etc. in the decoded text so
+        # clean_response() can reliably find and strip the analysis block
+        # using the literal markers instead of guessing from plain words.
+        skip_special_tokens=False,
     )
 
     raw = result[0]["generated_text"]
