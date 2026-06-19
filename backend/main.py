@@ -146,22 +146,46 @@ class FeedbackResponse(BaseModel):
     feedback_id: str
 
 
+# gpt-oss models emit the "harmony" response format: a reasoning ("analysis")
+# block followed by the real answer in a "final" channel, delimited by
+# literal special tokens, e.g.:
+#   <|channel|>analysis<|message|> ... reasoning ... <|end|>
+#   <|start|>assistant<|channel|>final<|message|> ... answer ... <|return|>
+#
+# We must extract content using these literal markers. Searching for the
+# plain English word "final" (the previous approach) is unsafe: space/launch
+# answers routinely contain that word in normal sentences (e.g. "final orbit
+# insertion", "final stage burn", "final launch window"). rfind("final")
+# would match the LAST such occurrence inside the real answer and discard
+# everything before it -- which is exactly why timelines/lists were coming
+# back truncated or blank.
+HARMONY_FINAL_RE = re.compile(
+    r"<\|channel\|>\s*final\s*<\|message\|>(.*?)(?:<\|end\|>|<\|return\|>|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+SPECIAL_TOKEN_RE = re.compile(r"<\|[^|]*\|>")
+
+
 def clean_response(text: str) -> str:
     """
-    gpt-oss-20b outputs a chain-of-thought reasoning block before the actual
-    answer. The reasoning always ends with one or more 'final' tokens.
-    This function strips the reasoning block and returns only the answer.
+    Extract the final-channel answer from gpt-oss harmony-formatted output,
+    stripping the analysis/reasoning block. Falls back to returning the text
+    unchanged (minus stray special tokens) if no harmony markers are present
+    -- e.g. when the chat pipeline has already parsed the turns for us.
     """
-    # Step 1: Find the last 'final' token and take everything after it
-    lower = text.lower()
-    last_final = lower.rfind("final")
-    if last_final != -1:
-        text = text[last_final + len("final"):].strip()
+    if not text:
+        return ""
 
-    # Step 2: Strip any remaining leading 'final' repetitions
-    text = re.sub(r"^(final\s*)+", "", text, flags=re.IGNORECASE).strip()
+    matches = HARMONY_FINAL_RE.findall(text)
+    if matches:
+        # If the model emitted multiple "final" blocks, the last one wins.
+        text = matches[-1]
 
-    # Step 3: Remove lines that are reasoning artifacts
+    # Defensively strip any leftover special tokens (covers both the
+    # harmony-marker case above and the "no markers found" fallback case).
+    text = SPECIAL_TOKEN_RE.sub("", text).strip()
+
+    # Remove any residual meta-commentary lines that slipped through.
     artifact_prefixes = (
         "the assistant",
         "the user",
@@ -208,6 +232,13 @@ def generate(req: GenerateRequest):
         raw = raw[-1].get("content", "")
 
     response_text = clean_response(raw)
+
+    # Safety net: if cleaning somehow produced an empty string but the model
+    # did generate something, fall back to the raw text (special tokens
+    # stripped) rather than silently returning blank to the user.
+    if not response_text and raw:
+        response_text = SPECIAL_TOKEN_RE.sub("", raw).strip()
+
     log.info("Response generated (%d chars).", len(response_text))
     return GenerateResponse(response=response_text)
 
