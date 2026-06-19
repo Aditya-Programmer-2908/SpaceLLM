@@ -25,114 +25,65 @@ FEEDBACK_LOG     = Path("feedback_log.jsonl")
 BASE_MODEL_ID    = "openai/gpt-oss-20b"
 ADAPTER_MODEL_ID = "AdityaPS/SpaceLLM_v1"
 
-# ── Prompts ────────────────────────────────────────────────────────────────────
+# ── System prompts ─────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """
-You are SpaceLLM, an expert AI assistant for space missions,
-astronomy, satellites, rockets, planetary science,
-and aerospace engineering.
-Your goal is to help users understand space topics clearly.
+# Default: short, factual, direct. 50-200 words.
+SYSTEM_PROMPT_SHORT = """\
+You are SpaceLLM, a precise expert assistant specialising in space missions, \
+astronomy, satellites, launch vehicles, planetary science, and aerospace engineering, \
+trained on data from NASA, ISRO, and ESA mission archives.
 
-Response Style Rules:
-1. Match the user's desired depth.
-   - Short factual questions → concise answer (2-4 sentences).
-   - Questions containing: explain, details, tell me about, how, why,
-     compare, teach, elaborate, overview, describe, history, about
-     → provide a thorough multi-paragraph explanation.
-2. NEVER describe what you are going to write. Write it directly.
-   Forbidden opener phrases:
-   - "This overview covers..."  "The following discusses..."
-   - "Details are provided below..."  "As follows:"  "Listed below:"
-3. Thorough answers must contain:
-   - Introduction, main explanation, key facts, historical significance.
-4. Prefer natural educational language.
-5. Never reveal chain of thought.
-6. If uncertain, say so briefly.
-7. If outside the space domain, say:
-   "I specialise in space missions. Please consult a general-purpose assistant."
+RESPONSE RULES:
+- Answer directly and factually. No preamble, no filler.
+- Keep responses between 50 and 200 words.
+- If the question is outside the space domain, say exactly:
+  "I specialise in space missions. Please consult a general-purpose assistant."
+- Never reveal your reasoning process in the output.\
 """
 
-DETAIL_ADDENDUM = """
-REQUIREMENT FOR THIS RESPONSE:
-The user is asking for a thorough explanation.
-You MUST write a minimum of {min_words} words.
-Do not stop early. Keep writing until you have covered:
-- Background and context
-- Technical details and key facts
-- Scientific significance
-- Historical impact and legacy
+# Detailed: chain-of-thought reasoning internally, high-quality answer externally.
+SYSTEM_PROMPT_DETAIL = """\
+You are SpaceLLM, a deep-knowledge expert assistant specialising in space missions, \
+astronomy, satellites, launch vehicles, planetary science, and aerospace engineering, \
+trained on data from NASA, ISRO, and ESA mission archives.
 
-Rules:
-- Do NOT open with meta-phrases like "This covers..." or "Below is...".
-- Do NOT use bullet lists as a substitute for explanation.
-- Write in flowing paragraphs.
-- Start the explanation immediately.
+THINKING PROCESS (internal — never shown to user):
+Before writing your answer, silently work through these steps:
+1. Identify the core topic and what the user actually needs to understand.
+2. Recall the key facts, figures, dates, and technical parameters relevant to this topic.
+3. Identify common misconceptions or gaps a learner might have.
+4. Structure the explanation: background → mechanics/technical detail → significance → legacy.
+5. Check: is every claim accurate? Are any figures approximate? Note uncertainty if present.
+
+OUTPUT RULES:
+- Write a thorough, technically accurate, educational explanation.
+- Aim for 300–600 words. Do not pad; stop when the explanation is complete.
+- Use flowing paragraphs. No bullet lists.
+- Open directly with substance — never with "This overview covers..." or similar.
+- Show technical depth: include specific mission names, instrument names, orbital parameters,
+  dates, agencies, and scientific outcomes where relevant.
+- If the question is outside the space domain, say exactly:
+  "I specialise in space missions. Please consult a general-purpose assistant."
+- Never reveal your chain-of-thought in the output.\
 """
 
-EXPAND_MSG = {
-    "role": "user",
-    "content": (
-        "Your answer is too short — it has fewer than {min_words} words. "
-        "Continue writing from where you left off. Cover whatever you have not yet addressed: "
-        "background, technical details, scientific significance, historical impact. "
-        "Do not repeat what you already wrote. Keep writing until the total exceeds {min_words} words."
-    ),
+# Keywords that force the short path regardless of anything else
+SHORT_INTENT = {
+    "in short", "briefly", "brief", "quick", "summarize", "summary",
+    "tldr", "tl;dr", "one line", "one sentence", "short answer",
+    "concise", "in brief", "just tell me", "short", "give me a short",
+    "keep it short",
 }
 
-RETRY_MSG = {
-    "role": "user",
-    "content": (
-        "You described what you would explain but did not explain it. "
-        "Write the actual explanation now. No 'below', no 'as follows'. Start immediately."
-    ),
+# Keywords that trigger the detailed path
+DETAIL_INTENT = {
+    "explain", "tell me about", "describe", "detail", "details", "detailed",
+    "how does", "how do", "how did", "why did", "why does", "why is",
+    "what is", "what are", "what was", "what were",
+    "teach me", "elaborate", "compare", "history", "background",
+    "overview", "in depth", "deep dive", "walk me through", "about",
+    "tell me", "how", "why",
 }
-
-# ── Detection patterns ─────────────────────────────────────────────────────────
-
-EMPTY_PROMISE_PATTERNS = [
-    "below is", "are provided below", "is provided below",
-    "following table", "the following list", "the timeline below",
-    "listed below", "as follows", "are as follows",
-]
-
-INCOMPLETE_PATTERNS = [
-    "this overview covers", "this detailed overview covers",
-    "the following discusses", "details are provided below",
-    "the report covers", "this explanation covers",
-    "the following topics", "the following sections",
-    "a detailed summary", "the mission involved",
-    "the following goals", "the following specific goals",
-    "these objectives included", "which were achieved",
-    "were as follows", "are listed below",
-    "can be summarized", "are outlined below",
-    "the following table", "the following points",
-]
-
-SUSPICIOUS_ENDINGS = [
-    "as follows:", "below:", "the following:", "etc.",
-    "including:", "such as:", "namely:", "these include:",
-    "which include:", "are:", "follows:",
-]
-
-# Keywords that signal the user explicitly wants brevity — override detail path
-SHORT_INTENT = [
-    "in short", "briefly", "brief", "quick",
-    "summarize", "tldr", "tl;dr", "one line", "one sentence",
-    "short answer", "concise", "in brief", "just tell me",
-    "short", "give me a short", "keep it short",
-]
-
-# Keywords that signal the user wants depth
-DETAIL_KEYWORDS = [
-    "detail", "details", "detailed", "explain", "tell me about",
-    "teach", "how", "why", "compare", "history", "complete", "full",
-    "elaborate", "more about", "research", "study", "deep", "in depth",
-    "describe", "what is", "what are", "objective", "objectives",
-    "overview", "background", "tell me", "about",
-]
-
-# Minimum words expected in a detailed response
-DETAIL_MIN_WORDS = 500
 
 model     = None
 tokenizer = None
@@ -145,30 +96,28 @@ pipe      = None
 async def lifespan(app: FastAPI):
     global model, tokenizer, pipe
 
-    log.info("Loading tokenizer from adapter: %s", ADAPTER_MODEL_ID)
+    log.info("Loading tokenizer: %s", ADAPTER_MODEL_ID)
     tokenizer = AutoTokenizer.from_pretrained(ADAPTER_MODEL_ID, trust_remote_code=True)
-
     if tokenizer.pad_token is None:
         tokenizer.pad_token    = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "right"
-    log.info("Tokenizer vocab size: %d  |  len(tokenizer): %d",
-             tokenizer.vocab_size, len(tokenizer))
+    log.info("Tokenizer vocab=%d  len=%d", tokenizer.vocab_size, len(tokenizer))
 
     device = "cuda:0"
-    log.info("Loading base model %s on %s ...", BASE_MODEL_ID, device)
+    log.info("Loading base model %s on %s", BASE_MODEL_ID, device)
     _base = AutoModelForCausalLM.from_pretrained(
         BASE_MODEL_ID,
         torch_dtype="auto",
         device_map={"": device},
         trust_remote_code=True,
     )
-    log.info("Base model loaded. dtype=%s", next(_base.parameters()).dtype)
+    log.info("Base loaded. dtype=%s", next(_base.parameters()).dtype)
 
     _base.config.tie_word_embeddings = False
     lm_head = _base.get_output_embeddings()
     lm_head.weight = nn.Parameter(lm_head.weight.detach().clone())
-    log.info("lm_head weight untied and cloned.")
+    log.info("lm_head untied.")
 
     _base.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=64)
     actual_vocab = _base.get_output_embeddings().weight.shape[0]
@@ -190,7 +139,7 @@ async def lifespan(app: FastAPI):
         ignore_mismatched_sizes=True,
     )
     model.eval()
-    log.info("SpaceLLM_v1 ready!")
+    log.info("SpaceLLM ready.")
 
     pipe = pipeline("text-generation", model=model, tokenizer=tokenizer)
     yield
@@ -216,7 +165,7 @@ class ChatMessage(BaseModel):
 
 class GenerateRequest(BaseModel):
     messages:       list[ChatMessage]
-    max_new_tokens: int   = 768
+    max_new_tokens: int   = 1024
     temperature:    float = 0.7
     top_p:          float = 0.9
     do_sample:      bool  = True
@@ -238,98 +187,77 @@ class FeedbackResponse(BaseModel):
     feedback_id: str
 
 
-# ── Helper functions ───────────────────────────────────────────────────────────
+# ── Core logic ─────────────────────────────────────────────────────────────────
 
-def needs_detailed_response(user_messages: list[dict]) -> bool:
+def classify_request(messages: list[dict]) -> str:
     """
-    Inspect only raw user messages (before any system injection).
-    SHORT_INTENT always overrides DETAIL_KEYWORDS.
+    Returns 'short' or 'detail' by scanning the last 3 user turns.
+    SHORT_INTENT wins if present; then DETAIL_INTENT; else 'short'.
     """
     text = " ".join(
-        m["content"].lower() for m in user_messages[-3:] if m["role"] == "user"
+        m["content"].lower()
+        for m in messages[-3:]
+        if m["role"] == "user"
     )
     if any(kw in text for kw in SHORT_INTENT):
-        log.info("detail=False (short-intent override) | %.100s", text)
-        return False
-    result = any(kw in text for kw in DETAIL_KEYWORDS)
-    log.info("detail=%s | %.100s", result, text)
-    return result
+        log.info("classify=short (short-intent keyword) | %.120s", text)
+        return "short"
+    if any(kw in text for kw in DETAIL_INTENT):
+        log.info("classify=detail | %.120s", text)
+        return "detail"
+    log.info("classify=short (default) | %.120s", text)
+    return "short"
 
 
-def build_messages(raw: list[dict], detailed: bool) -> list[dict]:
+def build_messages(raw: list[dict], mode: str) -> list[dict]:
     """
-    Build the final message list.
-    System prompt (+ detail addendum if needed) always sits at position 0.
-    Any system messages sent by the client are stripped — we own the system prompt.
-    The detail addendum is baked INTO the system message, never injected mid-conversation.
+    Construct final message list.
+    - Strip any client-supplied system messages (we own the system prompt).
+    - Inject the correct system prompt at position 0.
     """
-    system_content = SYSTEM_PROMPT.strip()
-    if detailed:
-        addendum = DETAIL_ADDENDUM.replace("{min_words}", str(DETAIL_MIN_WORDS)).strip()
-        system_content += "\n\n" + addendum
-
-    conv = [m for m in raw if m["role"] != "system"]
-    return [{"role": "system", "content": system_content}] + conv
+    system = SYSTEM_PROMPT_DETAIL if mode == "detail" else SYSTEM_PROMPT_SHORT
+    conv   = [m for m in raw if m["role"] != "system"]
+    return [{"role": "system", "content": system}] + conv
 
 
 def clean_response(text: str) -> str:
-    """Strip GPT-OSS reasoning artifacts."""
+    """
+    Remove GPT-OSS internal reasoning artifacts that leak into output.
+    Only strips clearly mechanical prefixes — does not alter actual content.
+    """
     if not text:
         return ""
     text = text.strip()
+
+    # Strip leaked reasoning blocks: "Analysis ... Final answer:"
     if text.lower().startswith("analysis"):
         parts = re.split(r"\bfinal\b", text, flags=re.IGNORECASE, maxsplit=1)
         if len(parts) > 1:
             text = parts[1].strip()
-    text = re.sub(r"^(final\s*)+", "", text, flags=re.IGNORECASE).strip()
-    bad_starts = ("the assistant", "assistant will", "assistant should",
-                  "assistant can", "assistant must")
+
+    # Strip leading "Final " / "Final Answer:" prefixes
+    text = re.sub(r"^(final\s*(answer\s*[:\-]?\s*)?)+", "", text, flags=re.IGNORECASE).strip()
+
+    # Strip lines where model talks about itself in third person
+    bad_starts = (
+        "the assistant", "assistant will", "assistant should",
+        "assistant can", "assistant must",
+    )
     lines = [l for l in text.splitlines()
              if not l.strip().lower().startswith(bad_starts)]
     return "\n".join(lines).strip()
 
 
-def is_empty_promise(text: str) -> bool:
-    """True if the model promised to list content but produced nothing substantial."""
-    if not text:
-        return True
-    lower = text.lower()
-    has_promise = any(p in lower for p in EMPTY_PROMISE_PATTERNS)
-    real_lines  = [l for l in text.splitlines() if l.strip()]
-    return has_promise and len(real_lines) < 6
-
-
-def looks_incomplete(text: str, detailed: bool) -> bool:
-    """True if the response is a meta-description or too thin for a detailed request."""
-    if not text or not text.strip():
-        return True
-    lower = text.lower().strip()
-    if any(p in lower for p in INCOMPLETE_PATTERNS):
-        log.info("looks_incomplete: INCOMPLETE_PATTERN matched")
-        return True
-    if any(lower.endswith(e) for e in SUSPICIOUS_ENDINGS):
-        log.info("looks_incomplete: SUSPICIOUS_ENDING matched")
-        return True
-    if detailed and len(text.split()) < DETAIL_MIN_WORDS:
-        log.info("looks_incomplete: word_count=%d < %d", len(text.split()), DETAIL_MIN_WORDS)
-        return True
-    return False
-
-
-def run_pipe(
-    messages:       list[dict],
-    req:            GenerateRequest,
-    temperature:    float,
-    min_new_tokens: int = 10,
-) -> str:
+def run_pipe(messages: list[dict], req: GenerateRequest, temperature: float,
+             min_new_tokens: int) -> str:
     result = pipe(
         messages,
-        max_new_tokens=max(req.max_new_tokens, 1024),
+        max_new_tokens=req.max_new_tokens,
         min_new_tokens=min_new_tokens,
         temperature=temperature,
         top_p=req.top_p if req.do_sample else 1.0,
         do_sample=req.do_sample,
-        repetition_penalty=1.15,
+        repetition_penalty=1.1,
         pad_token_id=tokenizer.eos_token_id,
         return_full_text=False,
     )
@@ -353,56 +281,20 @@ def generate(req: GenerateRequest):
     if pipe is None:
         raise HTTPException(status_code=503, detail="Model still loading.")
 
-    # Inspect raw user messages BEFORE any system injection
-    raw      = [m.model_dump() for m in req.messages]
-    detailed = needs_detailed_response(raw)
-
-    # Build final message list with system prompt (detail addendum baked in if needed)
-    msgs = build_messages(raw, detailed)
+    raw  = [m.model_dump() for m in req.messages]
+    mode = classify_request(raw)
+    msgs = build_messages(raw, mode)
 
     temperature = req.temperature if req.do_sample else 1.0
 
-    # Detailed: give the model a token floor matching the word target (~1.3 tokens/word).
-    # Default: no floor — model stops naturally when done.
-    min_tok = int(DETAIL_MIN_WORDS * 1.3) if detailed else 10
+    # Token floors:
+    # - short: 30 tokens minimum (enough for 1-2 solid sentences, prevents empty output)
+    # - detail: 400 tokens minimum (~300 words), model stops naturally when complete
+    min_tok = 400 if mode == "detail" else 30
 
-    # ── Pass 1 ────────────────────────────────────────────────────────────────
     response = run_pipe(msgs, req, temperature, min_new_tokens=min_tok)
 
-    # ── Pass 2: expand if the model still came up short ───────────────────────
-    if looks_incomplete(response, detailed):
-        log.warning("Pass 2: response incomplete — asking model to continue")
-        words_so_far = len(response.split())
-        expand = {
-            "role": "user",
-            "content": EXPAND_MSG["content"].replace("{min_words}", str(DETAIL_MIN_WORDS)),
-        }
-        expand_msgs = msgs + [
-            {"role": "assistant", "content": response},
-            expand,
-        ]
-        continuation = run_pipe(expand_msgs, req, temperature=0.4,
-                                min_new_tokens=min_tok)
-
-        # If pass 1 was pure meta-description, replace; otherwise append
-        if any(p in response.lower() for p in INCOMPLETE_PATTERNS):
-            response = continuation
-        else:
-            response = response.rstrip() + "\n\n" + continuation
-
-        log.info("After expansion: ~%d words", len(response.split()))
-
-    # ── Pass 3: retry if model made an empty promise ──────────────────────────
-    if is_empty_promise(response):
-        log.warning("Pass 3: empty promise — retrying")
-        retry_msgs = msgs + [
-            {"role": "assistant", "content": response},
-            RETRY_MSG,
-        ]
-        response = run_pipe(retry_msgs, req, temperature=0.3,
-                            min_new_tokens=min_tok)
-
-    log.info("Final: %d chars, ~%d words", len(response), len(response.split()))
+    log.info("mode=%s | %d chars | ~%d words", mode, len(response), len(response.split()))
     return GenerateResponse(response=response)
 
 
