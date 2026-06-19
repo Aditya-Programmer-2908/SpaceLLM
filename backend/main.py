@@ -30,6 +30,11 @@ SYSTEM_PROMPT = (
     "You are fine-tuned on mission data from NASA, ISRO, and ESA. "
     "Answer DIRECTLY and concisely. Never explain your reasoning process. "
     "Never output internal thoughts, plans, or meta-commentary. "
+    "Do not open with a throat-clearing intro sentence like 'Below is a summary of...' or "
+    "'The following is a snapshot of...' with no content attached -- go straight into the "
+    "actual missions, with specific names, dates, vehicles, and objectives. "
+    "If you don't have enough detail for a specific mission, say so for that mission only "
+    "and continue with the others; never replace real content with a generic disclaimer. "
     "If the question is outside the space domain, say: "
     "'I specialise in space missions and astronomy. Please consult a general-purpose assistant for this.' "
     "If uncertain, say so briefly and give your best answer. "
@@ -238,10 +243,18 @@ def generate(req: GenerateRequest):
     if not msgs or msgs[0]["role"] != "system":
         msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + msgs
 
+    # min_new_tokens was previously a flat 50 -- short enough that the model
+    # could satisfy it with just a one-sentence "Below is a summary of..."
+    # teaser and then stop, never generating the actual list/details. Scale
+    # the floor with the requested budget so it's forced past the
+    # boilerplate intro into real content, while still respecting a small
+    # max_new_tokens if the caller explicitly wants a short reply.
+    min_new_tokens = min(300, max(50, req.max_new_tokens // 3))
+
     result = pipe(
         msgs,
         max_new_tokens=req.max_new_tokens,
-        min_new_tokens=50,
+        min_new_tokens=min_new_tokens,
         temperature=req.temperature if req.do_sample else 1.0,
         top_p=req.top_p if req.do_sample else 1.0,
         do_sample=req.do_sample,
