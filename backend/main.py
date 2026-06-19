@@ -27,45 +27,45 @@ ADAPTER_MODEL_ID = "AdityaPS/SpaceLLM_v1"
 
 SYSTEM_PROMPT = ("""
 You are SpaceLLM, an expert AI assistant for space missions,
-astronomy, satellites, rockets and aerospace engineering.
+astronomy, satellites, rockets, planetary science,
+and aerospace engineering.
 
-Your goal is to help users understand topics clearly.
+Your goal is to help users understand space topics clearly.
 
 Response Style Rules:
 
-1. Match the user's request depth.
-   - Simple questions → concise answers.
-   - Requests like "explain", "tell me more",
-     "detailed", "teach me", "how", "why"
+1. Match the user's desired depth.
+   - Short factual questions → concise answer.
+   - Questions containing:
+     explain, details, detailed, teach me,
+     tell me about, how, why, compare
      → provide a complete explanation.
 
-2. Always answer the actual question.
-   Never say:
-   - "The following information is provided below"
-   - "A detailed summary is given below"
-   - "The information is as follows"
+2. Never describe what you are going to explain.
+   Forbidden phrases:
+   - "This overview covers..."
+   - "The following discusses..."
+   - "Details are provided below..."
+   - "This report explains..."
+   - "The mission involved..."
 
-   Instead provide the information directly.
+   Instead provide the actual explanation.
 
-3. Prefer explanations that are:
-   - easy to understand
-   - engaging
-   - factually accurate
-   - complete
-
-4. Structure long answers using:
+3. Long answers should contain:
    - Introduction
    - Main explanation
-   - Key facts
-   - Significance
+   - Important facts
+   - Historical significance
 
-5. Never reveal internal reasoning.
+4. Prefer natural and educational language.
 
-6. If uncertain, state uncertainty briefly.
+5. Never reveal chain of thought.
+
+6. If uncertain, say so briefly.
 
 7. If outside the space domain, say:
-   "I specialise in space missions and astronomy.
-   Please consult a general-purpose assistant for this."
+   "I specialise in space missions.
+   Please consult a general-purpose assistant."
 """)
 
 model     = None
@@ -156,7 +156,7 @@ class ChatMessage(BaseModel):
 
 class GenerateRequest(BaseModel):
     messages:       list[ChatMessage]
-    max_new_tokens: int   = 512
+    max_new_tokens: int   = 768
     temperature:    float = 0.7
     top_p:          float = 0.9
     do_sample:      bool  = True
@@ -180,33 +180,47 @@ class FeedbackResponse(BaseModel):
 
 def clean_response(text: str) -> str:
     """
-    gpt-oss-20b outputs a chain-of-thought reasoning block before the actual
-    answer. The reasoning always ends with one or more 'final' tokens.
-    This function strips the reasoning block and returns only the answer.
+    Remove GPT-OSS reasoning blocks safely.
     """
-    # Step 1: Find the last 'final' token and take everything after it
-    lower = text.lower()
-    last_final = lower.rfind("final")
-    if last_final != -1:
-        text = text[last_final + len("final"):].strip()
 
-    # Step 2: Strip any remaining leading 'final' repetitions
-    text = re.sub(r"^(final\s*)+", "", text, flags=re.IGNORECASE).strip()
+    if not text:
+        return ""
 
-    # Step 3: Remove lines that are reasoning artifacts
+    text = text.strip()
+
+    if text.lower().startswith("analysis"):
+        parts = re.split(
+            r"\bfinal\b",
+            text,
+            flags=re.IGNORECASE,
+            maxsplit=1
+        )
+
+        if len(parts) > 1:
+            text = parts[1].strip()
+
+    text = re.sub(
+        r"^(final\s*)+",
+        "",
+        text,
+        flags=re.IGNORECASE
+    ).strip()
+
     artifact_prefixes = (
         "the assistant",
-        "the user",
         "assistant will",
         "assistant should",
         "assistant can",
         "assistant must",
     )
-    clean_lines = [
-        line for line in text.splitlines()
-        if not line.strip().lower().startswith(artifact_prefixes)
-    ]
-    return "\n".join(clean_lines).strip()
+
+    lines = []
+
+    for line in text.splitlines():
+        if not line.strip().lower().startswith(artifact_prefixes):
+            lines.append(line)
+
+    return "\n".join(lines).strip()
 
 
 @app.get("/health")
@@ -229,7 +243,47 @@ def is_empty_promise(text: str) -> bool:
     # If it promises a list/table but has fewer than 5 lines, it's hollow
     has_content = len([l for l in text.splitlines() if l.strip()]) >= 5
     return has_promise and not has_content
+    
+DETAIL_KEYWORDS = [
+    "detail",
+    "details",
+    "detailed",
+    "explain",
+    "tell me about",
+    "teach",
+    "how",
+    "why",
+    "compare",
+    "history",
+]
 
+def needs_detailed_response(messages):
+    for msg in reversed(messages):
+        if msg["role"] == "user":
+            text = msg["content"].lower()
+
+            return any(
+                kw in text
+                for kw in DETAIL_KEYWORDS
+            )
+
+    return False
+
+INCOMPLETE_PATTERNS = [
+    "this overview covers",
+    "this detailed overview covers",
+    "the following discusses",
+    "details are provided below",
+    "the report covers",
+]
+
+def looks_incomplete(text):
+    lower = text.lower()
+
+    return any(
+        pattern in lower
+        for pattern in INCOMPLETE_PATTERNS
+    )
 
 @app.post("/generate", response_model=GenerateResponse)
 def generate(req: GenerateRequest):
@@ -237,6 +291,27 @@ def generate(req: GenerateRequest):
         raise HTTPException(status_code=503, detail="Model still loading.")
 
     msgs = [m.model_dump() for m in req.messages]
+    if needs_detailed_response(msgs):
+        msgs.append({
+            "role": "system",
+            "content": """
+    The user is requesting a detailed explanation.
+    
+    Requirements:
+    - At least 5 paragraphs.
+    - Explain directly.
+    - Include context.
+    - Include important facts.
+    - Include significance.
+    - Do not write phrases such as:
+      'This overview covers'
+      'The following discusses'
+      'Details are provided below'
+    
+    Write the actual explanation.
+    """
+        })
+        
     if not msgs or msgs[0]["role"] != "system":
         msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + msgs
 
@@ -252,12 +327,46 @@ def generate(req: GenerateRequest):
             return_full_text=False,
         )
         raw = result[0]["generated_text"]
+
         if isinstance(raw, list):
             raw = raw[-1].get("content", "")
+        
+        log.info("RAW OUTPUT:\n%s", raw)
+        
         return clean_response(raw)
 
     # First attempt
-    response_text = run_pipe(msgs, req.temperature if req.do_sample else 1.0)
+    response_text = run_pipe(
+    msgs,
+    req.temperature if req.do_sample else 1.0
+    )
+    
+    if looks_incomplete(response_text):
+    
+        log.warning(
+            "Incomplete answer detected. Regenerating."
+        )
+    
+        repair_msgs = msgs + [
+            {
+                "role": "assistant",
+                "content": response_text
+            },
+            {
+                "role": "user",
+                "content": """
+    Continue by providing the actual explanation.
+    
+    Do not describe what the answer covers.
+    Write the content directly.
+    """
+            }
+        ]
+    
+        response_text = run_pipe(
+            repair_msgs,
+            0.3
+        )
 
     # If response is an empty promise, retry with a direct instruction appended
     if is_empty_promise(response_text):
