@@ -255,20 +255,36 @@ DETAIL_KEYWORDS = [
     "why",
     "compare",
     "history",
+    "complete",
+    "full",
+    "elaborate",
+    "more",
+    "research",
+    "study",
+    "deep",
+    "in depth",
 ]
 
 def needs_detailed_response(messages):
-    for msg in reversed(messages):
+    """
+    Look through recent conversation.
+    If user asks for details anywhere in the recent context,
+    trigger long-form mode.
+    """
+
+    recent_user_text = []
+
+    for msg in messages[-6:]:
         if msg["role"] == "user":
-            text = msg["content"].lower()
+            recent_user_text.append(msg["content"].lower())
 
-            return any(
-                kw in text
-                for kw in DETAIL_KEYWORDS
-            )
+    context = " ".join(recent_user_text)
 
-    return False
-
+    return any(
+        keyword in context
+        for keyword in DETAIL_KEYWORDS
+    )
+    
 INCOMPLETE_PATTERNS = [
     "this overview covers",
     "this detailed overview covers",
@@ -295,20 +311,27 @@ def generate(req: GenerateRequest):
         msgs.append({
             "role": "system",
             "content": """
-    The user is requesting a detailed explanation.
+    The user wants a comprehensive educational explanation.
     
     Requirements:
-    - At least 5 paragraphs.
-    - Explain directly.
-    - Include context.
-    - Include important facts.
-    - Include significance.
-    - Do not write phrases such as:
-      'This overview covers'
-      'The following discusses'
-      'Details are provided below'
     
-    Write the actual explanation.
+    - Minimum 400 words.
+    - Multiple paragraphs.
+    - Include background.
+    - Include key facts.
+    - Include scientific significance.
+    - Include historical impact.
+    - Include examples if relevant.
+    - Explain concepts clearly.
+    
+    Do NOT give a short summary.
+    
+    Do NOT write:
+    - This overview covers...
+    - The following discusses...
+    - Details are provided below...
+    
+    Write the complete explanation directly.
     """
         })
         
@@ -318,7 +341,7 @@ def generate(req: GenerateRequest):
     def run_pipe(messages, temperature):
         result = pipe(
             messages,
-            max_new_tokens=req.max_new_tokens,
+            max_new_tokens=max(req.max_new_tokens, 1024),
             min_new_tokens=10,
             temperature=temperature,
             top_p=req.top_p if req.do_sample else 1.0,
@@ -326,28 +349,35 @@ def generate(req: GenerateRequest):
             pad_token_id=tokenizer.eos_token_id,
             return_full_text=False,
         )
+    
         raw = result[0]["generated_text"]
-
+    
         if isinstance(raw, list):
             raw = raw[-1].get("content", "")
-        
-        log.info("RAW OUTPUT:\n%s", raw)
-        
+    
+        log.info(
+            "\n========== RAW OUTPUT ==========\n%s\n==============================",
+            raw
+        )
+    
         return clean_response(raw)
 
     # First attempt
     response_text = run_pipe(
-    msgs,
-    req.temperature if req.do_sample else 1.0
+        msgs,
+        req.temperature if req.do_sample else 1.0
     )
     
-    if looks_incomplete(response_text):
+    # Was the user asking for a detailed explanation?
+    detailed_request = needs_detailed_response(msgs)
+    
+    if detailed_request and looks_incomplete(response_text):
     
         log.warning(
-            "Incomplete answer detected. Regenerating."
+            "Detailed request received but answer looks incomplete."
         )
     
-        repair_msgs = msgs + [
+        expand_msgs = msgs + [
             {
                 "role": "assistant",
                 "content": response_text
@@ -355,18 +385,65 @@ def generate(req: GenerateRequest):
             {
                 "role": "user",
                 "content": """
-    Continue by providing the actual explanation.
+    Expand this answer substantially.
     
-    Do not describe what the answer covers.
-    Write the content directly.
+    Include:
+    - background
+    - technical details
+    - scientific significance
+    - historical impact
+    
+    Do not repeat previous text.
     """
             }
         ]
     
-        response_text = run_pipe(
-            repair_msgs,
+        continuation = run_pipe(
+            expand_msgs,
             0.3
         )
+    
+        response_text += "\n\n" + continuation
+    
+    INCOMPLETE_PATTERNS = [
+    "this overview covers",
+    "this detailed overview covers",
+    "the following discusses",
+    "details are provided below",
+    "the report covers",
+    "this explanation covers",
+    "the following topics",
+    "the following sections",
+    "a detailed summary",
+    ]
+    
+    def looks_incomplete(text: str) -> bool:
+        """
+        Detect responses that promise information
+        but do not actually provide it.
+        """
+    
+        if not text or not text.strip():
+            return True
+    
+        lower = text.lower().strip()
+    
+        # Explicit placeholder / teaser phrases
+        if any(pattern in lower for pattern in INCOMPLETE_PATTERNS):
+            return True
+    
+        # Suspicious endings
+        suspicious_endings = [
+            "as follows:",
+            "below:",
+            "the following:",
+            "etc.",
+        ]
+    
+        if any(lower.endswith(e) for e in suspicious_endings):
+            return True
+    
+        return False
 
     # If response is an empty promise, retry with a direct instruction appended
     if is_empty_promise(response_text):
