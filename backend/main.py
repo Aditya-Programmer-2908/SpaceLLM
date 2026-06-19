@@ -2,7 +2,6 @@ import json
 import logging
 import re
 import uuid
-from collections import Counter
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,7 +37,7 @@ Response Style Rules:
 1. Match the user's desired depth.
    - Short factual questions → concise answer (2-4 sentences).
    - Questions containing: explain, details, tell me about, how, why,
-     compare, teach, elaborate, overview, describe, history
+     compare, teach, elaborate, overview, describe, history, about
      → provide a thorough multi-paragraph explanation.
 2. NEVER describe what you are going to write. Write it directly.
    Forbidden opener phrases:
@@ -54,24 +53,29 @@ Response Style Rules:
 """
 
 DETAIL_ADDENDUM = """
-ADDITIONAL REQUIREMENT FOR THIS RESPONSE:
-The user is asking for a thorough explanation. You must:
-- Write at least 500 words.
-- Use multiple paragraphs with natural flow.
-- Cover background, technical details, key facts, scientific significance,
-  historical impact, and legacy.
-- Do NOT use bullet lists as a replacement for explanation.
-- Do NOT open with any meta-phrase like "This covers..." or "Below is...".
-- Start writing the actual explanation immediately.
+REQUIREMENT FOR THIS RESPONSE:
+The user is asking for a thorough explanation.
+You MUST write a minimum of {min_words} words.
+Do not stop early. Keep writing until you have covered:
+- Background and context
+- Technical details and key facts
+- Scientific significance
+- Historical impact and legacy
+
+Rules:
+- Do NOT open with meta-phrases like "This covers..." or "Below is...".
+- Do NOT use bullet lists as a substitute for explanation.
+- Write in flowing paragraphs.
+- Start the explanation immediately.
 """
 
 EXPAND_MSG = {
     "role": "user",
     "content": (
-        "Your previous answer is too short or cut off. "
-        "Continue and expand substantially — cover background, technical details, "
-        "scientific significance, historical impact. "
-        "Do not repeat your opening sentence. Write directly."
+        "Your answer is too short — it has fewer than {min_words} words. "
+        "Continue writing from where you left off. Cover whatever you have not yet addressed: "
+        "background, technical details, scientific significance, historical impact. "
+        "Do not repeat what you already wrote. Keep writing until the total exceeds {min_words} words."
     ),
 }
 
@@ -110,17 +114,9 @@ SUSPICIOUS_ENDINGS = [
     "which include:", "are:", "follows:",
 ]
 
-LOOP_PATTERNS = [
-    "a significant achievement in the space and the mission",
-    "a major achievement in the space and the mission",
-    "which is a significant achievement in the space",
-    "a major milestone in space exploration, as it demonstrated",
-    "the mission's success was a major milestone",
-]
-
 # Keywords that signal the user explicitly wants brevity — override detail path
 SHORT_INTENT = [
-    "in short", "briefly", "brief", "quick", "quickl",
+    "in short", "briefly", "brief", "quick",
     "summarize", "tldr", "tl;dr", "one line", "one sentence",
     "short answer", "concise", "in brief", "just tell me",
     "short", "give me a short", "keep it short",
@@ -135,8 +131,8 @@ DETAIL_KEYWORDS = [
     "overview", "background", "tell me", "about",
 ]
 
-# A detailed response must have at least this many words; below triggers expansion
-DETAIL_MIN_WORDS = 400
+# Minimum words expected in a detailed response
+DETAIL_MIN_WORDS = 500
 
 model     = None
 tokenizer = None
@@ -246,8 +242,8 @@ class FeedbackResponse(BaseModel):
 
 def needs_detailed_response(user_messages: list[dict]) -> bool:
     """
-    Check only raw user messages (before system injection).
-    Short-intent keywords always override detail keywords.
+    Inspect only raw user messages (before any system injection).
+    SHORT_INTENT always overrides DETAIL_KEYWORDS.
     """
     text = " ".join(
         m["content"].lower() for m in user_messages[-3:] if m["role"] == "user"
@@ -260,18 +256,19 @@ def needs_detailed_response(user_messages: list[dict]) -> bool:
     return result
 
 
-def build_messages(raw_user_msgs: list[dict], detailed: bool) -> list[dict]:
+def build_messages(raw: list[dict], detailed: bool) -> list[dict]:
     """
-    Construct the final message list:
-      [system_prompt (with detail addendum baked in if needed)] + [user conversation]
-    The detail addendum lives in the SYSTEM message — never appended mid-conversation.
+    Build the final message list.
+    System prompt (+ detail addendum if needed) always sits at position 0.
+    Any system messages sent by the client are stripped — we own the system prompt.
+    The detail addendum is baked INTO the system message, never injected mid-conversation.
     """
     system_content = SYSTEM_PROMPT.strip()
     if detailed:
-        system_content += "\n\n" + DETAIL_ADDENDUM.strip()
+        addendum = DETAIL_ADDENDUM.replace("{min_words}", str(DETAIL_MIN_WORDS)).strip()
+        system_content += "\n\n" + addendum
 
-    # Strip any system messages the client sent (we own the system prompt)
-    conv = [m for m in raw_user_msgs if m["role"] != "system"]
+    conv = [m for m in raw if m["role"] != "system"]
     return [{"role": "system", "content": system_content}] + conv
 
 
@@ -293,7 +290,7 @@ def clean_response(text: str) -> str:
 
 
 def is_empty_promise(text: str) -> bool:
-    """True if the model promised to list content but produced nothing."""
+    """True if the model promised to list content but produced nothing substantial."""
     if not text:
         return True
     lower = text.lower()
@@ -303,7 +300,7 @@ def is_empty_promise(text: str) -> bool:
 
 
 def looks_incomplete(text: str, detailed: bool) -> bool:
-    """True if the response looks cut-off or too thin for what was asked."""
+    """True if the response is a meta-description or too thin for a detailed request."""
     if not text or not text.strip():
         return True
     lower = text.lower().strip()
@@ -319,49 +316,20 @@ def looks_incomplete(text: str, detailed: bool) -> bool:
     return False
 
 
-def is_looping(text: str) -> bool:
-    """True if the model is repeating itself."""
-    lower = text.lower()
-    if any(p in lower for p in LOOP_PATTERNS):
-        return True
-    sentences = [s.strip() for s in re.split(r"[.!?]", lower) if len(s.strip()) > 30]
-    if sentences:
-        freq = Counter(sentences).most_common(1)[0][1]
-        if freq >= 3:
-            return True
-    return False
-
-
-def truncate_at_loop(text: str) -> str:
-    """Cut text at the first sentence that repeats."""
-    parts  = re.split(r"(?<=[.!?])\s+", text)
-    seen   = set()
-    result = []
-    for sent in parts:
-        key = sent.strip().lower()
-        if key in seen and len(key) > 40:
-            log.info("truncate_at_loop: cut at repeated sentence")
-            break
-        seen.add(key)
-        result.append(sent)
-    return " ".join(result).strip()
-
-
 def run_pipe(
-    messages:           list[dict],
-    req:                GenerateRequest,
-    temperature:        float,
-    min_new_tokens:     int   = 10,
-    repetition_penalty: float = 1.15,
+    messages:       list[dict],
+    req:            GenerateRequest,
+    temperature:    float,
+    min_new_tokens: int = 10,
 ) -> str:
     result = pipe(
         messages,
-        max_new_tokens=max(req.max_new_tokens, 1024),  # no upper cap
+        max_new_tokens=max(req.max_new_tokens, 1024),
         min_new_tokens=min_new_tokens,
         temperature=temperature,
         top_p=req.top_p if req.do_sample else 1.0,
         do_sample=req.do_sample,
-        repetition_penalty=repetition_penalty,
+        repetition_penalty=1.15,
         pad_token_id=tokenizer.eos_token_id,
         return_full_text=False,
     )
@@ -385,43 +353,44 @@ def generate(req: GenerateRequest):
     if pipe is None:
         raise HTTPException(status_code=503, detail="Model still loading.")
 
-    # Work on raw user messages BEFORE any system injection
-    raw = [m.model_dump() for m in req.messages]
+    # Inspect raw user messages BEFORE any system injection
+    raw      = [m.model_dump() for m in req.messages]
     detailed = needs_detailed_response(raw)
 
-    # Build final message list with correct system prompt
+    # Build final message list with system prompt (detail addendum baked in if needed)
     msgs = build_messages(raw, detailed)
 
     temperature = req.temperature if req.do_sample else 1.0
 
-    # Detailed responses get a minimum token floor so the model can't bail early;
-    # default responses have no artificial floor (model stops when done naturally).
-    min_tok = 300 if detailed else 10
+    # Detailed: give the model a token floor matching the word target (~1.3 tokens/word).
+    # Default: no floor — model stops naturally when done.
+    min_tok = int(DETAIL_MIN_WORDS * 1.3) if detailed else 10
 
-    # ── Pass 1: initial generation ────────────────────────────────────────────
+    # ── Pass 1 ────────────────────────────────────────────────────────────────
     response = run_pipe(msgs, req, temperature, min_new_tokens=min_tok)
 
-    if is_looping(response):
-        log.warning("Pass 1: loop detected — truncating")
-        response = truncate_at_loop(response)
-
-    # ── Pass 2: expand if still too short / incomplete ────────────────────────
+    # ── Pass 2: expand if the model still came up short ───────────────────────
     if looks_incomplete(response, detailed):
-        log.warning("Pass 2: incomplete — expanding")
+        log.warning("Pass 2: response incomplete — asking model to continue")
+        words_so_far = len(response.split())
+        expand = {
+            "role": "user",
+            "content": EXPAND_MSG["content"].replace("{min_words}", str(DETAIL_MIN_WORDS)),
+        }
         expand_msgs = msgs + [
             {"role": "assistant", "content": response},
-            EXPAND_MSG,
+            expand,
         ]
         continuation = run_pipe(expand_msgs, req, temperature=0.4,
-                                min_new_tokens=300)
-        if is_looping(continuation):
-            continuation = truncate_at_loop(continuation)
+                                min_new_tokens=min_tok)
 
         # If pass 1 was pure meta-description, replace; otherwise append
         if any(p in response.lower() for p in INCOMPLETE_PATTERNS):
             response = continuation
         else:
             response = response.rstrip() + "\n\n" + continuation
+
+        log.info("After expansion: ~%d words", len(response.split()))
 
     # ── Pass 3: retry if model made an empty promise ──────────────────────────
     if is_empty_promise(response):
@@ -431,11 +400,9 @@ def generate(req: GenerateRequest):
             RETRY_MSG,
         ]
         response = run_pipe(retry_msgs, req, temperature=0.3,
-                            min_new_tokens=300)
-        if is_looping(response):
-            response = truncate_at_loop(response)
+                            min_new_tokens=min_tok)
 
-    log.info("Final response: %d chars, ~%d words", len(response), len(response.split()))
+    log.info("Final: %d chars, ~%d words", len(response), len(response.split()))
     return GenerateResponse(response=response)
 
 
