@@ -159,6 +159,7 @@ def generate(req: GenerateRequest):
     result = pipe(
         msgs,
         max_new_tokens=req.max_new_tokens,
+        min_new_tokens=50,             # force at least 50 tokens — prevents empty/tiny responses
         temperature=req.temperature if req.do_sample else 1.0,
         top_p=req.top_p if req.do_sample else 1.0,
         do_sample=req.do_sample,
