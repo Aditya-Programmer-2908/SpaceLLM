@@ -30,11 +30,6 @@ SYSTEM_PROMPT = (
     "You are fine-tuned on mission data from NASA, ISRO, and ESA. "
     "Answer DIRECTLY and concisely. Never explain your reasoning process. "
     "Never output internal thoughts, plans, or meta-commentary. "
-    "Do not open with a throat-clearing intro sentence like 'Below is a summary of...' or "
-    "'The following is a snapshot of...' with no content attached -- go straight into the "
-    "actual missions, with specific names, dates, vehicles, and objectives. "
-    "If you don't have enough detail for a specific mission, say so for that mission only "
-    "and continue with the others; never replace real content with a generic disclaimer. "
     "If the question is outside the space domain, say: "
     "'I specialise in space missions and astronomy. Please consult a general-purpose assistant for this.' "
     "If uncertain, say so briefly and give your best answer. "
@@ -129,7 +124,7 @@ class ChatMessage(BaseModel):
 
 class GenerateRequest(BaseModel):
     messages:       list[ChatMessage]
-    max_new_tokens: int   = 1536
+    max_new_tokens: int   = 512
     temperature:    float = 0.7
     top_p:          float = 0.9
     do_sample:      bool  = True
@@ -151,68 +146,22 @@ class FeedbackResponse(BaseModel):
     feedback_id: str
 
 
-# gpt-oss models emit the "harmony" response format: a reasoning ("analysis")
-# block followed by the real answer in a "final" channel, delimited by
-# literal special tokens, e.g.:
-#   <|channel|>analysis<|message|> ... reasoning ... <|end|>
-#   <|start|>assistant<|channel|>final<|message|> ... answer ... <|return|>
-#
-# We must extract content using these literal markers. Searching for the
-# plain English word "final" (the original approach) is unsafe: space/launch
-# answers routinely contain that word in normal sentences (e.g. "final orbit
-# insertion", "final stage burn"), so rfind("final") could match the LAST
-# such occurrence INSIDE the real answer and discard everything before it.
-#
-# IMPORTANT: this only works if the pipeline decode keeps the special
-# tokens. By default HF decodes with skip_special_tokens=True, which deletes
-# the "<|channel|>"/"<|message|>" wrapper tokens but leaves the bare channel
-# *name* ("analysis", "final") sitting in the text with no separator -- e.g.
-# "finalThe following is a snapshot...". We fix this at the source by
-# calling the pipeline with skip_special_tokens=False (see generate()) so
-# the literal markers survive and can be stripped properly here. The
-# leftover bare-word stripping below is kept only as a defensive fallback.
-HARMONY_FINAL_RE = re.compile(
-    r"<\|channel\|>\s*final\s*<\|message\|>(.*?)(?:<\|end\|>|<\|return\|>|$)",
-    re.IGNORECASE | re.DOTALL,
-)
-SPECIAL_TOKEN_RE = re.compile(r"<\|[^|]*\|>")
-# Only strips a leaked "final" channel-name label when it is glued to the
-# very start of the string with no markers around it (the exact bug
-# reported: "finalThe following is a snapshot..."). Anchored with ^ and
-# only matches at position 0, so it can never reach into the body of the
-# real answer and truncate content the way the old rfind("final") did.
-# The lowercase "final" channel label is glued directly to the capitalized
-# start of the real answer with no separator, so we match on that boundary
-# (a word boundary regex like \bfinal\b would NOT catch this, since "final"
-# and the following letter are both word characters).
-LEAKED_CHANNEL_LABEL_RE = re.compile(r"^final(?=[A-Z])")
-
-
 def clean_response(text: str) -> str:
     """
-    Extract the final-channel answer from gpt-oss harmony-formatted output,
-    stripping the analysis/reasoning block. Falls back to returning the text
-    unchanged (minus stray special tokens) if no harmony markers are present
-    -- e.g. when the chat pipeline has already parsed the turns for us.
+    gpt-oss-20b outputs a chain-of-thought reasoning block before the actual
+    answer. The reasoning always ends with one or more 'final' tokens.
+    This function strips the reasoning block and returns only the answer.
     """
-    if not text:
-        return ""
+    # Step 1: Find the last 'final' token and take everything after it
+    lower = text.lower()
+    last_final = lower.rfind("final")
+    if last_final != -1:
+        text = text[last_final + len("final"):].strip()
 
-    matches = HARMONY_FINAL_RE.findall(text)
-    if matches:
-        # If the model emitted multiple "final" blocks, the last one wins.
-        text = matches[-1]
-    else:
-        # No literal markers found (e.g. they were decoded away). Strip a
-        # leaked "analysis...final" label only if it's glued to the very
-        # start of the text -- this is anchored with ^, so it cannot match
-        # (and truncate) an occurrence of "final" inside the real answer.
-        text = LEAKED_CHANNEL_LABEL_RE.sub("", text, count=1)
+    # Step 2: Strip any remaining leading 'final' repetitions
+    text = re.sub(r"^(final\s*)+", "", text, flags=re.IGNORECASE).strip()
 
-    # Defensively strip any leftover special tokens.
-    text = SPECIAL_TOKEN_RE.sub("", text).strip()
-
-    # Remove any residual meta-commentary lines that slipped through.
+    # Step 3: Remove lines that are reasoning artifacts
     artifact_prefixes = (
         "the assistant",
         "the user",
@@ -234,6 +183,22 @@ def health():
     return {"status": "ok" if ready else "loading", "model": ADAPTER_MODEL_ID, "ready": ready}
 
 
+# Phrases that indicate the model promised content but didn't deliver it
+EMPTY_PROMISE_PATTERNS = [
+    "below is", "are provided below", "is provided below",
+    "following table", "the following list", "the timeline below",
+    "listed below", "as follows", "are as follows",
+]
+
+def is_empty_promise(text: str) -> bool:
+    """Returns True if response promises content but contains no actual data."""
+    lower = text.lower()
+    has_promise = any(p in lower for p in EMPTY_PROMISE_PATTERNS)
+    # If it promises a list/table but has fewer than 5 lines, it's hollow
+    has_content = len([l for l in text.splitlines() if l.strip()]) >= 5
+    return has_promise and not has_content
+
+
 @app.post("/generate", response_model=GenerateResponse)
 def generate(req: GenerateRequest):
     if pipe is None:
@@ -243,40 +208,33 @@ def generate(req: GenerateRequest):
     if not msgs or msgs[0]["role"] != "system":
         msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + msgs
 
-    # min_new_tokens was previously a flat 50 -- short enough that the model
-    # could satisfy it with just a one-sentence "Below is a summary of..."
-    # teaser and then stop, never generating the actual list/details. Scale
-    # the floor with the requested budget so it's forced past the
-    # boilerplate intro into real content, while still respecting a small
-    # max_new_tokens if the caller explicitly wants a short reply.
-    min_new_tokens = min(300, max(50, req.max_new_tokens // 3))
+    def run_pipe(messages, temperature):
+        result = pipe(
+            messages,
+            max_new_tokens=req.max_new_tokens,
+            min_new_tokens=80,
+            temperature=temperature,
+            top_p=req.top_p if req.do_sample else 1.0,
+            do_sample=req.do_sample,
+            pad_token_id=tokenizer.eos_token_id,
+            return_full_text=False,
+        )
+        raw = result[0]["generated_text"]
+        if isinstance(raw, list):
+            raw = raw[-1].get("content", "")
+        return clean_response(raw)
 
-    result = pipe(
-        msgs,
-        max_new_tokens=req.max_new_tokens,
-        min_new_tokens=min_new_tokens,
-        temperature=req.temperature if req.do_sample else 1.0,
-        top_p=req.top_p if req.do_sample else 1.0,
-        do_sample=req.do_sample,
-        pad_token_id=tokenizer.eos_token_id,
-        return_full_text=False,
-        # Keep <|channel|>/<|message|>/<|end|> etc. in the decoded text so
-        # clean_response() can reliably find and strip the analysis block
-        # using the literal markers instead of guessing from plain words.
-        skip_special_tokens=False,
-    )
+    # First attempt
+    response_text = run_pipe(msgs, req.temperature if req.do_sample else 1.0)
 
-    raw = result[0]["generated_text"]
-    if isinstance(raw, list):
-        raw = raw[-1].get("content", "")
-
-    response_text = clean_response(raw)
-
-    # Safety net: if cleaning somehow produced an empty string but the model
-    # did generate something, fall back to the raw text (special tokens
-    # stripped) rather than silently returning blank to the user.
-    if not response_text and raw:
-        response_text = SPECIAL_TOKEN_RE.sub("", raw).strip()
+    # If response is an empty promise, retry with a direct instruction appended
+    if is_empty_promise(response_text):
+        log.warning("Empty promise detected — retrying with direct instruction.")
+        retry_msgs = msgs + [
+            {"role": "assistant", "content": response_text},
+            {"role": "user", "content": "Please provide the actual content now. Do not say 'below' — write it directly here."},
+        ]
+        response_text = run_pipe(retry_msgs, 0.3)  # lower temp for more focused retry
 
     log.info("Response generated (%d chars).", len(response_text))
     return GenerateResponse(response=response_text)
