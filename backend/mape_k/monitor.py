@@ -297,7 +297,7 @@ class Monitor:
                 record      = record,
                 event_type  = "NEGATIVE_FEEDBACK",
                 topic       = topic,
-                base_scores = {"negative_feedback": 5},
+                base_scores = {"negative_feedback": 1},
                 metadata    = {"question_preview": record.question[:120]},
             ))
 
@@ -307,7 +307,7 @@ class Monitor:
                 record      = record,
                 event_type  = "HUMAN_CORRECTION",
                 topic       = topic,
-                base_scores = {"human_correction": 10},
+                base_scores = {"human_correction": 1},
                 metadata    = {
                     "correction_preview":  record.reference[:200],
                     "candidate_preview":   record.candidate[:200],
@@ -321,7 +321,7 @@ class Monitor:
                 record      = record,
                 event_type  = "INCOMPLETE_ANSWER",
                 topic       = topic,
-                base_scores = {"incomplete_answer": 4},
+                base_scores = {"incomplete_answer": 1},
                 metadata    = incomplete_meta,
             ))
 
@@ -332,7 +332,7 @@ class Monitor:
                 record      = record,
                 event_type  = "POSSIBLE_HALLUCINATION",
                 topic       = topic,
-                base_scores = {"hallucination": 8},
+                base_scores = {"hallucination": 1},
                 metadata    = hall_meta,
             ))
 
@@ -343,7 +343,7 @@ class Monitor:
                 record      = record,
                 event_type  = "REPEATED_FAILURE",
                 topic       = topic,
-                base_scores = {"negative_feedback": 5, "repeated_failure": 6},
+                base_scores = {"negative_feedback": 1, "repeated_failure": 1},
                 metadata    = repeat_meta,
             ))
 
@@ -354,7 +354,7 @@ class Monitor:
                 record      = record,
                 event_type  = "DOMAIN_DRIFT",
                 topic       = topic,
-                base_scores = {"domain_drift": 7},
+                base_scores = {"domain_drift": 1},
                 metadata    = drift_meta,
             ))
 
