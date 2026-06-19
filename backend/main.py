@@ -9,8 +9,6 @@ from typing import Literal
 import torch
 import torch.nn as nn
 from fastapi import FastAPI, HTTPException
-from pymongo import MongoClient
-from pymongo.errors import PyMongoError
 from fastapi.middleware.cors import CORSMiddleware
 from peft import PeftModel
 from pydantic import BaseModel
@@ -20,33 +18,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 log = logging.getLogger("spacellm")
 
 FEEDBACK_LOG     = Path("feedback_log.jsonl")
-
-# ── MongoDB ───────────────────────────────────────────────────────────────
-MONGO_URI        = "mongodb+srv://adityapratapusingh:Aditya2984@cluster0.ss7p3.mongodb.net/?appName=Cluster0"
-MONGO_DB_NAME    = "SpaceLLM"
-
-# Three collections:
-#   feedback      — all feedback records (positive + negative)
-#   corrections   — only negative feedback with user correction
-#                   (question + LLM answer + user correction)
-#                   used as candidate/reference pairs for BERTScore
-#   conversations — full conversation history per session
-
-try:
-    _mongo_client  = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-    _mongo_client.server_info()
-    _mongo_db      = _mongo_client[MONGO_DB_NAME]
-    _feedback_col  = _mongo_db["feedback"]
-    _correction_col = _mongo_db["corrections"]
-    _conv_col      = _mongo_db["conversations"]
-    log.info("MongoDB connected: %s", MONGO_DB_NAME)
-except Exception as _e:
-    log.warning("MongoDB connection failed: %s — falling back to JSONL only", _e)
-    _mongo_client   = None
-    _feedback_col   = None
-    _correction_col = None
-    _conv_col       = None
-
 BASE_MODEL_ID    = "openai/gpt-oss-20b"
 ADAPTER_MODEL_ID = "AdityaPS/SpaceLLM_v1"
 SYSTEM_PROMPT    = (
@@ -160,7 +131,7 @@ class GenerateResponse(BaseModel):
 class FeedbackRequest(BaseModel):
     message_id:    str
     feedback_type: Literal["positive", "negative"]
-    correction:    str | None = None   # user's corrected answer (reference)
+    correction:    str | None = None
     timestamp:     str | None = None
     model_version: str = "SpaceLLM_v1"
     conversation:  list[ChatMessage] = []
@@ -207,15 +178,11 @@ def generate(req: GenerateRequest):
 @app.post("/feedback", response_model=FeedbackResponse)
 def feedback(req: FeedbackRequest):
     feedback_id = str(uuid.uuid4())
-    ts = req.timestamp or datetime.now(timezone.utc).isoformat()
-
-    # ── Extract question and LLM answer from conversation ─────────────────
-    # conversation is the full history: [user, assistant, user, assistant ...]
-    # We want the LAST user question and the LAST assistant answer
-    # (the one the user is giving feedback on)
+    ts  = req.timestamp or datetime.now(timezone.utc).isoformat()
     conv = [m.model_dump() for m in req.conversation]
 
-    last_question  = ""
+    # Extract last question and last LLM answer from conversation
+    last_question   = ""
     last_llm_answer = ""
     for msg in reversed(conv):
         if not last_llm_answer and msg["role"] == "assistant":
@@ -225,64 +192,23 @@ def feedback(req: FeedbackRequest):
         if last_question and last_llm_answer:
             break
 
-    # ── Base feedback record (stored in 'feedback' collection) ────────────
-    feedback_record = {
+    record = {
         "feedback_id":   feedback_id,
         "message_id":    req.message_id,
         "feedback_type": req.feedback_type,
         "model_version": req.model_version,
         "timestamp":     ts,
-        "question":      last_question,
-        "llm_answer":    last_llm_answer,   # candidate answer for BERTScore
-        "correction":    req.correction,    # reference answer for BERTScore (if provided)
+        "question":      last_question,       # user query
+        "candidate":     last_llm_answer,     # LLM answer (BERTScore candidate)
+        "reference":     req.correction or "", # user correction (BERTScore reference)
+        "has_correction": bool(req.correction),
+        "used_in_training": False,             # flipped to True after v2 fine-tuning
+        "bertscore":     None,                 # filled by Analyse phase
         "conversation":  conv,
     }
 
-    # ── Correction record (stored in 'corrections' collection) ────────────
-    # Only saved when user flagged as negative — this is the MAPE-K training data
-    # Schema designed for BERTScore: candidate = llm_answer, reference = correction
-    correction_record = None
-    if req.feedback_type == "negative" and last_question:
-        correction_record = {
-            "correction_id":  str(uuid.uuid4()),
-            "feedback_id":    feedback_id,
-            "timestamp":      ts,
-            "model_version":  req.model_version,
-
-            # Core fields for BERTScore evaluation
-            "question":       last_question,        # what the user asked
-            "candidate":      last_llm_answer,      # what the LLM said (to evaluate)
-            "reference":      req.correction or "",  # what the user says it should be
-
-            # Training pipeline fields
-            "has_correction": bool(req.correction),  # True = has reference for retraining
-            "used_in_training": False,                # flipped to True after v2 fine-tuning
-            "bertscore":      None,                   # filled in by Analyse phase
-        }
-
-    # ── Save to JSONL backup ──────────────────────────────────────────────
     with FEEDBACK_LOG.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(feedback_record) + "\n")
+        f.write(json.dumps(record) + "\n")
 
-    # ── Save to MongoDB ───────────────────────────────────────────────────
-    mongo_status = "jsonl_only"
-    if _feedback_col is not None:
-        try:
-            _feedback_col.insert_one({**feedback_record})
-            mongo_status = "mongodb+jsonl"
-
-            if correction_record is not None:
-                _correction_col.insert_one({**correction_record})
-                log.info(
-                    "Correction saved — question: '%s...' | has_reference: %s",
-                    last_question[:60], correction_record["has_correction"]
-                )
-
-            log.info("Feedback %s (%s) saved to MongoDB.", feedback_id, req.feedback_type)
-
-        except PyMongoError as e:
-            log.warning("MongoDB write failed: %s — JSONL only.", e)
-    else:
-        log.info("Feedback %s saved to JSONL only (MongoDB unavailable).", feedback_id)
-
-    return FeedbackResponse(status=mongo_status, feedback_id=feedback_id)
+    log.info("Feedback %s (%s) saved to JSONL.", feedback_id, req.feedback_type)
+    return FeedbackResponse(status="logged", feedback_id=feedback_id)
