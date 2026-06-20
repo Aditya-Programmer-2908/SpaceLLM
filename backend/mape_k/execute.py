@@ -4,13 +4,19 @@ SpaceLLM MAPE-K :: Executor Component
 Responsibility: Read Planner actions → execute them → update statuses.
 
 Actions handled:
-  RETRAIN_ADAPTER  → build training data from corrections → run
-                     correction_fine_tuning.py (continuing from the
-                     currently-live adapter) → push new adapter to
-                     HuggingFace → hot-reload backend → mark corrections used
-  PROMPT_PATCH     → patch system prompt in main.py → restart uvicorn
-  TOPIC_GUARDRAIL  → log + write to human_review_queue.jsonl
-  FLAG_FOR_REVIEW  → write to human_review_queue.jsonl
+  RETRAIN_ADAPTER  → build correction_train_injection.json
+                   → run lora_finetuning_v5.py (delta training on corrections only)
+                   → push new adapter to HuggingFace
+                   → update ADAPTER_MODEL_ID in main.py
+                   → mark corrections as used_in_training=True in feedback_log.jsonl
+                   → restart uvicorn and wait for /health ready=true
+
+  PROMPT_PATCH     → inject patch_text into SYSTEM_PROMPT in main.py → restart
+
+  TOPIC_GUARDRAIL  → log to human_review_queue.jsonl
+
+  FLAG_FOR_REVIEW  → log to human_review_queue.jsonl
+
   NO_ACTION        → log and skip
 
 Pipeline position:
@@ -19,31 +25,6 @@ Pipeline position:
     Executor  ← YOU ARE HERE
         ↓
     SpaceLLM_v(N+1) live on GPU
-
-CHANGELOG (this pass)
-----------------------
-1. SECURITY: hf_token_env now holds the *name* of an environment variable
-   (e.g. "HF_TOKEN"), not a literal token. A real token was previously
-   hardcoded here — if that token is still live, revoke it on
-   huggingface.co and export a fresh one as $HF_TOKEN before running this.
-
-2. PATH BUG FIX: finetune_script now points at the real file —
-   correction_fine_tuning.py under
-   Model_training_&_Data_Extraction/fine_tuning_v2/ — instead of the
-   stale lora_finetuning_v4.py path that no longer exists.
-
-3. EXPLICIT CLI CONTRACT: _run_finetuning() now passes --train_file and
-   --output_dir explicitly instead of relying on both scripts hardcoding
-   matching constants independently. One source of truth (this file's
-   CORRECTION_TRAIN_FILE / ADAPTER_OUTPUT_DIR), passed at call time.
-
-4. CONTINUAL FINE-TUNING: _run_finetuning() now reads the currently-live
-   ADAPTER_MODEL_ID out of main.py and passes it as --base_adapter, so
-   each retrain cycle continues training the live adapter instead of
-   re-initializing a fresh LoRA from the base model every time. This
-   matches the project's continual-learning design (SpaceLLM_v2, v3, ...
-   each building on the last). If you actually want fresh-LoRA-per-cycle
-   instead, just drop the --base_adapter arg in _run_finetuning().
 
 Author: SpaceLLM Project
 """
@@ -54,10 +35,10 @@ import json
 import logging
 import os
 import re
-import signal
 import subprocess
 import sys
 import time
+import urllib.request
 import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -78,20 +59,29 @@ log = logging.getLogger("spacellm.executor")
 # Paths
 # ---------------------------------------------------------------------------
 
-BASE_DIR            = Path("/mnt/DATA/saurabh/aditya/SpaceLLM/backend")
-MAPE_DIR            = BASE_DIR / "mape_k"
-FINE_TUNING_DIR     = Path("/mnt/DATA/saurabh/aditya/SpaceLLM/Model_training_&_Data_Extraction/fine_tuning_v2")
-ADAPTER_OUTPUT_DIR  = FINE_TUNING_DIR / "outputs" / "spacellm_lora_final"
-TRAIN_DATA_DIR      = Path("/mnt/DATA/saurabh/aditya/SpaceLLM/data_processing/DatasetA_core_QA_v2")
-CORRECTION_TRAIN_FILE = MAPE_DIR / "correction_train_injection.json"
+BASE_DIR             = Path("/mnt/DATA/saurabh/aditya/SpaceLLM/backend")
+MAPE_DIR             = BASE_DIR / "mape_k"
+FINE_TUNING_DIR      = Path("/mnt/DATA/saurabh/aditya/SpaceLLM/fine_tuning_v2")
 
-PLAN_ACTIONS_LOG    = MAPE_DIR / "plan_actions.jsonl"
-PLAN_REPORT_PATH    = MAPE_DIR / "plan_report.json"
-FEEDBACK_LOG        = BASE_DIR / "feedback_log.jsonl"
-MAIN_PY_PATH        = BASE_DIR / "main.py"
-HUMAN_REVIEW_QUEUE  = MAPE_DIR / "human_review_queue.jsonl"
-EXECUTION_LOG       = MAPE_DIR / "execution_log.jsonl"
-STATE_FILE          = MAPE_DIR / ".executor_state.json"
+# v5 adapter output dir  (matches FINAL_DIR in lora_finetuning_v5.py)
+ADAPTER_OUTPUT_DIR   = FINE_TUNING_DIR / "outputs_v5" / "spacellm_lora_final"
+
+# Original train data for replay buffer (used by v5)
+ORIGINAL_TRAIN_FILE  = Path(
+    "/mnt/DATA/saurabh/aditya/SpaceLLM/data_processing/DatasetA_core_QA_v2/train.json"
+)
+VAL_FILE             = Path(
+    "/mnt/DATA/saurabh/aditya/SpaceLLM/data_processing/DatasetA_core_QA_v2/validate.json"
+)
+
+# MAPE-K files
+CORRECTION_FILE      = MAPE_DIR / "correction_train_injection.json"
+PLAN_ACTIONS_LOG     = MAPE_DIR / "plan_actions.jsonl"
+FEEDBACK_LOG         = BASE_DIR / "feedback_log.jsonl"
+MAIN_PY_PATH         = BASE_DIR / "main.py"
+HUMAN_REVIEW_QUEUE   = MAPE_DIR / "human_review_queue.jsonl"
+EXECUTION_LOG        = MAPE_DIR / "execution_log.jsonl"
+STATE_FILE           = MAPE_DIR / ".executor_state.json"
 
 MAPE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -101,30 +91,32 @@ MAPE_DIR.mkdir(parents=True, exist_ok=True)
 
 @dataclass
 class ExecutorConfig:
-    # HuggingFace
-    hf_repo_id:              str   = "AdityaPS/SpaceLLM_v1"   # updated per version
-    hf_token_env:            str   = "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"   # NAME of the env var holding your HF token
-    #                                               (export HF_TOKEN=<your_token> in your shell —
-    #                                               never put the literal token in source code)
+    # Fine-tuning script — v5 does delta training (corrections + replay only)
+    finetune_script:          str   = str(FINE_TUNING_DIR / "lora_finetuning_v5.py")
+    cuda_visible_devices:     str   = "1"
 
-    # Fine-tuning script
-    finetune_script:         str   = str(FINE_TUNING_DIR / "correction_fine_tuning.py")
-    cuda_visible_devices:    str   = "1"
-    finetune_epochs:         int   = 3
-    finetune_lr:             float = 2e-4
-    finetune_max_seq_len:    int   = 2048
+    # v5 hyperparams (smaller than v4 since dataset is tiny)
+    finetune_epochs:          int   = 3
+    finetune_lr:              float = 5e-5
+    finetune_replay_ratio:    float = 0.30   # 30% replay buffer
+    finetune_max_seq_len:     int   = 2048
+
+    # HuggingFace push
+    hf_token_env:             str   = "HF_TOKEN"
+    hf_base_org:              str   = "AdityaPS"
 
     # Backend restart
-    uvicorn_host:            str   = "localhost"
-    uvicorn_port:            int   = 8000
-    uvicorn_startup_wait_s:  int   = 300   # wait up to 5 min for model to load
+    uvicorn_host:             str   = "localhost"
+    uvicorn_port:             int   = 8000
+    uvicorn_startup_wait_s:   int   = 360    # 6 min for model to load
 
     # Prompt patch
-    system_prompt_marker:    str   = "SYSTEM_PROMPT = ("
+    system_prompt_marker:     str   = "SYSTEM_PROMPT = ("
+    system_prompt_close:      str   = "\n)"
 
 
 # ---------------------------------------------------------------------------
-# Atomic write helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _atomic_write_json(path: Path, data: Any) -> None:
@@ -141,18 +133,18 @@ def _append_jsonl(path: Path, record: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Execution result
+# Result model
 # ---------------------------------------------------------------------------
 
 @dataclass
 class ExecutionResult:
-    action_id:    str
-    action_type:  str
-    status:       str       # "EXECUTED" | "FAILED" | "SKIPPED"
-    timestamp:    str
-    duration_s:   float
-    details:      dict = field(default_factory=dict)
-    error:        str  = ""
+    action_id:   str
+    action_type: str
+    status:      str       # "EXECUTED" | "FAILED" | "SKIPPED"
+    timestamp:   str
+    duration_s:  float
+    details:     dict = field(default_factory=dict)
+    error:       str  = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -182,16 +174,18 @@ class Executor:
             log.info("No PENDING actions found.")
             return []
 
-        log.info("Found %d PENDING action(s).", len(actions))
-        # Sort by priority descending — highest priority executes first
+        # Highest priority first
         actions.sort(key=lambda a: a.get("priority", 0), reverse=True)
+        log.info("Found %d PENDING action(s).", len(actions))
 
         results: list[ExecutionResult] = []
         for action in actions:
             result = self._execute_action(action)
             results.append(result)
             _append_jsonl(EXECUTION_LOG, result.to_dict())
-            self._update_action_status(action["action_id"], result.status, result.error)
+            self._update_action_status(
+                action["action_id"], result.status, result.error
+            )
 
         self._save_state()
         log.info("Executor cycle complete. %d action(s) processed.", len(results))
@@ -199,33 +193,33 @@ class Executor:
         return results
 
     # ------------------------------------------------------------------
-    # Action dispatcher
+    # Dispatcher
     # ------------------------------------------------------------------
 
     def _execute_action(self, action: dict) -> ExecutionResult:
-        action_type = action.get("action_type", "UNKNOWN")
-        action_id   = action.get("action_id", "?")
-        t0          = time.time()
-
-        log.info("Executing [%s] action_id=%s ...", action_type, action_id[:8])
+        atype = action.get("action_type", "UNKNOWN")
+        aid   = action.get("action_id", "?")
+        t0    = time.time()
+        log.info("Executing [%s] action_id=%s ...", atype, aid[:8])
 
         try:
-            if action_type == "RETRAIN_ADAPTER":
+            if atype == "RETRAIN_ADAPTER":
                 details = self._execute_retrain(action)
-            elif action_type == "PROMPT_PATCH":
+            elif atype == "PROMPT_PATCH":
                 details = self._execute_prompt_patch(action)
-            elif action_type == "TOPIC_GUARDRAIL":
+            elif atype == "TOPIC_GUARDRAIL":
                 details = self._execute_guardrail(action)
-            elif action_type == "FLAG_FOR_REVIEW":
+            elif atype == "FLAG_FOR_REVIEW":
                 details = self._execute_flag_for_review(action)
-            elif action_type == "NO_ACTION":
+            elif atype == "NO_ACTION":
                 details = {"message": "No action required this cycle."}
+                log.info("NO_ACTION — skipping.")
             else:
-                raise ValueError(f"Unknown action_type: {action_type}")
+                raise ValueError(f"Unknown action_type: {atype}")
 
             return ExecutionResult(
-                action_id   = action_id,
-                action_type = action_type,
+                action_id   = aid,
+                action_type = atype,
                 status      = "EXECUTED",
                 timestamp   = datetime.now(timezone.utc).isoformat(),
                 duration_s  = round(time.time() - t0, 2),
@@ -233,10 +227,10 @@ class Executor:
             )
 
         except Exception as exc:
-            log.error("Action [%s] %s FAILED: %s", action_type, action_id[:8], exc, exc_info=True)
+            log.error("Action [%s] %s FAILED: %s", atype, aid[:8], exc, exc_info=True)
             return ExecutionResult(
-                action_id   = action_id,
-                action_type = action_type,
+                action_id   = aid,
+                action_type = atype,
                 status      = "FAILED",
                 timestamp   = datetime.now(timezone.utc).isoformat(),
                 duration_s  = round(time.time() - t0, 2),
@@ -248,59 +242,62 @@ class Executor:
     # ------------------------------------------------------------------
 
     def _execute_retrain(self, action: dict) -> dict:
-        payload        = action.get("payload", {})
-        base_version   = payload.get("base_model_version", "SpaceLLM_v1")
-        target_label   = payload.get("target_adapter_label", "SpaceLLM_v2")
-        examples       = payload.get("training_examples", [])
+        payload       = action.get("payload", {})
+        base_version  = payload.get("base_model_version", "SpaceLLM_v1")
+        target_label  = payload.get("target_adapter_label", "SpaceLLM_v2")
+        examples      = payload.get("training_examples", [])
 
         if not examples:
-            raise ValueError("No training examples in RETRAIN_ADAPTER payload.")
+            raise ValueError("RETRAIN_ADAPTER payload has no training_examples.")
 
-        log.info("Retraining: %s → %s  (%d examples)",
+        log.info("Retraining: %s -> %s  (%d correction examples)",
                  base_version, target_label, len(examples))
 
-        # Step 1 — Build correction training file
-        self._build_correction_train_file(examples)
+        # 1. Write correction_train_injection.json
+        self._write_correction_file(examples)
 
-        # Step 2 — Run fine-tuning script (continuing from the live adapter)
-        self._run_finetuning(target_label)
+        # 2. Derive current adapter repo from main.py so v5 continues from it
+        current_adapter = self._read_current_adapter_from_main()
+        log.info("Continuing from adapter: %s", current_adapter)
 
-        # Step 3 — Push new adapter to HuggingFace
+        # 3. Run lora_finetuning_v5.py (delta training)
+        self._run_finetuning_v5(current_adapter)
+
+        # 4. Push new adapter to HuggingFace
         new_repo_id = self._push_to_hf(target_label)
 
-        # Step 4 — Update ADAPTER_MODEL_ID in main.py
-        self._update_adapter_in_main_py(new_repo_id, target_label)
+        # 5. Update ADAPTER_MODEL_ID in main.py
+        self._update_adapter_in_main_py(new_repo_id)
 
-        # Step 5 — Mark corrections as used_in_training in feedback_log
+        # 6. Mark corrections as used_in_training=True
         feedback_ids = [e.get("feedback_id") for e in examples if e.get("feedback_id")]
         self._mark_corrections_used(feedback_ids)
 
-        # Step 6 — Restart uvicorn with new adapter
+        # 7. Restart backend
         self._restart_backend()
 
         return {
-            "base_version":     base_version,
-            "new_version":      target_label,
-            "new_repo_id":      new_repo_id,
-            "examples_used":    len(examples),
-            "feedback_ids_marked": len(feedback_ids),
+            "base_version":          base_version,
+            "new_version":           target_label,
+            "new_repo_id":           new_repo_id,
+            "continued_from":        current_adapter,
+            "examples_used":         len(examples),
+            "feedback_ids_marked":   len(feedback_ids),
         }
 
-    def _build_correction_train_file(self, examples: list[dict]) -> None:
+    def _write_correction_file(self, examples: list[dict]) -> None:
         """
-        Convert correction pairs into the training JSON format expected by
-        correction_fine_tuning.py (same schema as DatasetA_core_QA_v2).
-        Each example becomes a multi-turn conversation:
-          user: [original question]
-          assistant: [human correction / reference answer]
+        Convert Planner correction examples into lora_finetuning_v5.py's
+        expected format: each example is a record with a `messages` list
+        containing a user turn (question) and an assistant turn (reference).
         """
         records = []
         for i, ex in enumerate(examples):
             question  = (ex.get("question")  or "").strip()
             reference = (ex.get("reference") or "").strip()
             if not question or not reference:
+                log.debug("Skipping example %d — missing question or reference.", i)
                 continue
-
             records.append({
                 "sample_id":    f"correction_{i:04d}",
                 "source_id":    ex.get("feedback_id", f"fb_{i}"),
@@ -317,138 +314,121 @@ class Executor:
             })
 
         if not records:
-            raise ValueError("No valid correction examples after filtering.")
+            raise ValueError(
+                "No valid correction records after filtering "
+                "(all had empty question or reference)."
+            )
 
-        CORRECTION_TRAIN_FILE.write_text(
+        CORRECTION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CORRECTION_FILE.write_text(
             json.dumps(records, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
-        log.info("Correction training file written: %d records → %s",
-                 len(records), CORRECTION_TRAIN_FILE)
+        log.info("Correction file written: %d records -> %s",
+                 len(records), CORRECTION_FILE)
 
-    def _get_current_adapter_id(self) -> str | None:
-        """
-        Read the currently-live ADAPTER_MODEL_ID out of main.py so the
-        fine-tuning script can continue training from it (continual
-        learning) instead of re-initializing a fresh LoRA from the base
-        model every cycle. Returns None (and logs a warning) if it can't
-        be found, in which case correction_fine_tuning.py falls back to
-        fresh-LoRA-from-base-model.
-        """
+    def _read_current_adapter_from_main(self) -> str:
+        """Read the current ADAPTER_MODEL_ID value from main.py."""
         if not MAIN_PY_PATH.exists():
-            log.warning("main.py not found — cannot resolve current adapter id.")
-            return None
+            return "AdityaPS/SpaceLLM_v1"
         content = MAIN_PY_PATH.read_text(encoding="utf-8")
-        match = re.search(r'ADAPTER_MODEL_ID\s*=\s*"([^"]+)"', content)
-        if not match:
-            log.warning("Could not find ADAPTER_MODEL_ID in main.py — cannot resolve current adapter id.")
-            return None
-        return match.group(1)
+        match = re.search(r'ADAPTER_MODEL_ID\s*=\s*["\']([^"\']+)["\']', content)
+        if match:
+            return match.group(1)
+        log.warning("Could not parse ADAPTER_MODEL_ID from main.py — using default.")
+        return "AdityaPS/SpaceLLM_v1"
 
-    def _run_finetuning(self, target_label: str) -> None:
-        """Run correction_fine_tuning.py with the correction data injected."""
+    def _run_finetuning_v5(self, current_adapter: str) -> None:
+        """
+        Run lora_finetuning_v5.py with:
+          --correction_file  correction_train_injection.json
+          --adapter_base     <current live adapter>   (continue from it, not scratch)
+          --original_train   DatasetA_core_QA_v2/train.json  (replay buffer pool)
+          --replay_ratio     0.30
+          --epochs / --lr    from config
+        """
         script = self.config.finetune_script
         if not Path(script).exists():
-            raise FileNotFoundError(f"Fine-tuning script not found: {script}")
+            raise FileNotFoundError(f"v5 fine-tuning script not found: {script}")
 
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = self.config.cuda_visible_devices
 
         cmd = [
             sys.executable, script,
-            "--train_file",  str(CORRECTION_TRAIN_FILE),
-            "--output_dir",  str(ADAPTER_OUTPUT_DIR),
-            "--epochs",      str(self.config.finetune_epochs),
-            "--lr",          str(self.config.finetune_lr),
-            "--max_seq_len", str(self.config.finetune_max_seq_len),
+            "--correction_file", str(CORRECTION_FILE),
+            "--adapter_base",    current_adapter,
+            "--original_train",  str(ORIGINAL_TRAIN_FILE),
+            "--val_file",        str(VAL_FILE),
+            "--replay_ratio",    str(self.config.finetune_replay_ratio),
+            "--epochs",          str(self.config.finetune_epochs),
+            "--lr",              str(self.config.finetune_lr),
+            "--max_seq_len",     str(self.config.finetune_max_seq_len),
         ]
 
-        base_adapter = self._get_current_adapter_id()
-        if base_adapter:
-            cmd += ["--base_adapter", base_adapter]
-            log.info("Continual fine-tuning from current live adapter: %s", base_adapter)
-        else:
-            log.warning("No current adapter resolved — fine-tuning script will train a fresh LoRA from base.")
-
-        log.info("Running fine-tuning: %s", " ".join(cmd))
-        result = subprocess.run(
-            cmd,
-            env     = env,
-            capture_output = False,   # stream output to terminal
-            check   = False,
-        )
-
+        log.info("Running v5 fine-tuning: %s", " ".join(cmd))
+        result = subprocess.run(cmd, env=env, check=False)
         if result.returncode != 0:
             raise RuntimeError(
-                f"Fine-tuning script exited with code {result.returncode}."
+                f"lora_finetuning_v5.py exited with code {result.returncode}."
             )
-        log.info("Fine-tuning complete for %s.", target_label)
+        log.info("v5 fine-tuning complete.")
 
     def _push_to_hf(self, target_label: str) -> str:
         """
-        Push the newly trained adapter to HuggingFace Hub.
-        Returns the new repo_id (e.g. AdityaPS/SpaceLLM_v2).
+        Push adapter from ADAPTER_OUTPUT_DIR to HuggingFace Hub.
+        Returns new repo_id e.g. 'AdityaPS/SpaceLLM_v2'.
         """
         from huggingface_hub import HfApi
 
         hf_token = os.environ.get(self.config.hf_token_env)
         if not hf_token:
             raise EnvironmentError(
-                f"HuggingFace token not found. "
-                f"Set env var: export {self.config.hf_token_env}=<your_token>"
+                f"HF token not set. Run: export {self.config.hf_token_env}=<your_token>"
             )
 
-        # Derive new repo_id from target_label
-        # e.g. "SpaceLLM_v2" → "AdityaPS/SpaceLLM_v2"
-        base_org  = self.config.hf_repo_id.split("/")[0]
-        new_repo  = f"{base_org}/{target_label}"
+        new_repo = f"{self.config.hf_base_org}/{target_label}"
+        api      = HfApi(token=hf_token)
 
-        api = HfApi(token=hf_token)
+        # Create repo (idempotent)
+        api.create_repo(repo_id=new_repo, repo_type="model", exist_ok=True)
+        log.info("HF repo ready: %s", new_repo)
 
-        # Create repo if it doesn't exist
-        try:
-            api.create_repo(repo_id=new_repo, repo_type="model", exist_ok=True)
-            log.info("HF repo ready: %s", new_repo)
-        except Exception as exc:
-            raise RuntimeError(f"Failed to create HF repo {new_repo}: {exc}")
-
-        # Upload adapter folder
         if not ADAPTER_OUTPUT_DIR.exists():
             raise FileNotFoundError(
-                f"Adapter output directory not found: {ADAPTER_OUTPUT_DIR}"
+                f"Adapter output directory not found: {ADAPTER_OUTPUT_DIR}\n"
+                f"Ensure lora_finetuning_v5.py completed successfully."
             )
 
-        log.info("Uploading adapter from %s → %s ...", ADAPTER_OUTPUT_DIR, new_repo)
+        log.info("Uploading adapter %s -> %s ...", ADAPTER_OUTPUT_DIR, new_repo)
         api.upload_folder(
-            folder_path = str(ADAPTER_OUTPUT_DIR),
-            repo_id     = new_repo,
-            repo_type   = "model",
+            folder_path    = str(ADAPTER_OUTPUT_DIR),
+            repo_id        = new_repo,
+            repo_type      = "model",
             commit_message = f"MAPE-K auto-retrain: {target_label}",
         )
-        log.info("Adapter pushed to HuggingFace: https://huggingface.co/%s", new_repo)
+        log.info("Adapter pushed: https://huggingface.co/%s", new_repo)
         return new_repo
 
-    def _update_adapter_in_main_py(self, new_repo_id: str, target_label: str) -> None:
-        """Update ADAPTER_MODEL_ID in main.py to point at the new adapter."""
+    def _update_adapter_in_main_py(self, new_repo_id: str) -> None:
+        """Patch ADAPTER_MODEL_ID in main.py to point at the new adapter."""
         if not MAIN_PY_PATH.exists():
             raise FileNotFoundError(f"main.py not found: {MAIN_PY_PATH}")
 
         content = MAIN_PY_PATH.read_text(encoding="utf-8")
-
-        # Replace ADAPTER_MODEL_ID = "..." line
         new_content = re.sub(
-            r'ADAPTER_MODEL_ID\s*=\s*"[^"]+"',
-            f'ADAPTER_MODEL_ID    = "{new_repo_id}"',
+            r'(ADAPTER_MODEL_ID\s*=\s*)["\'][^"\']+["\']',
+            f'\\1"{new_repo_id}"',
             content,
         )
         if new_content == content:
-            raise ValueError("Could not find ADAPTER_MODEL_ID in main.py to update.")
+            raise ValueError("Could not find ADAPTER_MODEL_ID in main.py.")
 
         MAIN_PY_PATH.write_text(new_content, encoding="utf-8")
-        log.info("main.py updated: ADAPTER_MODEL_ID → %s", new_repo_id)
+        log.info("main.py updated: ADAPTER_MODEL_ID = %s", new_repo_id)
 
     def _mark_corrections_used(self, feedback_ids: list[str]) -> None:
-        """Flip used_in_training=True for all feedback_ids in feedback_log.jsonl."""
+        """Flip used_in_training=True for all used feedback_ids."""
         if not FEEDBACK_LOG.exists() or not feedback_ids:
             return
 
@@ -476,13 +456,10 @@ class Executor:
         log.info("Marked %d feedback record(s) as used_in_training=True.", updated)
 
     def _restart_backend(self) -> None:
-        """
-        Kill the running uvicorn process and restart it with the updated main.py.
-        Waits until /health returns ready=true before returning.
-        """
+        """Kill uvicorn, restart it, wait for /health ready=true."""
         import signal as _signal
 
-        # Find uvicorn PID
+        # Find and kill existing uvicorn
         try:
             result = subprocess.run(
                 ["pgrep", "-f", "uvicorn main:app"],
@@ -499,7 +476,7 @@ class Executor:
             except ProcessLookupError:
                 pass
 
-        time.sleep(5)   # give uvicorn time to shut down cleanly
+        time.sleep(5)   # let uvicorn shut down
 
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = self.config.cuda_visible_devices
@@ -512,23 +489,25 @@ class Executor:
         log.info("Starting uvicorn: %s", " ".join(cmd))
         subprocess.Popen(cmd, env=env, cwd=str(BASE_DIR))
 
-        # Poll /health until ready
-        import urllib.request
-        health_url = f"http://{self.config.uvicorn_host}:{self.config.uvicorn_port}/health"
-        deadline   = time.time() + self.config.uvicorn_startup_wait_s
-        log.info("Waiting for backend to become ready (up to %ds) ...",
+        # Poll /health
+        health_url = (
+            f"http://{self.config.uvicorn_host}:{self.config.uvicorn_port}/health"
+        )
+        deadline = time.time() + self.config.uvicorn_startup_wait_s
+        log.info("Waiting for backend (up to %ds) ...",
                  self.config.uvicorn_startup_wait_s)
 
         while time.time() < deadline:
-            time.sleep(10)
+            time.sleep(15)
             try:
                 with urllib.request.urlopen(health_url, timeout=5) as resp:
                     data = json.loads(resp.read())
                     if data.get("ready"):
-                        log.info("Backend is ready. New adapter loaded.")
+                        log.info("Backend ready — new adapter loaded successfully.")
                         return
-            except Exception:
-                pass
+                    log.info("Backend starting... (ready=%s)", data.get("ready"))
+            except Exception as exc:
+                log.debug("Health check: %s", exc)
 
         raise TimeoutError(
             f"Backend did not become ready within {self.config.uvicorn_startup_wait_s}s."
@@ -540,41 +519,34 @@ class Executor:
 
     def _execute_prompt_patch(self, action: dict) -> dict:
         payload    = action.get("payload", {})
-        patch_text = payload.get("patch_text", "").strip()
+        patch_text = (payload.get("patch_text") or "").strip()
         patch_key  = payload.get("patch_key", "unknown")
 
         if not patch_text:
             raise ValueError("patch_text is empty in PROMPT_PATCH payload.")
-
         if not MAIN_PY_PATH.exists():
             raise FileNotFoundError(f"main.py not found: {MAIN_PY_PATH}")
 
         content = MAIN_PY_PATH.read_text(encoding="utf-8")
 
-        # Find the SYSTEM_PROMPT block and append the patch as a new sentence
-        marker = self.config.system_prompt_marker
-        idx    = content.find(marker)
-        if idx == -1:
+        marker    = self.config.system_prompt_marker
+        start_idx = content.find(marker)
+        if start_idx == -1:
             raise ValueError(f"Could not find '{marker}' in main.py.")
 
         # Find the closing paren of the SYSTEM_PROMPT tuple
-        close_idx = content.find("\n)", idx)
+        close_idx = content.find("\n)", start_idx)
         if close_idx == -1:
-            raise ValueError("Could not find closing paren of SYSTEM_PROMPT in main.py.")
+            raise ValueError("Could not find closing ')' of SYSTEM_PROMPT in main.py.")
 
-        # Insert patch as last line of SYSTEM_PROMPT before closing paren
-        patch_line = f'    "{patch_text}"'
-        new_content = (
-            content[:close_idx]
-            + "\n"
-            + patch_line
-            + content[close_idx:]
-        )
+        # Append patch as a new concatenated string before the closing paren
+        patch_line  = f'\n    "{patch_text}"'
+        new_content = content[:close_idx] + patch_line + content[close_idx:]
 
         MAIN_PY_PATH.write_text(new_content, encoding="utf-8")
-        log.info("Prompt patch '%s' applied to main.py.", patch_key)
+        log.info("Prompt patch '%s' applied.", patch_key)
 
-        # Restart backend to pick up new prompt
+        # Restart backend to pick up new system prompt
         self._restart_backend()
 
         return {
@@ -599,7 +571,7 @@ class Executor:
             "reasoning":      action.get("reasoning", []),
         }
         _append_jsonl(HUMAN_REVIEW_QUEUE, record)
-        log.info("Topic guardrail logged to human_review_queue.jsonl.")
+        log.info("Topic guardrail written to human_review_queue.jsonl.")
         return {"written_to": str(HUMAN_REVIEW_QUEUE)}
 
     # ------------------------------------------------------------------
@@ -616,12 +588,9 @@ class Executor:
             "reasoning":         action.get("reasoning", []),
         }
         _append_jsonl(HUMAN_REVIEW_QUEUE, record)
-        log.info("Flagged %d question(s) for human review.",
-                 len(payload.get("flagged_questions", [])))
-        return {
-            "flagged_count": len(payload.get("flagged_questions", [])),
-            "written_to":    str(HUMAN_REVIEW_QUEUE),
-        }
+        n = len(payload.get("flagged_questions", []))
+        log.info("Flagged %d question(s) for human review.", n)
+        return {"flagged_count": n, "written_to": str(HUMAN_REVIEW_QUEUE)}
 
     # ------------------------------------------------------------------
     # plan_actions.jsonl management
@@ -642,12 +611,10 @@ class Executor:
                     action = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-
                 aid = action.get("action_id")
                 if not aid or aid in seen:
                     continue
                 seen.add(aid)
-
                 if action.get("status") == "PENDING":
                     pending.append(action)
 
@@ -656,7 +623,6 @@ class Executor:
     def _update_action_status(
         self, action_id: str, status: str, error: str = ""
     ) -> None:
-        """Rewrite plan_actions.jsonl updating the status of one action."""
         if not PLAN_ACTIONS_LOG.exists():
             return
 
@@ -682,7 +648,7 @@ class Executor:
         tmp.replace(PLAN_ACTIONS_LOG)
 
     # ------------------------------------------------------------------
-    # State persistence
+    # State
     # ------------------------------------------------------------------
 
     def _load_state(self) -> dict:
@@ -715,7 +681,7 @@ if __name__ == "__main__":
             icon = "✓" if r.status == "EXECUTED" else "✗"
             print(f"  {icon} [{r.action_type:<16}] {r.status:<8}  ({r.duration_s:.1f}s)")
             if r.error:
-                print(f"    ERROR: {r.error}")
-    print(f"\n  Execution log → {EXECUTION_LOG}")
-    print(f"  Review queue  → {HUMAN_REVIEW_QUEUE}")
+                print(f"      ERROR: {r.error}")
+    print(f"\n  Execution log  -> {EXECUTION_LOG}")
+    print(f"  Review queue   -> {HUMAN_REVIEW_QUEUE}")
     print(f"{'='*60}\n")
