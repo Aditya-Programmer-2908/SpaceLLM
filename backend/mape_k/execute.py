@@ -5,8 +5,9 @@ Responsibility: Read Planner actions → execute them → update statuses.
 
 Actions handled:
   RETRAIN_ADAPTER  → build training data from corrections → run
-                     lora_finetuning_v4.py → push adapter to HuggingFace
-                     → hot-reload backend → mark corrections used
+                     correction_fine_tuning.py (continuing from the
+                     currently-live adapter) → push new adapter to
+                     HuggingFace → hot-reload backend → mark corrections used
   PROMPT_PATCH     → patch system prompt in main.py → restart uvicorn
   TOPIC_GUARDRAIL  → log + write to human_review_queue.jsonl
   FLAG_FOR_REVIEW  → write to human_review_queue.jsonl
@@ -18,6 +19,31 @@ Pipeline position:
     Executor  ← YOU ARE HERE
         ↓
     SpaceLLM_v(N+1) live on GPU
+
+CHANGELOG (this pass)
+----------------------
+1. SECURITY: hf_token_env now holds the *name* of an environment variable
+   (e.g. "HF_TOKEN"), not a literal token. A real token was previously
+   hardcoded here — if that token is still live, revoke it on
+   huggingface.co and export a fresh one as $HF_TOKEN before running this.
+
+2. PATH BUG FIX: finetune_script now points at the real file —
+   correction_fine_tuning.py under
+   Model_training_&_Data_Extraction/fine_tuning_v2/ — instead of the
+   stale lora_finetuning_v4.py path that no longer exists.
+
+3. EXPLICIT CLI CONTRACT: _run_finetuning() now passes --train_file and
+   --output_dir explicitly instead of relying on both scripts hardcoding
+   matching constants independently. One source of truth (this file's
+   CORRECTION_TRAIN_FILE / ADAPTER_OUTPUT_DIR), passed at call time.
+
+4. CONTINUAL FINE-TUNING: _run_finetuning() now reads the currently-live
+   ADAPTER_MODEL_ID out of main.py and passes it as --base_adapter, so
+   each retrain cycle continues training the live adapter instead of
+   re-initializing a fresh LoRA from the base model every time. This
+   matches the project's continual-learning design (SpaceLLM_v2, v3, ...
+   each building on the last). If you actually want fresh-LoRA-per-cycle
+   instead, just drop the --base_adapter arg in _run_finetuning().
 
 Author: SpaceLLM Project
 """
@@ -77,7 +103,9 @@ MAPE_DIR.mkdir(parents=True, exist_ok=True)
 class ExecutorConfig:
     # HuggingFace
     hf_repo_id:              str   = "AdityaPS/SpaceLLM_v1"   # updated per version
-    hf_token_env:            str   = "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"               # env var name
+    hf_token_env:            str   = "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"   # NAME of the env var holding your HF token
+    #                                               (export HF_TOKEN=<your_token> in your shell —
+    #                                               never put the literal token in source code)
 
     # Fine-tuning script
     finetune_script:         str   = str(FINE_TUNING_DIR / "correction_fine_tuning.py")
@@ -234,7 +262,7 @@ class Executor:
         # Step 1 — Build correction training file
         self._build_correction_train_file(examples)
 
-        # Step 2 — Run fine-tuning script
+        # Step 2 — Run fine-tuning script (continuing from the live adapter)
         self._run_finetuning(target_label)
 
         # Step 3 — Push new adapter to HuggingFace
@@ -261,7 +289,7 @@ class Executor:
     def _build_correction_train_file(self, examples: list[dict]) -> None:
         """
         Convert correction pairs into the training JSON format expected by
-        lora_finetuning_v4.py (same schema as DatasetA_core_QA_v2).
+        correction_fine_tuning.py (same schema as DatasetA_core_QA_v2).
         Each example becomes a multi-turn conversation:
           user: [original question]
           assistant: [human correction / reference answer]
@@ -298,8 +326,27 @@ class Executor:
         log.info("Correction training file written: %d records → %s",
                  len(records), CORRECTION_TRAIN_FILE)
 
+    def _get_current_adapter_id(self) -> str | None:
+        """
+        Read the currently-live ADAPTER_MODEL_ID out of main.py so the
+        fine-tuning script can continue training from it (continual
+        learning) instead of re-initializing a fresh LoRA from the base
+        model every cycle. Returns None (and logs a warning) if it can't
+        be found, in which case correction_fine_tuning.py falls back to
+        fresh-LoRA-from-base-model.
+        """
+        if not MAIN_PY_PATH.exists():
+            log.warning("main.py not found — cannot resolve current adapter id.")
+            return None
+        content = MAIN_PY_PATH.read_text(encoding="utf-8")
+        match = re.search(r'ADAPTER_MODEL_ID\s*=\s*"([^"]+)"', content)
+        if not match:
+            log.warning("Could not find ADAPTER_MODEL_ID in main.py — cannot resolve current adapter id.")
+            return None
+        return match.group(1)
+
     def _run_finetuning(self, target_label: str) -> None:
-        """Run lora_finetuning_v4.py with the correction data injected."""
+        """Run correction_fine_tuning.py with the correction data injected."""
         script = self.config.finetune_script
         if not Path(script).exists():
             raise FileNotFoundError(f"Fine-tuning script not found: {script}")
@@ -309,10 +356,19 @@ class Executor:
 
         cmd = [
             sys.executable, script,
+            "--train_file",  str(CORRECTION_TRAIN_FILE),
+            "--output_dir",  str(ADAPTER_OUTPUT_DIR),
             "--epochs",      str(self.config.finetune_epochs),
             "--lr",          str(self.config.finetune_lr),
             "--max_seq_len", str(self.config.finetune_max_seq_len),
         ]
+
+        base_adapter = self._get_current_adapter_id()
+        if base_adapter:
+            cmd += ["--base_adapter", base_adapter]
+            log.info("Continual fine-tuning from current live adapter: %s", base_adapter)
+        else:
+            log.warning("No current adapter resolved — fine-tuning script will train a fresh LoRA from base.")
 
         log.info("Running fine-tuning: %s", " ".join(cmd))
         result = subprocess.run(
