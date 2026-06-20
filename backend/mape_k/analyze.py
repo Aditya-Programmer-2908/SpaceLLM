@@ -64,8 +64,8 @@ class AnalyserConfig:
     # BERTScore
     bertscore_model:            str   = "distilbert-base-uncased"
     bertscore_lang:             str   = "en"
-    bertscore_low_threshold:    float = 0.75   # below this = concern
-    bertscore_critical:         float = 0.60   # below this = CRITICAL
+    bertscore_low_threshold:    float = 0.879   # below this = concern
+    bertscore_critical:         float = 0.84   # below this = CRITICAL
 
     # Negative rate
     neg_rate_medium:            float = 0.20
@@ -80,7 +80,7 @@ class AnalyserConfig:
     # Hallucination count triggers
     hallucination_medium:       int   = 3
     hallucination_high:         int   = 8
-    hallucination_critical:     int   = 15
+    hallucination_critical:     int   = 12
 
     # Repeated failure triggers
     repeated_failure_medium:    int   = 2
@@ -561,6 +561,21 @@ class Analyser:
         log.info("Backfilled BERTScore into %d feedback records.", updated)
 
     # ------------------------------------------------------------------
+    # Failed-record logging (parity with monitor.py's poison-pill guard)
+    # ------------------------------------------------------------------
+
+    def _log_failed_event(self, event: dict, exc: Exception) -> None:
+        try:
+            with FAILED_LOG.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({
+                    "event_id":  event.get("event_id"),
+                    "error":     str(exc),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }) + "\n")
+        except OSError as write_exc:
+            log.error("Could not write to failed-event log: %s", write_exc)
+
+    # ------------------------------------------------------------------
     # Utilities
     # ------------------------------------------------------------------
 
@@ -601,5 +616,3 @@ if __name__ == "__main__":
         print(f"    • {r}")
     print(f"\n  Report → {REPORT_PATH}")
     print(f"{'='*60}\n")
-
-
