@@ -62,7 +62,7 @@ MAPE_DIR.mkdir(parents=True, exist_ok=True)
 @dataclass
 class AnalyserConfig:
     # BERTScore
-    bertscore_model:            str   = "distilbert-base-uncased"
+    bertscore_model:            str   = "roberta-large"
     bertscore_lang:             str   = "en"
     bertscore_low_threshold:    float = 0.879   # below this = concern
     bertscore_critical:         float = 0.84   # below this = CRITICAL
