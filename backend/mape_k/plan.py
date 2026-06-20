@@ -292,12 +292,18 @@ class Planner:
                 dropped += 1
 
         cleaned = cleaned[: self.config.max_training_examples]
+        cleaned, enriched = self._backfill_bertscore(cleaned, report)
 
         reasoning = list(report.get("retrain_trigger_reasons", []))
         reasoning.append(
             f"{dropped} correction(s) excluded from training set — reference too short "
             f"(<{self.config.min_reference_words_for_training} words) to be a usable "
             f"target; likely a feedback comment rather than an actual correction."
+        )
+        reasoning.append(
+            f"{enriched}/{len(cleaned)} training example(s) backfilled with their real "
+            f"BERTScore (joined from analysis_report.low_bertscore_pairs by feedback_id) "
+            f"— corrections_for_training reads bertscore pre-backfill so it's null there."
         )
 
         payload = {
@@ -314,6 +320,42 @@ class Planner:
             reasoning   = reasoning,
             payload     = payload,
         )
+
+    def _backfill_bertscore(
+        self, examples: list[dict], report: dict,
+    ) -> tuple[list[dict], int]:
+        """
+        corrections_for_training in analysis_report.json reads the feedback
+        record's `bertscore` field, which the Analyser only backfills to
+        disk AFTER that list is already built — so every entry shows
+        bertscore=null even when the Analyser computed a real score for it
+        the same run. Join against `low_bertscore_pairs` (which DOES carry
+        the freshly-computed bertscore_f1) by feedback_id to recover it,
+        so the retrain payload can actually be weighted by how bad each
+        original answer was instead of treating every example as unscored.
+
+        Note: low_bertscore_pairs only contains pairs that fell BELOW
+        bertscore_low_threshold, so an example with a healthy score won't
+        be in it — that's expected, not a miss. We only backfill what's
+        available; anything not found stays null (it may simply be a
+        higher-scoring example, or its score will land in the next cycle's
+        backfilled feedback_log.jsonl).
+        """
+        score_by_fid = {
+            p.get("feedback_id"): p.get("bertscore_f1")
+            for p in report.get("low_bertscore_pairs", [])
+            if p.get("feedback_id")
+        }
+        enriched = 0
+        out = []
+        for ex in examples:
+            ex = dict(ex)
+            fid = ex.get("feedback_id")
+            if ex.get("bertscore") is None and fid in score_by_fid:
+                ex["bertscore"] = score_by_fid[fid]
+                enriched += 1
+            out.append(ex)
+        return out, enriched
 
     # ------------------------------------------------------------------
     # Decision: prompt patches
