@@ -58,6 +58,7 @@ Before writing your answer, silently work through these steps:
 
 OUTPUT RULES:
 - Write a thorough, technically accurate, educational explanation.
+- The response must be factually very accurate no compromise in getting the facts correct in the response.
 - Aim for 300–600 words. Do not pad; stop when the explanation is complete.
 - Make sure that the response is complete( less than or equal to 1024 tokens).
 - Use flowing paragraphs. No bullet lists.
