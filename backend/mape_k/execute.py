@@ -80,7 +80,7 @@ class ExecutorConfig:
     hf_token_env:            str   = "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"               # env var name
 
     # Fine-tuning script
-    finetune_script:         str   = str(FINE_TUNING_DIR / "lora_finetuning_v4.py")
+    finetune_script:         str   = str(FINE_TUNING_DIR / "correction_fine_tuning.py")
     cuda_visible_devices:    str   = "1"
     finetune_epochs:         int   = 3
     finetune_lr:             float = 2e-4
