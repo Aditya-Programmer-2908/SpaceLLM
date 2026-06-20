@@ -44,6 +44,13 @@ CHANGELOG (research-readiness pass)
    atomic JSON writes to avoid corrupted state on a killed process, and a
    couple of defensive guards (e.g. `None` conversation content).
 
+6. TOPIC-AGNOSTIC DETECTION
+   The hardcoded space-domain TOPIC_KEYWORDS map has been removed.
+   classify_topic() now returns "Other" for all inputs (or plugs into
+   an external classifier). Event detection fires regardless of topic —
+   no question needs to match NASA/ISRO/etc. keywords to trigger events.
+   Topic remains a metadata field on MonitorEvent for downstream use.
+
 Public API (`Monitor`, `run()`, `process_feedback()`, detector method
 names) is unchanged so existing Analyzer/Planner code keeps working.
 """
@@ -86,39 +93,6 @@ PRIORITY = {
     "repeated_failure":  6,
     "domain_drift":      7,
     "positive_feedback": 1,   # low-weight positive signal
-}
-
-# -- Topic keyword map -------------------------------------------------------------
-
-TOPIC_KEYWORDS: dict[str, list[str]] = {
-    "Apollo Missions":   ["apollo", "saturn v", "neil armstrong", "buzz aldrin",
-                          "lunar module", "sea of tranquility", "apollo 11",
-                          "apollo 13", "apollo program"],
-    "Artemis Program":   ["artemis", "sls", "orion capsule", "gateway",
-                          "lunar south pole", "artemis i", "artemis ii"],
-    "Satellite Launches":["satellite", "geostationary", "leo orbit", "geo orbit",
-                          "launch vehicle", "payload", "cubesat", "smallsat",
-                          "pslv", "gslv", "falcon 9", "atlas v", "ariane"],
-    "Spacecraft":        ["spacecraft", "probe", "voyager", "cassini", "juno",
-                          "new horizons", "pioneer", "messenger", "dawn",
-                          "perseverance", "curiosity", "opportunity", "spirit",
-                          "ingenuity", "hubble", "james webb", "jwst"],
-    "Astronomy":         ["black hole", "neutron star", "galaxy", "nebula",
-                          "exoplanet", "dark matter", "dark energy", "pulsar",
-                          "quasar", "supernova", "cosmology", "redshift",
-                          "gravitational wave", "ligo", "telescope"],
-    "ISRO":              ["isro", "chandrayaan", "mangalyaan", "gaganyaan",
-                          "pslv", "gslv", "vikram", "pragyan", "aditya-l1",
-                          "sriharikota", "indian space"],
-    "NASA":              ["nasa", "kennedy space center", "jet propulsion",
-                          "jpl", "goddard", "johnson space center", "iss",
-                          "space shuttle", "hubble", "artemis", "mars 2020"],
-    "SpaceX":            ["spacex", "falcon", "starship", "dragon", "crew dragon",
-                          "starlink", "elon musk", "raptor engine", "boca chica",
-                          "super heavy"],
-    "ESA":               ["esa", "european space agency", "ariane", "rosetta",
-                          "huygens", "mars express", "envisat", "sentinel",
-                          "gaia", "cheops", "juice"],
 }
 
 # -- Hallucination signal keywords ------------------------------------------------
@@ -169,10 +143,10 @@ class MonitorConfig:
     drift_min_samples:                    int   = 5
     drift_neg_rate_threshold:             float = 0.60
     drift_window_size:                    int   = 50   # sliding window per topic
-    drift_reemit_cooldown_records:        int   = 5     # re-alert cadence once active
+    drift_reemit_cooldown_records:        int   = 5    # re-alert cadence once active
     incomplete_short_word_threshold:      int   = 60
     requires_learning_priority_threshold: int   = 8
-    checkpoint_interval:                  int   = 20    # save state every N records
+    checkpoint_interval:                  int   = 20   # save state every N records
 
 
 # -- Data models ---------------------------------------------------------------------
@@ -537,22 +511,16 @@ class Monitor:
 
     def classify_topic(self, text: str) -> str:
         """
-        Keyword-based topic classifier.
-        Returns the best-matching category or 'Other'.
-        Note: ties between categories with equal hit counts resolve to
-        whichever is defined first in TOPIC_KEYWORDS (insertion order) -
-        deterministic, but worth knowing if you see a topic look
-        "sticky" in ambiguous, multi-topic questions.
+        Topic classifier. Returns "Other" for all inputs since event detection
+        is topic-agnostic — no question needs to match a domain keyword list
+        to trigger events. Topic is retained as metadata on MonitorEvent for
+        any downstream Analyzer/Planner use.
+
+        To add real topic tagging later, replace the body of this method with
+        an NLP classifier (e.g. spaCy NER, keyBERT, or a zero-shot classifier)
+        without changing any other code.
         """
-        text_lower = text.lower()
-        scores: dict[str, int] = {}
-        for category, keywords in TOPIC_KEYWORDS.items():
-            hit = sum(1 for kw in keywords if kw in text_lower)
-            if hit:
-                scores[category] = hit
-        if not scores:
-            return "Other"
-        return max(scores, key=lambda c: scores[c])
+        return "Other"
 
     def detect_incomplete_answer(
         self, record: FeedbackRecord
@@ -565,11 +533,9 @@ class Monitor:
           - STRONG (timeline/table/schedule/steps/milestones) is an
             unambiguous ask for structured content by itself.
           - WEAK (list/dates/events/missions/launches) is extremely common
-            in plain space-domain questions, so it only counts as a
-            structural request when paired with an explicit enumeration
-            cue ("all", "every", "how many", ...). This is what keeps a
-            short, correct answer to "what mission was Apollo 11" from
-            being wrongly flagged.
+            in plain questions, so it only counts as a structural request
+            when paired with an explicit enumeration cue ("all", "every",
+            "how many", ...).
         """
         strong_match = STRUCTURAL_STRONG_PATTERN.search(record.question)
         weak_match   = STRUCTURAL_WEAK_PATTERN.search(record.question)
@@ -609,8 +575,7 @@ class Monitor:
         *saying* the model was wrong, not the model being wrong with no
         pushback. If you want to catch silent hallucinations later, this is
         the natural place to plug in a fact-verification or entity-check
-        callable (e.g. cross-referencing named missions/dates against a
-        gazetteer, or your existing BERTScore eval) as an additional signal.
+        callable as an additional signal.
         """
         search_corpus = record.reference.lower()
         for turn in record.conversation:
@@ -661,6 +626,12 @@ class Monitor:
         more records have passed, so the Planner sees a periodic re-alert
         rather than a flood. Dropping back under the threshold clears the
         active state.
+
+        With classify_topic() returning "Other" for all inputs, drift
+        detection now operates over the aggregate of all feedback rather
+        than per named domain. If you later introduce real topic tagging,
+        drift detection will automatically become per-topic with no code
+        changes here.
         """
         window = self._topic_history.get(topic, [])
         scoped = [e for e in window if e["v"] == model_version]
