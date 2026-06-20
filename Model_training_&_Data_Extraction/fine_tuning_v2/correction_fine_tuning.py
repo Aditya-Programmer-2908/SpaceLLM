@@ -1,39 +1,76 @@
 """
-SpaceLLM MAPE-K :: Executor Component
-=======================================
-Responsibility: Read Planner actions → execute them → update statuses.
+SpaceLLM :: Continual Correction Fine-Tuning
+==============================================
+Responsibility: Take a small batch of human-corrected QA pairs (built by
+                execute.py's RETRAIN_ADAPTER step) and continue training
+                the currently-live LoRA adapter on top of the base model,
+                producing an updated adapter ready to push to HuggingFace.
 
-Actions handled:
-  RETRAIN_ADAPTER  → build training data from corrections → run
-                     lora_finetuning_v4.py → push adapter to HuggingFace
-                     → hot-reload backend → mark corrections used
-  PROMPT_PATCH     → patch system prompt in main.py → restart uvicorn
-  TOPIC_GUARDRAIL  → log + write to human_review_queue.jsonl
-  FLAG_FOR_REVIEW  → write to human_review_queue.jsonl
-  NO_ACTION        → log and skip
+Called by:
+    backend/mape_k/execute.py  (RETRAIN_ADAPTER action)
 
-Pipeline position:
-    Planner (plan_actions.jsonl)
-        ↓
-    Executor  ← YOU ARE HERE
-        ↓
-    SpaceLLM_v(N+1) live on GPU
+Typical invocation (as run by execute.py):
+    python correction_fine_tuning.py \
+        --train_file  /mnt/DATA/saurabh/aditya/SpaceLLM/backend/mape_k/correction_train_injection.json \
+        --output_dir  /mnt/DATA/saurabh/aditya/SpaceLLM/Model_training_&_Data_Extraction/fine_tuning_v2/outputs/spacellm_lora_final \
+        --epochs 3 --lr 2e-4 --max_seq_len 2048 \
+        --base_adapter AdityaPS/SpaceLLM_v3
+
+Design notes
+------------
+- CONTINUAL, NOT FROM-SCRATCH. If --base_adapter is given, we load the
+  base model + that adapter with is_trainable=True and keep training it.
+  Correction batches are small (a handful to a few dozen examples), so
+  re-initializing a fresh LoRA from the base model every cycle would
+  throw away everything learned in prior retrain cycles. If --base_adapter
+  is omitted, a fresh LoRA is initialized (matches your established
+  r=16 / alpha=32, targeting "lm_head").
+
+- MXFP4. gpt-oss-20b ships MXFP4-quantized. MXFP4 weights aren't directly
+  differentiable, so we load with Mxfp4Config(dequantize=True) when the
+  installed transformers version supports it. This is the fix for the
+  "MXFP4 quantization blocking" crash noted in your earlier fine-tuning
+  work — if you hit a similar block again, the first thing to check is
+  whether `dequantize=True` actually took effect for your transformers
+  version.
+
+- lm_head-ONLY LoRA. Matches your established config. For an MoE model
+  this also sidesteps touching the expert/router weights with a tiny,
+  noisy correction batch — a meaningful source of the NaN/gradient-spike
+  instability you debugged previously. If you want to expand
+  target_modules later, do it deliberately and watch the loss curve.
+
+- NO BLIND resize_token_embeddings(). The CUDA "label out of range" bug
+  you hit before came from resizing embeddings unconditionally. Here we
+  only touch the pad token id (reusing eos_token if no pad token exists)
+  and never call resize_token_embeddings — vocab size is left untouched.
+
+- ASSISTANT-ONLY LOSS. Each training example is a 2-turn
+  [user question, assistant corrected-answer] pair. Loss is computed only
+  on the assistant tokens (prompt tokens are masked to -100), so the model
+  isn't penalized for "predicting" the question back.
+
+- NaN GUARD. A callback watches the logged loss every step; on the first
+  NaN/Inf it stops training and the script exits non-zero, so
+  execute.py's `if result.returncode != 0: raise RuntimeError(...)` stops
+  the pipeline before a broken adapter gets pushed to HuggingFace.
+
+- HF TOKEN. Read from the env var named by $HF_TOKEN (inherited from
+  execute.py's subprocess environment). Needed only if --base_adapter
+  is a private repo. Never hardcode a token in this file.
 
 Author: SpaceLLM Project
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
+import math
 import os
-import re
-import signal
-import subprocess
 import sys
-import time
-import uuid
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -46,620 +83,345 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
 )
-log = logging.getLogger("spacellm.executor")
+log = logging.getLogger("spacellm.correction_finetune")
 
 # ---------------------------------------------------------------------------
-# Paths
+# Default paths (overridable via CLI; execute.py passes these explicitly)
 # ---------------------------------------------------------------------------
 
-BASE_DIR            = Path("/mnt/DATA/saurabh/aditya/SpaceLLM/backend")
-MAPE_DIR            = BASE_DIR / "mape_k"
-FINE_TUNING_DIR     = Path("/mnt/DATA/saurabh/aditya/SpaceLLM/Model_training_&_Data_Extraction/fine_tuning_v2")
-ADAPTER_OUTPUT_DIR  = FINE_TUNING_DIR / "outputs" / "spacellm_lora_final"
-TRAIN_DATA_DIR      = Path("/mnt/DATA/saurabh/aditya/SpaceLLM/data_processing/DatasetA_core_QA_v2")
-CORRECTION_TRAIN_FILE = MAPE_DIR / "correction_train_injection.json"
+_MAPE_DIR        = Path("/mnt/DATA/saurabh/aditya/SpaceLLM/backend/mape_k")
+_FINE_TUNING_DIR = Path("/mnt/DATA/saurabh/aditya/SpaceLLM/Model_training_&_Data_Extraction/fine_tuning_v2")
 
-PLAN_ACTIONS_LOG    = MAPE_DIR / "plan_actions.jsonl"
-PLAN_REPORT_PATH    = MAPE_DIR / "plan_report.json"
-FEEDBACK_LOG        = BASE_DIR / "feedback_log.jsonl"
-MAIN_PY_PATH        = BASE_DIR / "main.py"
-HUMAN_REVIEW_QUEUE  = MAPE_DIR / "human_review_queue.jsonl"
-EXECUTION_LOG       = MAPE_DIR / "execution_log.jsonl"
-STATE_FILE          = MAPE_DIR / ".executor_state.json"
-
-MAPE_DIR.mkdir(parents=True, exist_ok=True)
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-@dataclass
-class ExecutorConfig:
-    # HuggingFace
-    hf_repo_id:              str   = "AdityaPS/SpaceLLM_v1"   # updated per version
-    hf_token_env:            str   = "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"               # env var name
-
-    # Fine-tuning script
-    finetune_script:         str   = str(FINE_TUNING_DIR / "correction_fine_tuning.py")
-    cuda_visible_devices:    str   = "1"
-    finetune_epochs:         int   = 3
-    finetune_lr:             float = 2e-4
-    finetune_max_seq_len:    int   = 2048
-
-    # Backend restart
-    uvicorn_host:            str   = "localhost"
-    uvicorn_port:            int   = 8000
-    uvicorn_startup_wait_s:  int   = 300   # wait up to 5 min for model to load
-
-    # Prompt patch
-    system_prompt_marker:    str   = "SYSTEM_PROMPT = ("
+DEFAULT_TRAIN_FILE  = _MAPE_DIR / "correction_train_injection.json"
+DEFAULT_OUTPUT_DIR  = _FINE_TUNING_DIR / "outputs" / "spacellm_lora_final"
 
 
 # ---------------------------------------------------------------------------
-# Atomic write helpers
+# CLI
 # ---------------------------------------------------------------------------
 
-def _atomic_write_json(path: Path, data: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
-    tmp.replace(path)
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Continual LoRA correction fine-tuning for SpaceLLM.")
 
+    p.add_argument("--base_model", default="openai/gpt-oss-20b",
+                    help="Base model to load (MXFP4-quantized, dequantized for training).")
+    p.add_argument("--base_adapter", default=None,
+                    help="HF repo id of an existing LoRA adapter to continue training from. "
+                         "Omit to initialize a fresh LoRA from --base_model instead.")
 
-def _append_jsonl(path: Path, record: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(record) + "\n")
+    p.add_argument("--train_file", default=str(DEFAULT_TRAIN_FILE),
+                    help="JSON file of correction records (list of {... , messages: [...]}).")
+    p.add_argument("--output_dir", default=str(DEFAULT_OUTPUT_DIR),
+                    help="Where to save the resulting adapter.")
+
+    p.add_argument("--epochs", type=int, default=3)
+    p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument("--max_seq_len", type=int, default=2048)
+
+    p.add_argument("--lora_r", type=int, default=32)
+    p.add_argument("--lora_alpha", type=int, default=128)
+    p.add_argument("--lora_dropout", type=float, default=0.1)
+    p.add_argument("--target_modules", default="lm_head",
+                    help="Comma-separated module names for LoRA. Default matches your "
+                         "established config (lm_head only).")
+
+    p.add_argument("--per_device_train_batch_size", type=int, default=1)
+    p.add_argument("--gradient_accumulation_steps", type=int, default=8)
+    p.add_argument("--warmup_ratio", type=float, default=0.03)
+    p.add_argument("--max_grad_norm", type=float, default=1.0)
+    p.add_argument("--min_reference_words", type=int, default=3,
+                    help="Skip records whose assistant content has fewer words than this "
+                         "(filters out near-empty / junk corrections).")
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--hf_token_env", default="HF_TOKEN",
+                    help="Name of the env var holding your HF token (for pulling a private "
+                         "--base_adapter). Never pass a literal token here.")
+
+    return p.parse_args()
 
 
 # ---------------------------------------------------------------------------
-# Execution result
+# Data loading
 # ---------------------------------------------------------------------------
 
-@dataclass
-class ExecutionResult:
-    action_id:    str
-    action_type:  str
-    status:       str       # "EXECUTED" | "FAILED" | "SKIPPED"
-    timestamp:    str
-    duration_s:   float
-    details:      dict = field(default_factory=dict)
-    error:        str  = ""
+def load_correction_examples(train_file: Path, min_reference_words: int) -> list[dict]:
+    if not train_file.exists():
+        raise FileNotFoundError(f"Training file not found: {train_file}")
 
-    def to_dict(self) -> dict:
-        return asdict(self)
+    raw = json.loads(train_file.read_text(encoding="utf-8"))
+    if not isinstance(raw, list):
+        raise ValueError(f"Expected a JSON list of records in {train_file}, got {type(raw)}.")
+
+    examples = []
+    skipped = 0
+    for rec in raw:
+        messages = rec.get("messages")
+        if not messages or len(messages) < 2:
+            skipped += 1
+            continue
+        assistant_turns = [m for m in messages if m.get("role") == "assistant"]
+        if not assistant_turns:
+            skipped += 1
+            continue
+        last_assistant = assistant_turns[-1].get("content", "") or ""
+        if len(last_assistant.split()) < min_reference_words:
+            skipped += 1
+            continue
+        examples.append(rec)
+
+    if skipped:
+        log.warning("Skipped %d/%d record(s) (missing/short assistant content).",
+                    skipped, len(raw))
+    if not examples:
+        raise ValueError("No usable training examples after filtering.")
+
+    log.info("Loaded %d usable correction example(s) from %s.", len(examples), train_file)
+    return examples
 
 
-# ---------------------------------------------------------------------------
-# Executor
-# ---------------------------------------------------------------------------
+def build_supervised_example(tokenizer, messages: list[dict], max_seq_len: int) -> dict[str, list[int]]:
+    """
+    Tokenize a [user, assistant] (or longer) conversation and mask every
+    token except the final assistant turn with -100, so loss is only
+    computed on the corrected answer.
+    """
+    prompt_messages = messages[:-1]
 
-class Executor:
+    full_text = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=False,
+    )
+    prompt_text = tokenizer.apply_chat_template(
+        prompt_messages, tokenize=False, add_generation_prompt=True,
+    )
 
-    def __init__(self, config: ExecutorConfig | None = None) -> None:
-        self.config = config or ExecutorConfig()
-        self._state = self._load_state()
-        log.info("Executor initialised.")
+    full_ids = tokenizer(
+        full_text, truncation=True, max_length=max_seq_len, add_special_tokens=False,
+    )["input_ids"]
+    prompt_ids = tokenizer(
+        prompt_text, truncation=True, max_length=max_seq_len, add_special_tokens=False,
+    )["input_ids"]
 
-    # ------------------------------------------------------------------
-    # Public entry point
-    # ------------------------------------------------------------------
+    prompt_len = min(len(prompt_ids), len(full_ids))
+    labels = list(full_ids)
+    for i in range(prompt_len):
+        labels[i] = -100
 
-    def run(self) -> list[ExecutionResult]:
-        log.info("=" * 60)
-        log.info("Executor cycle starting.")
+    return {
+        "input_ids": full_ids,
+        "attention_mask": [1] * len(full_ids),
+        "labels": labels,
+    }
 
-        actions = self._load_pending_actions()
-        if not actions:
-            log.info("No PENDING actions found.")
-            return []
 
-        log.info("Found %d PENDING action(s).", len(actions))
-        # Sort by priority descending — highest priority executes first
-        actions.sort(key=lambda a: a.get("priority", 0), reverse=True)
+def build_dataset(tokenizer, examples: list[dict], max_seq_len: int):
+    from datasets import Dataset
 
-        results: list[ExecutionResult] = []
-        for action in actions:
-            result = self._execute_action(action)
-            results.append(result)
-            _append_jsonl(EXECUTION_LOG, result.to_dict())
-            self._update_action_status(action["action_id"], result.status, result.error)
+    rows = [build_supervised_example(tokenizer, ex["messages"], max_seq_len) for ex in examples]
+    # Drop any example that collapsed to an empty/fully-masked sequence.
+    rows = [r for r in rows if any(l != -100 for l in r["labels"])]
+    if not rows:
+        raise ValueError("All examples collapsed to empty/fully-masked sequences after tokenization.")
+    return Dataset.from_list(rows)
 
-        self._save_state()
-        log.info("Executor cycle complete. %d action(s) processed.", len(results))
-        log.info("=" * 60)
-        return results
 
-    # ------------------------------------------------------------------
-    # Action dispatcher
-    # ------------------------------------------------------------------
+class PaddingCollator:
+    """Pads input_ids/attention_mask/labels to the longest sequence in the batch."""
 
-    def _execute_action(self, action: dict) -> ExecutionResult:
-        action_type = action.get("action_type", "UNKNOWN")
-        action_id   = action.get("action_id", "?")
-        t0          = time.time()
+    def __init__(self, pad_token_id: int):
+        self.pad_token_id = pad_token_id
 
-        log.info("Executing [%s] action_id=%s ...", action_type, action_id[:8])
+    def __call__(self, batch: list[dict]) -> dict:
+        import torch
 
-        try:
-            if action_type == "RETRAIN_ADAPTER":
-                details = self._execute_retrain(action)
-            elif action_type == "PROMPT_PATCH":
-                details = self._execute_prompt_patch(action)
-            elif action_type == "TOPIC_GUARDRAIL":
-                details = self._execute_guardrail(action)
-            elif action_type == "FLAG_FOR_REVIEW":
-                details = self._execute_flag_for_review(action)
-            elif action_type == "NO_ACTION":
-                details = {"message": "No action required this cycle."}
-            else:
-                raise ValueError(f"Unknown action_type: {action_type}")
+        max_len = max(len(b["input_ids"]) for b in batch)
+        input_ids, attention_mask, labels = [], [], []
 
-            return ExecutionResult(
-                action_id   = action_id,
-                action_type = action_type,
-                status      = "EXECUTED",
-                timestamp   = datetime.now(timezone.utc).isoformat(),
-                duration_s  = round(time.time() - t0, 2),
-                details     = details,
-            )
-
-        except Exception as exc:
-            log.error("Action [%s] %s FAILED: %s", action_type, action_id[:8], exc, exc_info=True)
-            return ExecutionResult(
-                action_id   = action_id,
-                action_type = action_type,
-                status      = "FAILED",
-                timestamp   = datetime.now(timezone.utc).isoformat(),
-                duration_s  = round(time.time() - t0, 2),
-                error       = str(exc),
-            )
-
-    # ------------------------------------------------------------------
-    # RETRAIN_ADAPTER
-    # ------------------------------------------------------------------
-
-    def _execute_retrain(self, action: dict) -> dict:
-        payload        = action.get("payload", {})
-        base_version   = payload.get("base_model_version", "SpaceLLM_v1")
-        target_label   = payload.get("target_adapter_label", "SpaceLLM_v2")
-        examples       = payload.get("training_examples", [])
-
-        if not examples:
-            raise ValueError("No training examples in RETRAIN_ADAPTER payload.")
-
-        log.info("Retraining: %s → %s  (%d examples)",
-                 base_version, target_label, len(examples))
-
-        # Step 1 — Build correction training file
-        self._build_correction_train_file(examples)
-
-        # Step 2 — Run fine-tuning script
-        self._run_finetuning(target_label)
-
-        # Step 3 — Push new adapter to HuggingFace
-        new_repo_id = self._push_to_hf(target_label)
-
-        # Step 4 — Update ADAPTER_MODEL_ID in main.py
-        self._update_adapter_in_main_py(new_repo_id, target_label)
-
-        # Step 5 — Mark corrections as used_in_training in feedback_log
-        feedback_ids = [e.get("feedback_id") for e in examples if e.get("feedback_id")]
-        self._mark_corrections_used(feedback_ids)
-
-        # Step 6 — Restart uvicorn with new adapter
-        self._restart_backend()
+        for b in batch:
+            pad_len = max_len - len(b["input_ids"])
+            input_ids.append(b["input_ids"] + [self.pad_token_id] * pad_len)
+            attention_mask.append(b["attention_mask"] + [0] * pad_len)
+            labels.append(b["labels"] + [-100] * pad_len)
 
         return {
-            "base_version":     base_version,
-            "new_version":      target_label,
-            "new_repo_id":      new_repo_id,
-            "examples_used":    len(examples),
-            "feedback_ids_marked": len(feedback_ids),
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
         }
-
-    def _build_correction_train_file(self, examples: list[dict]) -> None:
-        """
-        Convert correction pairs into the training JSON format expected by
-        lora_finetuning_v4.py (same schema as DatasetA_core_QA_v2).
-        Each example becomes a multi-turn conversation:
-          user: [original question]
-          assistant: [human correction / reference answer]
-        """
-        records = []
-        for i, ex in enumerate(examples):
-            question  = (ex.get("question")  or "").strip()
-            reference = (ex.get("reference") or "").strip()
-            if not question or not reference:
-                continue
-
-            records.append({
-                "sample_id":    f"correction_{i:04d}",
-                "source_id":    ex.get("feedback_id", f"fb_{i}"),
-                "mission_name": "MAPE-K Correction",
-                "organization": "SpaceLLM",
-                "aspect":       "correction",
-                "difficulty":   "medium",
-                "chain_id":     f"chain_correction_{i:04d}",
-                "bertscore":    ex.get("bertscore"),
-                "messages": [
-                    {"role": "user",      "content": question},
-                    {"role": "assistant", "content": reference},
-                ],
-            })
-
-        if not records:
-            raise ValueError("No valid correction examples after filtering.")
-
-        CORRECTION_TRAIN_FILE.write_text(
-            json.dumps(records, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        log.info("Correction training file written: %d records → %s",
-                 len(records), CORRECTION_TRAIN_FILE)
-
-    def _run_finetuning(self, target_label: str) -> None:
-        """Run lora_finetuning_v4.py with the correction data injected."""
-        script = self.config.finetune_script
-        if not Path(script).exists():
-            raise FileNotFoundError(f"Fine-tuning script not found: {script}")
-
-        env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = self.config.cuda_visible_devices
-
-        cmd = [
-            sys.executable, script,
-            "--epochs",      str(self.config.finetune_epochs),
-            "--lr",          str(self.config.finetune_lr),
-            "--max_seq_len", str(self.config.finetune_max_seq_len),
-        ]
-
-        log.info("Running fine-tuning: %s", " ".join(cmd))
-        result = subprocess.run(
-            cmd,
-            env     = env,
-            capture_output = False,   # stream output to terminal
-            check   = False,
-        )
-
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Fine-tuning script exited with code {result.returncode}."
-            )
-        log.info("Fine-tuning complete for %s.", target_label)
-
-    def _push_to_hf(self, target_label: str) -> str:
-        """
-        Push the newly trained adapter to HuggingFace Hub.
-        Returns the new repo_id (e.g. AdityaPS/SpaceLLM_v2).
-        """
-        from huggingface_hub import HfApi
-
-        hf_token = os.environ.get(self.config.hf_token_env)
-        if not hf_token:
-            raise EnvironmentError(
-                f"HuggingFace token not found. "
-                f"Set env var: export {self.config.hf_token_env}=<your_token>"
-            )
-
-        # Derive new repo_id from target_label
-        # e.g. "SpaceLLM_v2" → "AdityaPS/SpaceLLM_v2"
-        base_org  = self.config.hf_repo_id.split("/")[0]
-        new_repo  = f"{base_org}/{target_label}"
-
-        api = HfApi(token=hf_token)
-
-        # Create repo if it doesn't exist
-        try:
-            api.create_repo(repo_id=new_repo, repo_type="model", exist_ok=True)
-            log.info("HF repo ready: %s", new_repo)
-        except Exception as exc:
-            raise RuntimeError(f"Failed to create HF repo {new_repo}: {exc}")
-
-        # Upload adapter folder
-        if not ADAPTER_OUTPUT_DIR.exists():
-            raise FileNotFoundError(
-                f"Adapter output directory not found: {ADAPTER_OUTPUT_DIR}"
-            )
-
-        log.info("Uploading adapter from %s → %s ...", ADAPTER_OUTPUT_DIR, new_repo)
-        api.upload_folder(
-            folder_path = str(ADAPTER_OUTPUT_DIR),
-            repo_id     = new_repo,
-            repo_type   = "model",
-            commit_message = f"MAPE-K auto-retrain: {target_label}",
-        )
-        log.info("Adapter pushed to HuggingFace: https://huggingface.co/%s", new_repo)
-        return new_repo
-
-    def _update_adapter_in_main_py(self, new_repo_id: str, target_label: str) -> None:
-        """Update ADAPTER_MODEL_ID in main.py to point at the new adapter."""
-        if not MAIN_PY_PATH.exists():
-            raise FileNotFoundError(f"main.py not found: {MAIN_PY_PATH}")
-
-        content = MAIN_PY_PATH.read_text(encoding="utf-8")
-
-        # Replace ADAPTER_MODEL_ID = "..." line
-        new_content = re.sub(
-            r'ADAPTER_MODEL_ID\s*=\s*"[^"]+"',
-            f'ADAPTER_MODEL_ID    = "{new_repo_id}"',
-            content,
-        )
-        if new_content == content:
-            raise ValueError("Could not find ADAPTER_MODEL_ID in main.py to update.")
-
-        MAIN_PY_PATH.write_text(new_content, encoding="utf-8")
-        log.info("main.py updated: ADAPTER_MODEL_ID → %s", new_repo_id)
-
-    def _mark_corrections_used(self, feedback_ids: list[str]) -> None:
-        """Flip used_in_training=True for all feedback_ids in feedback_log.jsonl."""
-        if not FEEDBACK_LOG.exists() or not feedback_ids:
-            return
-
-        id_set    = set(feedback_ids)
-        updated   = 0
-        new_lines = []
-
-        with FEEDBACK_LOG.open("r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                    if record.get("feedback_id") in id_set:
-                        record["used_in_training"] = True
-                        updated += 1
-                    new_lines.append(json.dumps(record))
-                except json.JSONDecodeError:
-                    new_lines.append(line)
-
-        tmp = FEEDBACK_LOG.with_suffix(".jsonl.tmp")
-        tmp.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
-        tmp.replace(FEEDBACK_LOG)
-        log.info("Marked %d feedback record(s) as used_in_training=True.", updated)
-
-    def _restart_backend(self) -> None:
-        """
-        Kill the running uvicorn process and restart it with the updated main.py.
-        Waits until /health returns ready=true before returning.
-        """
-        import signal as _signal
-
-        # Find uvicorn PID
-        try:
-            result = subprocess.run(
-                ["pgrep", "-f", "uvicorn main:app"],
-                capture_output=True, text=True,
-            )
-            pids = [int(p) for p in result.stdout.strip().split() if p.isdigit()]
-        except Exception:
-            pids = []
-
-        for pid in pids:
-            try:
-                os.kill(pid, _signal.SIGTERM)
-                log.info("Sent SIGTERM to uvicorn PID %d.", pid)
-            except ProcessLookupError:
-                pass
-
-        time.sleep(5)   # give uvicorn time to shut down cleanly
-
-        env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = self.config.cuda_visible_devices
-
-        cmd = [
-            sys.executable, "-m", "uvicorn", "main:app",
-            "--host", self.config.uvicorn_host,
-            "--port", str(self.config.uvicorn_port),
-        ]
-        log.info("Starting uvicorn: %s", " ".join(cmd))
-        subprocess.Popen(cmd, env=env, cwd=str(BASE_DIR))
-
-        # Poll /health until ready
-        import urllib.request
-        health_url = f"http://{self.config.uvicorn_host}:{self.config.uvicorn_port}/health"
-        deadline   = time.time() + self.config.uvicorn_startup_wait_s
-        log.info("Waiting for backend to become ready (up to %ds) ...",
-                 self.config.uvicorn_startup_wait_s)
-
-        while time.time() < deadline:
-            time.sleep(10)
-            try:
-                with urllib.request.urlopen(health_url, timeout=5) as resp:
-                    data = json.loads(resp.read())
-                    if data.get("ready"):
-                        log.info("Backend is ready. New adapter loaded.")
-                        return
-            except Exception:
-                pass
-
-        raise TimeoutError(
-            f"Backend did not become ready within {self.config.uvicorn_startup_wait_s}s."
-        )
-
-    # ------------------------------------------------------------------
-    # PROMPT_PATCH
-    # ------------------------------------------------------------------
-
-    def _execute_prompt_patch(self, action: dict) -> dict:
-        payload    = action.get("payload", {})
-        patch_text = payload.get("patch_text", "").strip()
-        patch_key  = payload.get("patch_key", "unknown")
-
-        if not patch_text:
-            raise ValueError("patch_text is empty in PROMPT_PATCH payload.")
-
-        if not MAIN_PY_PATH.exists():
-            raise FileNotFoundError(f"main.py not found: {MAIN_PY_PATH}")
-
-        content = MAIN_PY_PATH.read_text(encoding="utf-8")
-
-        # Find the SYSTEM_PROMPT block and append the patch as a new sentence
-        marker = self.config.system_prompt_marker
-        idx    = content.find(marker)
-        if idx == -1:
-            raise ValueError(f"Could not find '{marker}' in main.py.")
-
-        # Find the closing paren of the SYSTEM_PROMPT tuple
-        close_idx = content.find("\n)", idx)
-        if close_idx == -1:
-            raise ValueError("Could not find closing paren of SYSTEM_PROMPT in main.py.")
-
-        # Insert patch as last line of SYSTEM_PROMPT before closing paren
-        patch_line = f'    "{patch_text}"'
-        new_content = (
-            content[:close_idx]
-            + "\n"
-            + patch_line
-            + content[close_idx:]
-        )
-
-        MAIN_PY_PATH.write_text(new_content, encoding="utf-8")
-        log.info("Prompt patch '%s' applied to main.py.", patch_key)
-
-        # Restart backend to pick up new prompt
-        self._restart_backend()
-
-        return {
-            "patch_key":  patch_key,
-            "patch_text": patch_text,
-            "applied_to": str(MAIN_PY_PATH),
-        }
-
-    # ------------------------------------------------------------------
-    # TOPIC_GUARDRAIL
-    # ------------------------------------------------------------------
-
-    def _execute_guardrail(self, action: dict) -> dict:
-        payload = action.get("payload", {})
-        record  = {
-            "type":           "TOPIC_GUARDRAIL",
-            "action_id":      action.get("action_id"),
-            "timestamp":      datetime.now(timezone.utc).isoformat(),
-            "topics":         payload.get("topics_reported", []),
-            "topic_specific": payload.get("topic_specific", False),
-            "suggestion":     payload.get("suggested_action", ""),
-            "reasoning":      action.get("reasoning", []),
-        }
-        _append_jsonl(HUMAN_REVIEW_QUEUE, record)
-        log.info("Topic guardrail logged to human_review_queue.jsonl.")
-        return {"written_to": str(HUMAN_REVIEW_QUEUE)}
-
-    # ------------------------------------------------------------------
-    # FLAG_FOR_REVIEW
-    # ------------------------------------------------------------------
-
-    def _execute_flag_for_review(self, action: dict) -> dict:
-        payload = action.get("payload", {})
-        record  = {
-            "type":              "FLAG_FOR_REVIEW",
-            "action_id":         action.get("action_id"),
-            "timestamp":         datetime.now(timezone.utc).isoformat(),
-            "flagged_questions": payload.get("flagged_questions", []),
-            "reasoning":         action.get("reasoning", []),
-        }
-        _append_jsonl(HUMAN_REVIEW_QUEUE, record)
-        log.info("Flagged %d question(s) for human review.",
-                 len(payload.get("flagged_questions", [])))
-        return {
-            "flagged_count": len(payload.get("flagged_questions", [])),
-            "written_to":    str(HUMAN_REVIEW_QUEUE),
-        }
-
-    # ------------------------------------------------------------------
-    # plan_actions.jsonl management
-    # ------------------------------------------------------------------
-
-    def _load_pending_actions(self) -> list[dict]:
-        if not PLAN_ACTIONS_LOG.exists():
-            return []
-
-        pending = []
-        seen    = set()
-        with PLAN_ACTIONS_LOG.open("r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    action = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                aid = action.get("action_id")
-                if not aid or aid in seen:
-                    continue
-                seen.add(aid)
-
-                if action.get("status") == "PENDING":
-                    pending.append(action)
-
-        return pending
-
-    def _update_action_status(
-        self, action_id: str, status: str, error: str = ""
-    ) -> None:
-        """Rewrite plan_actions.jsonl updating the status of one action."""
-        if not PLAN_ACTIONS_LOG.exists():
-            return
-
-        new_lines = []
-        with PLAN_ACTIONS_LOG.open("r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                    if record.get("action_id") == action_id:
-                        record["status"]      = status
-                        record["executed_at"] = datetime.now(timezone.utc).isoformat()
-                        if error:
-                            record["error"] = error
-                    new_lines.append(json.dumps(record))
-                except json.JSONDecodeError:
-                    new_lines.append(line)
-
-        tmp = PLAN_ACTIONS_LOG.with_suffix(".jsonl.tmp")
-        tmp.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
-        tmp.replace(PLAN_ACTIONS_LOG)
-
-    # ------------------------------------------------------------------
-    # State persistence
-    # ------------------------------------------------------------------
-
-    def _load_state(self) -> dict:
-        if STATE_FILE.exists():
-            try:
-                return json.loads(STATE_FILE.read_text())
-            except Exception as exc:
-                log.warning("Could not load executor state (%s). Starting fresh.", exc)
-        return {}
-
-    def _save_state(self) -> None:
-        _atomic_write_json(STATE_FILE, self._state)
 
 
 # ---------------------------------------------------------------------------
-# CLI entry point
+# Model loading
 # ---------------------------------------------------------------------------
+
+def load_model_and_tokenizer(args: argparse.Namespace):
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(args.base_model)
+    if tokenizer.pad_token is None:
+        # Reuse eos as pad — do NOT resize embeddings for this.
+        tokenizer.pad_token = tokenizer.eos_token
+
+    quantization_config = None
+    try:
+        from transformers import Mxfp4Config
+        quantization_config = Mxfp4Config(dequantize=True)
+        log.info("Using Mxfp4Config(dequantize=True) for trainable MXFP4 weights.")
+    except ImportError:
+        log.warning(
+            "Mxfp4Config not available in this transformers version. Loading without "
+            "explicit MXFP4 dequantization — if you hit a 'quantized tensor has no "
+            "grad_fn' style error, upgrade transformers."
+        )
+
+    load_kwargs: dict[str, Any] = dict(
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+    )
+    if quantization_config is not None:
+        load_kwargs["quantization_config"] = quantization_config
+
+    log.info("Loading base model %s ...", args.base_model)
+    base_model = AutoModelForCausalLM.from_pretrained(args.base_model, **load_kwargs)
+    base_model.config.use_cache = False  # required alongside gradient checkpointing
+
+    from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
+
+    base_model = prepare_model_for_kbit_training(base_model, use_gradient_checkpointing=True)
+
+    if args.base_adapter:
+        hf_token = os.environ.get(args.hf_token_env)
+        log.info("Loading existing adapter for continual training: %s", args.base_adapter)
+        model = PeftModel.from_pretrained(
+            base_model, args.base_adapter, is_trainable=True, token=hf_token,
+        )
+    else:
+        target_modules = [m.strip() for m in args.target_modules.split(",") if m.strip()]
+        log.info("No --base_adapter given — initializing fresh LoRA (r=%d, alpha=%d, targets=%s).",
+                  args.lora_r, args.lora_alpha, target_modules)
+        lora_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            target_modules=target_modules,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(base_model, lora_config)
+
+    model.print_trainable_parameters()
+    return model, tokenizer
+
+
+# ---------------------------------------------------------------------------
+# NaN guard
+# ---------------------------------------------------------------------------
+
+class NaNGuardCallback:
+    """
+    transformers.TrainerCallback subclass built lazily (after transformers
+    is imported) — see make_nan_guard_callback() below. Stops training the
+    moment a NaN/Inf loss is logged, so we never save or push a broken
+    adapter.
+    """
+    nan_detected: bool = False
+
+
+def make_nan_guard_callback():
+    from transformers import TrainerCallback
+
+    class _NaNGuard(TrainerCallback, NaNGuardCallback):
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if not logs or "loss" not in logs:
+                return control
+            loss = logs["loss"]
+            if loss is None or (isinstance(loss, float) and (math.isnan(loss) or math.isinf(loss))):
+                log.error("NaN/Inf loss detected at step %s — stopping training.", state.global_step)
+                self.nan_detected = True
+                control.should_training_stop = True
+            return control
+
+    return _NaNGuard()
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> int:
+    args = parse_args()
+
+    import torch
+    from transformers import Trainer, TrainingArguments
+
+    torch.manual_seed(args.seed)
+
+    train_file = Path(args.train_file)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    examples = load_correction_examples(train_file, args.min_reference_words)
+    model, tokenizer = load_model_and_tokenizer(args)
+    dataset = build_dataset(tokenizer, examples, args.max_seq_len)
+    collator = PaddingCollator(pad_token_id=tokenizer.pad_token_id)
+
+    nan_guard = make_nan_guard_callback()
+
+    training_args = TrainingArguments(
+        output_dir=str(output_dir / "_trainer_ckpts"),
+        num_train_epochs=args.epochs,
+        learning_rate=args.lr,
+        per_device_train_batch_size=args.per_device_train_batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        warmup_ratio=args.warmup_ratio,
+        max_grad_norm=args.max_grad_norm,
+        logging_steps=1,
+        save_strategy="no",
+        bf16=True,
+        gradient_checkpointing=True,
+        report_to=[],
+        seed=args.seed,
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=dataset,
+        data_collator=collator,
+        callbacks=[nan_guard],
+    )
+
+    log.info("Starting training: %d example(s), %d epoch(s), lr=%s, max_seq_len=%d",
+              len(dataset), args.epochs, args.lr, args.max_seq_len)
+    trainer.train()
+
+    if nan_guard.nan_detected:
+        log.error("Training aborted due to NaN/Inf loss. Adapter NOT saved.")
+        return 1
+
+    log.info("Saving adapter to %s ...", output_dir)
+    model.save_pretrained(str(output_dir))
+    tokenizer.save_pretrained(str(output_dir))
+
+    metadata = {
+        "base_model": args.base_model,
+        "base_adapter": args.base_adapter,
+        "examples_used": len(dataset),
+        "epochs": args.epochs,
+        "lr": args.lr,
+        "max_seq_len": args.max_seq_len,
+        "lora_r": args.lora_r,
+        "lora_alpha": args.lora_alpha,
+        "target_modules": args.target_modules,
+        "trained_at": datetime.now(timezone.utc).isoformat(),
+    }
+    (output_dir / "training_metadata.json").write_text(
+        json.dumps(metadata, indent=2), encoding="utf-8",
+    )
+
+    log.info("Done. Adapter saved → %s", output_dir)
+    return 0
+
 
 if __name__ == "__main__":
-    executor = Executor()
-    results  = executor.run()
-
-    print(f"\n{'='*60}")
-    print(f"  SpaceLLM Executor — Cycle Complete")
-    print(f"{'='*60}")
-    if not results:
-        print("  No actions executed.")
-    else:
-        for r in results:
-            icon = "✓" if r.status == "EXECUTED" else "✗"
-            print(f"  {icon} [{r.action_type:<16}] {r.status:<8}  ({r.duration_s:.1f}s)")
-            if r.error:
-                print(f"    ERROR: {r.error}")
-    print(f"\n  Execution log → {EXECUTION_LOG}")
-    print(f"  Review queue  → {HUMAN_REVIEW_QUEUE}")
-    print(f"{'='*60}\n")
+    sys.exit(main())
