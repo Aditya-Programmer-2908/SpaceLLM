@@ -1,0 +1,414 @@
+{
+  "run_id": "991579cc-3adf-43cc-ac50-eb15638fff81",
+  "timestamp": "2026-06-20T16:40:48.528721+00:00",
+  "model_version": "SpaceLLM_v1",
+  "severity": "CRITICAL",
+  "should_retrain": true,
+  "retrain_trigger_reasons": [
+    "negative_rate 27.6% >= 20% (MEDIUM)",
+    "mean_bertscore 0.2139 < 0.84 (CRITICAL)",
+    "corrections_unused 32 >= 30 (HIGH)"
+  ],
+  "signals": {
+    "total_feedback": 127,
+    "positive_count": 92,
+    "negative_count": 35,
+    "negative_rate": 0.2755905511811024,
+    "correction_pairs": 32,
+    "corrections_unused": 32,
+    "mean_bertscore": 0.213874,
+    "min_bertscore": -0.394764,
+    "low_bertscore_count": 12,
+    "hallucination_count": 1,
+    "incomplete_answer_count": 1,
+    "repeated_failure_count": 0,
+    "domain_drift_count": 0,
+    "event_type_breakdown": {
+      "POSITIVE_FEEDBACK": 20,
+      "NEGATIVE_FEEDBACK": 12,
+      "HUMAN_CORRECTION": 12,
+      "POSSIBLE_HALLUCINATION": 1,
+      "INCOMPLETE_ANSWER": 1
+    }
+  },
+  "corrections_for_training": [
+    {
+      "feedback_id": "1532ed6b-ee5c-4b04-ab37-d8a9f1d3b697",
+      "question": "apollo 18",
+      "candidate": "finalfinalfinalfinal",
+      "reference": "blank response",
+      "bertscore": null,
+      "timestamp": "2026-06-19T07:00:17.243Z",
+      "model_version": "SpaceLLM_v1"
+    },
+    {
+      "feedback_id": "3fef455a-7ea2-4f49-acac-8945f1366961",
+      "question": "tell me about apollo 18 on the moon",
+      "candidate": "finalfinalfinalfinalfinal",
+      "reference": "again blank",
+      "bertscore": null,
+      "timestamp": "2026-06-19T07:00:39.035Z",
+      "model_version": "SpaceLLM_v1"
+    },
+    {
+      "feedback_id": "91167195-7997-46e1-8a8f-0d12c702ad28",
+      "question": "tell me about neil armstrong",
+      "candidate": "The user is asking about a figure outside the space domain, specifically a human astronaut. This falls within the space domain. The user wants general information about Neil Armstrong, who is a notable astronaut, so we can comply. The user may want more context. The assistant should answer. The user might want more info about Armstrong's achievements. The assistant can respond with a concise summary of Armstrong's space career and achievements. The user is not asking for disallowed content. The assistant can provide the information. The user specifically: \"tell me about neil armstrong\". The assistant should provide a concise answer. The assistant should comply. The assistant will respond with a concise summary of Armstrong's life and achievements. The user may want more details. The assistant can respond with a short overview. The user might want to ask follow-up about Armstrong's later life or NASA's Apollo 11 mission. The assistant can respond with an overview of his early life, NASA career, Apollo 11 mission, later career and death. The assistant can provide the timeline of his career. The assistant can also mention his contributions to space exploration. The assistant should ensure to not mention the policy. The assistant's answer should be accurate and concise. The assistant can also mention the significance of Armstrong's \"One small step...\" speech. The assistant can mention that Armstrong was born in 1930 and died in 2012. The assistant can mention his contributions to NASA's Apollo program. The assistant can mention that he was a test pilot. The assistant can mention that he was also a professor of aerospace engineering at the University of Cincinnati. The assistant can mention that he was a recipient of the Presidential Medal of Freedom, NASA Distinguished Service Medal, etc. The assistant can mention that he was a pilot in the US Navy. The assistant can mention that he was known for his calm demeanor and his role in the Apollo 11 mission. The assistant can mention that he was a public figure and a symbol of space exploration. The assistant can mention that he was born in Wapakoneta, Ohio. The assistant can mention that he studied physics at Purdue University. The assistant can mention that he was part of the Mercury 4 program. The assistant can mention that he was a test pilot for NASA. The assistant can mention that he was a test pilot for the X-15 program. The assistant can mention that he was a teacher. The assistant can mention that he was a NASA astronaut. The assistant can mention that he was a NASA test pilot. The assistant can mention that he",
+      "reference": "irrelevant text",
+      "bertscore": null,
+      "timestamp": "2026-06-19T10:39:02.379Z",
+      "model_version": "SpaceLLM_v1"
+    },
+    {
+      "feedback_id": "35f13388-67e7-4ffe-8bb9-a315d7364cd7",
+      "question": "give it bullet points",
+      "candidate": "The Apollo 11 mission was a historic achievement in human space exploration, marking the first time humans landed on the Moon and returned safely to Earth. It was also a mission with a number of scientific experiments that did not meet their goals due to various constraints and issues. The mission's achievements include the successful launch of the spacecraft, the successful landing of the Lunar Module on the lunar surface, the successful completion of the lunar surface exploration, and the successful return of the crew to Earth. The mission's failures are in the space of the scientific experiments that did not meet their goals, due to the space of the space space space space space space.",
+      "reference": "not able to give in bullet points",
+      "bertscore": null,
+      "timestamp": "2026-06-19T10:52:49.660Z",
+      "model_version": "SpaceLLM_v1"
+    },
+    {
+      "feedback_id": "6e530e7a-35c8-41bb-820d-07e7690ed017",
+      "question": "which missions were there before apollo 11",
+      "candidate": "The Apollo 11 mission was preceded by a series of missions that laid the groundwork for humans to land on the Moon. These missions included the early Apollo missions, which were designed to test the capabilities of the spacecraft and the safety of the astronauts in space. The missions were designed to test the capabilities of the spacecraft, and the safety of the astronauts. The missions to the planet and the space of the planet, the missions of the mission, which are all of the intended space space.",
+      "reference": "not that detailed",
+      "bertscore": null,
+      "timestamp": "2026-06-19T11:03:44.474Z",
+      "model_version": "SpaceLLM_v1"
+    },
+    {
+      "feedback_id": "80d9cb2c-1918-4b85-aeed-6a7912e7fb0e",
+      "question": "explain in short about each of them",
+      "candidate": "The user is asking for a short description of each of the missions. The assistant should provide a concise bullet list of missions with brief description. The user is specifically interested in missions before Apollo 11. The assistant should include Gemini 3-11 and Apollo 4-9. The user may not be interested in the later Apollo missions (10 and beyond). The assistant's previous messages incorrectly included some erroneous content. The assistant must correct that. The assistant should provide a short description for each mission. The user wants \"explain in short about each of them\". The assistant should produce a short bullet list. The assistant should ensure the information is accurate. The assistant must ensure to not include extraneous or incorrect data. The assistant should also not mention the user incorrectly. The assistant should not mention the user in the response. The assistant should not mention the assistant. The assistant can provide a short bullet list. The assistant should not mention the previous assistant's errors. The assistant can provide a short summary of each mission. The assistant can mention that Gemini 3 was the first manned Gemini flight, etc. The assistant can provide short description of each mission. The assistant should be concise. The assistant can include a short description of each mission. The assistant should ensure to provide accurate information. The assistant can provide the answer. The assistant should not mention the previous assistant's errors. The assistant can respond with bullet points. The assistant should not mention the user or the assistant. The assistant should not mention the system. The assistant should not mention the user. The assistant can respond with bullet points. The assistant can mention the short description of each mission. The assistant can also mention the significance of each mission. The assistant should not mention \"The assistant's previous messages incorrectly included some erroneous content.\" The assistant should not mention the previous assistant's errors. The assistant can just provide the answer. The assistant should ensure the answer is correct. The assistant can provide a short bullet point for each mission. The assistant should not mention \"The assistant's previous messages incorrectly included some erroneous content.\" The assistant should not mention \"The assistant's previous messages incorrectly included some erroneous content.\" The assistant can provide a short bullet point for each mission. The assistant should ensure to include the correct missions. The assistant should ensure that the missions are correct. The assistant can provide the answer. The assistant can produce the answer. The assistant should not mention the previous assistant's errors. The assistant should not mention the user. The assistant can provide the answer. The assistant can also include",
+      "reference": "failure",
+      "bertscore": null,
+      "timestamp": "2026-06-19T11:06:32.967Z",
+      "model_version": "SpaceLLM_v1"
+    },
+    {
+      "feedback_id": "30c8a5a1-77c9-4f69-bffd-ebd392ba3020",
+      "question": "ISRO's lunar missions",
+      "candidate": "The user is asking about ISRO's lunar missions. The assistant is allowed to answer about space domain. The assistant should provide accurate information. The user likely wants an overview of ISRO's lunar missions. The assistant should mention Chandrayaan-1, Chandrayaan-2, Chandrayaan-3. Also mention the details. The assistant should ensure to provide correct dates and achievements. The assistant should not mention the previous assistant's errors. The assistant should be concise. The assistant should respond with correct information. The assistant should not mention the system. The assistant should provide an accurate answer. The assistant can mention Chandrayaan-1 launched in 2008, Chandrayaan-2 launched in 2019, Chandrayaan-3 launched in 2023. The assistant can mention the goals and achievements of each. The assistant can mention the success of Chandrayaan-3 landing. The assistant can mention the success of Chandrayaan-1 discovery of water molecules. The assistant can mention Chandrayaan-2's Vikram lander attempted but did not land. The assistant can mention Chandrayaan-3's Vikram 3, which landed successfully. The assistant can mention the instruments. The assistant can mention the significance. The assistant should be concise. The assistant can also mention the future missions. The assistant can mention Chandrayaan-4. The assistant should not mention the user. The assistant should not mention the system. The assistant should not mention the previous assistant's errors. The assistant should respond with a short introduction. The assistant can provide bullet points. The assistant can provide short. The assistant can provide a short summary. The assistant can respond with \"The ISRO's lunar missions include Chandrayaan-1, Chandrayaan-2, and Chandrayaan-3. Chandrayaan-1 was launched in 2008, etc. Chandrayaan-2 launched in 2019, etc. Chandrayaan-3 launched in 2023, etc. The assistant can also mention Chandrayaan-4 is planned for 2025. The assistant can mention the achievements of each. The assistant can also mention the instruments. The assistant can mention the success of Chandrayaan-3. The assistant can also mention the significance of Chandrayaan-1's discovery of water. The assistant can also mention the Chandrayaan-2 Vikram lander did not land. The assistant can mention the Chandrayaan-3 Vikram 3 landed successfully. The assistant",
+      "reference": "inaccurate response",
+      "bertscore": null,
+      "timestamp": "2026-06-19T11:12:50.530Z",
+      "model_version": "SpaceLLM_v1"
+    },
+    {
+      "feedback_id": "02da05cc-0317-4c67-8c41-d9d6a658e04d",
+      "question": "are their collaborations",
+      "candidate": "The user is asking about collaborations on ISRO's upcoming lunar missions. The assistant should provide accurate information. The user may be interested in which international partners are involved. The assistant can mention Chandrayaan-4 will be a collaboration with NASA, ESA, and other agencies. The assistant can mention that Chandrayaan-5 will involve cooperation with NASA and JAXA, as well as potential collaboration with other space agencies. The assistant should provide accurate information. The assistant can also mention that ISRO's Chandrayaan-3 mission had no international collaboration. The assistant can also mention that the Chandrayaan-4 mission will be a collaboration with NASA and other agencies, which may include the European Space Agency (ESA). The assistant should ensure to not mention the system. The assistant should provide correct information. The assistant can provide a short answer. The assistant should not mention the user. The assistant should not mention the system. The assistant should not mention the previous assistant's errors. The assistant can provide a short answer. The assistant should ensure to mention the correct information. The assistant can mention that Chandrayaan-4 is a collaboration with NASA and ESA. The assistant can mention that Chandrayaan-5 will involve NASA and JAXA. The assistant should ensure to not mention the user. The assistant can provide the answer. The assistant can also mention that ISRO has collaborated with NASA on Chandrayaan-3. The assistant can also mention that the Chandrayaan-4 mission is planned to be a joint mission with NASA. The assistant can also mention that the Chandrayaan-5 mission will be a joint mission with NASA, JAXA, and other agencies. The assistant can also mention that the Chandrayaan-4 mission is planned for launch in 2026. The assistant can also mention that Chandrayaan-5 mission will involve sample return from the Moon. The assistant can provide a short answer. The assistant should ensure the answer is accurate. The assistant should not mention the user. The assistant should not mention the system. The assistant should not mention the previous assistant's errors. The assistant can respond with the correct information. The assistant can also mention that Chandrayaan-4 will involve NASA's Lunar Reconnaissance Orbiter (LRO) and Chandrayaan-5 will involve NASA's Lunar Atmosphere and Dust Environment Explorer (LADEE) and JAXA's SELENE. The assistant can also mention that Chandrayaan-5 will involve NASA's Lunar CRater Observation and S",
+      "reference": "failure",
+      "bertscore": null,
+      "timestamp": "2026-06-19T11:18:41.077Z",
+      "model_version": "SpaceLLM_v1"
+    },
+    {
+      "feedback_id": "2fda54e9-50c7-4bbe-a3de-64088c477dc8",
+      "question": "What is ISRO",
+      "candidate": "The user is asking for an introduction to ISRO. The assistant should provide a concise, accurate description of the Indian Space Research Organization. The assistant should include the establishment year, mission, key achievements, and structure. The assistant should not mention the system. The assistant should not mention the user. The assistant should not mention previous assistant errors. The assistant should respond with a short introduction to ISRO. The assistant can mention: Founded in 1969, ISRO is India's national space agency, responsible for space exploration, satellite launches, and scientific research. ISRO has launched numerous satellites, including Chandrayaan missions, Mangalyaan, and PSLV and GSLV rocket series. The assistant can mention the structure: ISRO's headquarters in Bengaluru, with centers like the Liquid Propulsion Systems Center (LPSC), the Vikram Sarabhai Space Centre (VSSC), etc. The assistant can mention that ISRO's mission includes space exploration and technology development. The assistant can mention its achievements. The assistant can mention that ISRO's approach includes cost-effective and indigenous technologies. The assistant can provide a short answer. The assistant can respond. The assistant will answer. The assistant will not mention the system. The assistant will not mention the user. The assistant will not mention the previous assistant's errors. The assistant will provide a concise answer. The assistant will respond with an introduction to ISRO. The assistant will provide. The assistant will respond. The assistant will answer. The assistant will respond. The assistant will answer. The assistant will respond. The assistant will answer. The assistant will respond with final. The assistant will respond. The assistant will answer. The assistant will respond. The assistant will answer. The assistant will respond. The assistant will answer. The assistant will respond. The assistant will answer. The assistant will respond with final. The assistant will answer. The assistant will respond with final. The assistant will answer. The assistant will respond with final. The assistant will answer. The assistant will respond with final. The assistant will answer. The assistant will respond with final. The assistant will answer. The assistant will respond with final. The assistant will answer. The assistant will respond with final. The assistant will answer. The assistant will respond with final. The assistant will answer. The assistant will respond with final. The assistant will answer. The assistant will respond with final. The assistant will answer. The assistant will respond with final. The assistant will answer. The assistant will respond with final. The assistant will answer. The",
+      "reference": "again inaccurate responses",
+      "bertscore": null,
+      "timestamp": "2026-06-19T11:20:03.846Z",
+      "model_version": "SpaceLLM_v1"
+    },
+    {
+      "feedback_id": "6dc55bc8-9db6-4077-a88d-a28a50612868",
+      "question": "tell me about LLM transformers",
+      "candidate": "Neil A. Armstrong was born on August 5, 1930, in Wapakoneta, Ohio, and passed away on August 25, 2012. He was an American naval aviator, test pilot, and astronaut, best known for being the first person to set foot on the Moon during the historic Apollo 11 mission, which landed on July 20, 1969. This achievement made him a global icon and solidified his place in history as a pioneering figure in human space exploration.",
+      "reference": "blank Response",
+      "bertscore": null,
+      "timestamp": "2026-06-19T12:23:34.870Z",
+      "model_version": "SpaceLLM_v1"
+    },
+    {
+      "feedback_id": "4494a0d5-723b-46a4-9396-f108ae5283b0",
+      "question": "great you are doing well",
+      "candidate": "I’m focused on space and satellite technology. For information about Shah Rukh Khan, you might want to check a film or entertainment resource. If you have any questions related to space exploration, astronomy, or spacecraft engineering, feel free to ask!",
+      "reference": "blank reply not allowed",
+      "bertscore": null,
+      "timestamp": "2026-06-19T13:18:03.733Z",
+      "model_version": "SpaceLLM_v1"
+    },
+    {
+      "feedback_id": "7a926b0d-88c3-45a1-8461-557e14d76cc0",
+      "question": "tell me about satellite launches in near time",
+      "candidate": "Below is a curated list of the most significant satellite launches expected in the near future. The information includes the launch vehicle, launch site, date, and mission objective. These launches involve a variety of payloads, including Earth observation, communications, scientific research, and interplanetary missions.",
+      "reference": "not names and timeline given",
+      "bertscore": null,
+      "timestamp": "2026-06-19T13:28:30.175Z",
+      "model_version": "SpaceLLM_v1"
+    },
+    {
+      "feedback_id": "dc84a694-ffb6-4e81-9e84-ad47e8888e9e",
+      "question": "again",
+      "candidate": "Below is the up-to-date launch timeline for the key NASA missions due in the near future. The dates are given in UTC and include the launch vehicle and site. This is intended to be a quick reference for planning and tracking purposes.",
+      "reference": "blank response",
+      "bertscore": null,
+      "timestamp": "2026-06-19T13:47:44.404Z",
+      "model_version": "SpaceLLM_v1"
+    },
+    {
+      "feedback_id": "d7dbeeb7-c98f-448e-8667-ad610dec5b2b",
+      "question": "a bit detail",
+      "candidate": "The Apollo 11 mission provided the first in‑flight demonstration of the technology necessary for human lunar exploration. The mission involved a complex integration of spacecraft systems, rigorous preflight preparation, and precise flight operations. The following is a detailed technical summary of the mission, including the spacecraft design, launch sequence, flight timeline, crew activities, and scientific results. This information is drawn from primary mission documents, the Apollo 11 Mission Report, and postflight analyses.",
+      "reference": "it lacks the following part",
+      "bertscore": null,
+      "timestamp": "2026-06-19T15:20:44.989Z",
+      "model_version": "SpaceLLM_v1"
+    },
+    {
+      "feedback_id": "8e244e6c-9898-4b72-b84f-c5fca3295262",
+      "question": "tell me about apollo 11",
+      "candidate": "Apollo 11 was the first crewed mission to land humans on the Moon. Key details include the timeline, crew, spacecraft, and mission results. For a concise technical overview, see the points below.",
+      "reference": "nothing shown below",
+      "bertscore": null,
+      "timestamp": "2026-06-19T15:33:17.924Z",
+      "model_version": "SpaceLLM_v1"
+    },
+    {
+      "feedback_id": "8f51e184-3551-45c8-a30e-db0979b2e52e",
+      "question": "tell me about them in details",
+      "candidate": "The Apollo 11 mission included several scientific experiments on the lunar surface. These included seismometers to detect moonquakes and other geological activity, as well as various instruments to measure the Moon's magnetic field, radiation levels, and other scientific data. The mission also included experiments related to the study of the Earth's atmosphere.",
+      "reference": "same response",
+      "bertscore": null,
+      "timestamp": "2026-06-19T15:55:54.343Z",
+      "model_version": "SpaceLLM_v1"
+    },
+    {
+      "feedback_id": "dcfdac8e-ff62-4573-9c08-326bc685f306",
+      "question": "what were the outcomes of the research tell in details",
+      "candidate": "The primary objectives of the Apollo 11 mission were to demonstrate the capability of humans to travel to the Moon and return safely to Earth, and to conduct scientific exploration of the lunar surface. These objectives were articulated by President John F. Kennedy in his 1961 speech and were formalized by NASA as follows:\n\n1. **Human Lunar Landing**  \n   - Command a spacecraft to the Moon.  \n   - Land a crew of two astronauts on the lunar surface.  \n   - Return those astronauts safely to the Command Module.  \n   - Re‑enter Earth atmosphere and land in the Atlantic Ocean.  \n\n2. **Scientific Investigation**  \n   - Deploy scientific instruments on the lunar surface.  \n   - Collect and return to Earth samples of lunar soil and rocks.  \n   - Conduct experiments to measure the lunar environment.  \n\n3. **Operational Demonstration**  \n   - Demonstrate the use of the Lunar Module for descent and ascent.  \n   - Test rendezvous and docking techniques in lunar orbit.  \n   - Validate the safety and reliability of the Saturn V launch system.  \n\n4. **Public and Technical Milestone**  \n   - Provide data to support future lunar missions.  \n   - Inspire public interest in space exploration.  \n\nThe mission successfully met all of these objectives, marking a critical step in human space exploration.",
+      "reference": "terminated",
+      "bertscore": null,
+      "timestamp": "2026-06-19T16:39:26.471Z",
+      "model_version": "SpaceLLM_v1"
+    },
+    {
+      "feedback_id": "b8199f20-2114-4805-8721-b39d61516d68",
+      "question": "tell me about apollo 11",
+      "candidate": "Apollo 11 was the first crewed mission to land humans on the Moon. Key details include the launch date, crew, spacecraft components, mission timeline, and scientific achievements. For a concise technical overview, see the bullet points below.",
+      "reference": "again not giving the bullet points",
+      "bertscore": null,
+      "timestamp": "2026-06-19T16:44:12.760Z",
+      "model_version": "SpaceLLM_v1"
+    },
+    {
+      "feedback_id": "6c6f62f3-e4f3-41fd-88c8-6fd82d40fd0f",
+      "question": "tell me about perseverance",
+      "candidate": "Hi there! What would you like to explore about space today?",
+      "reference": "improper",
+      "bertscore": null,
+      "timestamp": "2026-06-19T18:28:20.712Z",
+      "model_version": "SpaceLLM_v1"
+    },
+    {
+      "feedback_id": "3416e125-82f8-4b7e-8135-73267f151d9c",
+      "question": "give in bullet points",
+      "candidate": "I specialise in space missions. Please consult a general-purpose assistant. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions. The response was provided following the instructions.",
+      "reference": "alignment issues",
+      "bertscore": null,
+      "timestamp": "2026-06-19T19:32:27.482Z",
+      "model_version": "SpaceLLM_v1"
+    },
+    {
+      "feedback_id": "ac5d06ec-8005-41e7-aad5-835fe5f81b5d",
+      "question": "tell me about perseverance",
+      "candidate": "The Mars 2020 Perseverance rover has redefined the exploration of Martian geology and astrobiology. Launched aboard an Atlas V 541 rocket from Cape Canaveral on July 30, 2020, it entered Mars orbit following a 10.5-month journey. Its entry, descent, and landing sequence utilized a unique “Sky Crane” maneuver, allowing it to touch down precisely within Jezero Crater, a remnant lake basin that once harbored a delta and an ancient river system. The rover's landing coordinates were 18.444° N latitude and 77.450° E longitude, placing it in one of Mars' most geologically promising sites for signs of past life and water activity. This location was chosen after detailed analysis of high-resolution imagery from MRO's CTX camera, which revealed sedimentary layers indicative of fluvial processes. Additionally, the InSight mission provided constraints on the region's seismic activity, ensuring a relatively stable surface environment. The rover's landing success marked the first time a spacecraft landed within a crater that also hosts a well-preserved paleolake. This dual achievement required precise navigation and a robust communication link back to Earth, facilitated by Deep Space Network antennas. The rover's instruments include the Navigation and Hazard Avoidance Cameras (NACs) and Hazard Detection Cameras (HDCs), which together create 3D maps of the terrain to avoid obstacles during autonomous driving. Another key payload is the Mars Oxygen In-Situ Resource Utilization Experiment (MOXIE), which tests the production of breathable oxygen from CO2. MOXIE uses solid oxide electrolysis at 800°C to split carbon dioxide into oxygen and carbon monoxide, demonstrating a potential technology for future human missions. The rover also carries SuperCam, which can analyze rocks remotely using laser-induced breakdown spectroscopy (LIBS). This technique vaporizes a tiny portion of the target, creating a plasma whose spectral lines are then recorded to determine elemental composition. The instrument's ability to measure isotopic ratios—such as nitrogen, carbon, and sulfur isotopes—provides insights into the atmospheric evolution and potential biosignatures. Perseverance's sample collection operation involves its robotic arm equipped with a drill and a scoop. It has collected more than 100 samples, each sealed in metal tubes designed to preserve organic compounds. These samples will eventually be transported back to Earth, likely by NASA's Sample Retrieval Lander. Additionally, Perseverance launched two small rovers, InSight, and the Mars Recon",
+      "reference": "incomplete response",
+      "bertscore": null,
+      "timestamp": "2026-06-20T10:01:27.952Z",
+      "model_version": "SpaceLLM_v1"
+    },
+    {
+      "feedback_id": "48b3dd5c-740e-4cfe-af3b-438e37510c95",
+      "question": "provide me details of perseverance rover",
+      "candidate": "The Mars Perseverance Rover has significantly advanced our understanding of the Martian surface and its potential habitability. Launched on July 30, 2020, as part of NASA's Mars 2020 mission, Perseverance was designed to search for signs of ancient life, collect samples, and prepare for future human exploration. This comprehensive overview delves into its objectives, design, mission timeline, scientific discoveries, and broader impact on Mars research and future endeavors. By exploring its intricate systems and operational history, we gain insight into how Perseverance paves the way for the next generation of interplanetary missions. The rover's success is a testament to international collaboration and technological innovation in space exploration. By studying Perseverance's journey, scientists can better understand the challenges of long-duration missions and develop strategies to mitigate risks associated with extended stays on other planets. Additionally, the data collected will help inform future missions to Mars and beyond, ensuring continued scientific discovery and the expansion of humanity's presence in space. This detailed review highlights the importance of Perseverance within the broader context of planetary science and the ongoing quest to uncover the mysteries of our solar system. The rover's achievements underscore the potential for future missions to unlock new frontiers and expand our knowledge of the universe. It also showcases the collaborative effort required to achieve such ambitious goals, demonstrating the power of teamwork and shared expertise in advancing space exploration. The mission's successes have far-reaching implications for both science and human exploration of the solar system, paving the way for future advancements and breakthroughs in the field of space exploration. This report aims to provide a comprehensive understanding of Perseverance's role in advancing our knowledge of Mars, as well as its impact on the wider field of space exploration. The rover's achievements demonstrate the potential for future missions to further our understanding of the planet's geology and potential habitability, and inspire the development of innovative technologies to enable longer-term missions to other planets and moons. The information provided here serves as an example of the importance of collaboration and innovation in the field of space exploration, which is crucial for achieving scientific and commercial goals in the future.",
+      "reference": "inaccurate",
+      "bertscore": null,
+      "timestamp": "2026-06-20T10:27:24.404Z",
+      "model_version": "SpaceLLM_v1"
+    },
+    {
+      "feedback_id": "872c28eb-690b-42a4-800a-927250d51bc8",
+      "question": "tell me about JUICE",
+      "candidate": "The Joint Ulysses Mission to Jupiter's Ice Moons (JUICE) aims to explore Europa, Ganymede, Callisto, and their environments. This mission will study the dynamics of Jupiter's magnetosphere and the subsurface oceans on these moons. Its payload includes radio science instruments and spectrometers to analyze composition and dynamics. It will perform multiple flybys before entering orbit around Ganymede, becoming Europe's largest interplanetary mission. The mission supports future human exploration and advances our understanding of potentially habitable worlds. The spacecraft will utilize advanced propulsion and communication systems to reach Jupiter's orbit in 2028, with a planned 10-year mission. The JUICE mission will provide unprecedented data on Jupiter's moons, helping scientists assess their habitability and geological evolution, which are crucial for understanding the origins of life in the Solar System. The mission's findings could influence future missions to other icy bodies and contribute to comparative planetology. The JUICE mission's exploration of Jupiter's moons is crucial for understanding the conditions necessary for life in the Solar System. The mission's success will pave the way for future missions to other icy worlds. The mission's results will enhance our knowledge of the Solar System's formation and evolution. The mission's data will provide insights into the early Solar System's history. The mission's results will help scientists understand the role of water and ice in the formation of planets. The mission's success will contribute to the broader field of planetary science and provide valuable data for future missions to other icy worlds, which are crucial for understanding the origin of life. The JUICE mission is a vital step in advancing our knowledge of the Solar System and its potential for hosting life. The mission's success will help shape the future of space exploration and deepen our understanding of the universe. The JUICE mission's contribution to our understanding of the Solar System's history and the potential for life on other planets is invaluable. The mission's success will open up new avenues for future research and exploration.",
+      "reference": "JUICE (Jupiter Icy Moons Explorer) is the European Space Agency (ESA)'s flagship mission to study the gas giant Jupiter and three of its largest, ocean-bearing icy moons: Ganymede, Callisto, and Europa. Launched in April 2023, it relies on a series of planetary gravity assists to reach the outer Solar System, aiming to arrive in 2031",
+      "bertscore": null,
+      "timestamp": "2026-06-20T10:32:43.573Z",
+      "model_version": "SpaceLLM_v1"
+    },
+    {
+      "feedback_id": "4be17f4d-1d9c-46dd-89fe-0f302b7edf1c",
+      "question": "PSLV C1 launch",
+      "candidate": "The PSLV-C1 mission launched on 22 September 1993. It deployed the Rohini satellite into a 400 km circular orbit. This mission marked ISRO's first successful operational launch of the PSLV.",
+      "reference": "The PSLV-C1 mission was launched by Indian Space Research Organisation on 29 September 1997. It successfully placed the IRS-1D into a Sun-synchronous orbit. The mission demonstrated the growing reliability of the Polar Satellite Launch Vehicle (PSLV), which later became ISRO's workhorse launch vehicle for Earth observation, navigation, and interplanetary missions.",
+      "bertscore": null,
+      "timestamp": "2026-06-20T10:46:34.448Z",
+      "model_version": "SpaceLLM_v1"
+    },
+    {
+      "feedback_id": "1be59af5-b1c3-42fa-9b08-9fe7468f26a4",
+      "question": "IRS 1D",
+      "candidate": "IRS 1D was an Indian Remote Sensing satellite designed for Earth observation. Launched on 19 December 1997 using a PSLV-D2 vehicle, it provided imagery in visible and infrared bands, supporting applications like agriculture, forestry, and disaster management.",
+      "reference": "IRS-1D was an Indian Remote Sensing satellite designed for Earth observation. It was launched on 29 September 1997 aboard the PSLV-C1 launch vehicle into a Sun-synchronous orbit. The satellite carried PAN, LISS-3, and WiFS imaging sensors that provided data in visible and infrared bands, supporting applications such as agriculture, forestry, land-use mapping, environmental monitoring, and disaster management.",
+      "bertscore": null,
+      "timestamp": "2026-06-20T10:48:35.472Z",
+      "model_version": "SpaceLLM_v1"
+    },
+    {
+      "feedback_id": "d254861a-467b-4e64-be61-08104e02c76d",
+      "question": "IRS 1E",
+      "candidate": "IRS 1E was an Earth observation satellite developed by ISRO, launched on 18 February 1998 aboard a PSLV-D3. It carried a Charge Coupled Device (CCD) imager providing high-resolution images for resource mapping and environmental monitoring.",
+      "reference": "IRS-1E was an experimental Earth observation satellite developed by the Indian Space Research Organisation (ISRO). It was launched on 20 September 1993 aboard the PSLV-D1 launch vehicle, the first developmental flight of the Polar Satellite Launch Vehicle. The satellite carried the LISS-I sensor and the MEOSS stereo imaging instrument, which used CCD technology for Earth observation and resource mapping. However, due to a malfunction in the launch vehicle, IRS-1E failed to reach orbit and the mission was unsuccessful",
+      "bertscore": null,
+      "timestamp": "2026-06-20T10:50:07.736Z",
+      "model_version": "SpaceLLM_v1"
+    },
+    {
+      "feedback_id": "b55ea4e3-e404-49a2-a4ca-3c436b895f12",
+      "question": "Apollo 11",
+      "candidate": "Apollo 11 was the first human mission to land on the Moon. Launched on July 16, 1969, the spacecraft consisted of the Command Module Columbia and Lunar Module Eagle, commanded by Neil A. Armstrong, Michael Collins, and Edwin E. 'Buzz' Aldrin. Armstrong and Aldrin landed on the lunar surface at 02:56 UTC on July 20, 1969, becoming the first humans to set foot on another celestial body. The mission achieved President Kennedy's goal of landing humans on the Moon and returning them safely to Earth.",
+      "reference": "Apollo 11 was the first human mission to land on the Moon. Launched on July 16, 1969, the spacecraft consisted of the Command Module Columbia and the Lunar Module Eagle. The crew comprised Neil Armstrong, Buzz Aldrin, and Michael Collins. Eagle landed on the lunar surface at 20:17 UTC on July 20, 1969, and Armstrong became the first human to step onto the Moon at 02:56 UTC on July 21, 1969, followed shortly by Aldrin. The mission successfully fulfilled President Kennedy's goal of landing humans on the Moon and returning them safely to Earth.",
+      "bertscore": null,
+      "timestamp": "2026-06-20T10:51:12.007Z",
+      "model_version": "SpaceLLM_v1"
+    },
+    {
+      "feedback_id": "1bd6dfc8-0078-4f36-b21e-0299bbeb070f",
+      "question": "SROSS-C",
+      "candidate": "SROSS-C does not correspond to any known space mission or spacecraft. It might be a typographical error. If you intended to refer to a different mission, such as SROSS-A or SROSS-B, or perhaps SROSS-C as part of a series, please clarify.",
+      "reference": "SROSS-C (Stretched Rohini Satellite Series-C) was an Indian scientific satellite developed by ISRO. It was launched on 20 May 1992 aboard the ASLV-D3 launch vehicle. The mission carried instruments for gamma-ray burst studies and upper atmospheric research. Its successful launch marked a significant milestone for the ASLV program and India's early satellite development efforts.",
+      "bertscore": null,
+      "timestamp": "2026-06-20T10:59:18.068Z",
+      "model_version": "SpaceLLM_v1"
+    },
+    {
+      "feedback_id": "2620d88b-7d88-4832-8a75-1b5307b3edea",
+      "question": "ADITYA",
+      "candidate": "The Aditya Solar Telescope is an Indian solar observatory, launched by ISRO on September 22, 2017. It aims to study the Sun's corona, particularly its structure and dynamics. The telescope is designed to provide high-resolution images of the solar atmosphere and contribute to understanding solar activity and space weather.",
+      "reference": "Aditya-L1 is India's first dedicated solar observation mission, developed by ISRO. It was launched on 2 September 2023 and operates around the Sun–Earth L1 Lagrange point. The mission studies the Sun's corona, photosphere, chromosphere, solar wind, and magnetic activity. Its payloads include the Solar Ultraviolet Imaging Telescope (SUIT), the Visible Emission Line Coronagraph (VELC), and other instruments designed to investigate solar processes and improve our understanding of space weather.",
+      "bertscore": null,
+      "timestamp": "2026-06-20T11:11:15.067Z",
+      "model_version": "SpaceLLM_v1"
+    },
+    {
+      "feedback_id": "f68abd95-50b6-45ac-88a1-87f92ce4f1d3",
+      "question": "SROSS-C",
+      "candidate": "I specialize in space missions. Please consult a general-purpose assistant. The SROSS-C mission does not correspond to any known space program.",
+      "reference": "SROSS-C (Stretched Rohini Satellite Series-C) was an Indian scientific satellite developed by ISRO. It was launched on 20 May 1992 aboard the ASLV-D3 launch vehicle. The mission carried instruments for gamma-ray burst studies and upper atmospheric research. Its successful launch marked a significant milestone for the ASLV program and India's early satellite development efforts.",
+      "bertscore": null,
+      "timestamp": "2026-06-20T11:12:49.152Z",
+      "model_version": "SpaceLLM_v1"
+    },
+    {
+      "feedback_id": "10a91dd7-a188-4d03-acab-febfc7cf394e",
+      "question": "XRISM (X-ray Imaging and Spectroscopy Mission)",
+      "candidate": "The XRISM mission is led by JAXA with contributions from NASA. It was launched on November 25, 2023 using the H-IIA rocket. XRISM carries X-Ray microcalorimeter (Resolve) and X-Ray imaging spectrometer (Xtend). Its objectives include studying hot gas in galaxy clusters, supernova remnants, and active galactic nuclei.",
+      "reference": "XRISM (X-Ray Imaging and Spectroscopy Mission) is a JAXA-led X-ray astronomy mission developed in collaboration with NASA and with participation from ESA. It was launched on September 6, 2023 (UTC) aboard the H-IIA Launch Vehicle No. 47. The spacecraft carries two primary instruments: Resolve, a high-resolution X-ray microcalorimeter spectrometer, and Xtend, a wide-field X-ray imaging instrument. XRISM studies hot gas in galaxy clusters, supernova remnants, black holes, and active galactic nuclei to better understand the structure, evolution, and energetic processes of the universe.",
+      "bertscore": null,
+      "timestamp": "2026-06-20T11:15:04.533Z",
+      "model_version": "SpaceLLM_v1"
+    },
+    {
+      "feedback_id": "166febcb-0696-4bff-9558-f077d2a4e8b3",
+      "question": "Why doesn't a geostationary orbit exist around Mars in the same practical sense as Earth?",
+      "candidate": "A true geostationary orbit exists only where the planet's rotational period matches the orbital period of a satellite. Earth is about 24 hours fast, which means a satellite in a circular orbit approximately 35,786 kilometers above the equator takes one full revolution per day, matching the planet's spin. Mars, however, rotates much more slowly: one Martian sol is about 24 hours and 39 minutes. This longer day forces a “Mars geosynchronous” orbit to lie farther out, roughly 17,000 kilometers above the surface, because orbital speed decreases with altitude. Additionally, Mars' gravitational field is significantly weaker, leading to a larger Hill sphere. The resulting orbit would have an orbital period equal to Mars' rotation but would still drift relative to the surface because Mars lacks a substantial atmosphere to dissipate orbital energy. In practice, the primary challenge is the size of the orbit: a 17,000-kilometer altitude is beyond the practical range for most satellites due to increased transmission losses and the difficulty of launching into such a distant orbit. Another factor is the absence of a dense atmosphere, meaning there is no aerodynamic drag to help a satellite settle into a low, stable orbit. This lack of atmospheric braking makes it difficult to maintain a low-altitude stationary orbit. Earth also benefits from a relatively large radius and a faster rotation, allowing a compact geosynchronous orbit. Mars' slower spin and smaller gravity require a much more extended orbit, which is less economical for communication and observation purposes. Therefore, while a mathematically correct Mars geosynchronous orbit exists, it is not utilized in the way Earth uses its geostationary belt because the orbit is too high to provide effective coverage and efficiency. The concept of a practical stationary satellite over a given location on Mars is instead realized through other strategies, such as multiple satellites in slightly different orbits or orbiters following elliptical trajectories that spend more time over specific regions. This approach circumvents the limitations imposed by Mars' rotation and gravity.",
+      "reference": "A true areostationary orbit does exist around Mars.\n\nThe reason Mars does not have an equivalent of Earth's geostationary satellite belt is largely economic and operational, not physical.\n\nKey reasons:\n\nVery little communication demand\nEarth has thousands of TV, internet, weather, and military users.\nMars currently has only a few robotic assets.\nExisting relay orbiters work well\nMissions use orbiters such as Mars Reconnaissance Orbiter and others as communication relays.\nCoverage challenges\nOne areostationary satellite only covers part of Mars.\nA useful network would require multiple satellites.\nStation-keeping requirements\nMars has gravitational irregularities (mascons and harmonics) that perturb areostationary orbits.\nSatellites would need active orbit maintenance.",
+      "bertscore": null,
+      "timestamp": "2026-06-20T12:16:31.914Z",
+      "model_version": "SpaceLLM_v1"
+    }
+  ],
+  "low_bertscore_pairs": [
+    {
+      "feedback_id": "ac5d06ec-8005-41e7-aad5-835fe5f81b5d",
+      "question": "tell me about perseverance",
+      "candidate": "The Mars 2020 Perseverance rover has redefined the exploration of Martian geology and astrobiology. Launched aboard an Atlas V 541 rocket from Cape Canaveral on July 30, 2020, it entered Mars orbit following a 10.5-month journey. Its entry, descent, and landing sequence utilized a unique “Sky Crane”",
+      "reference": "incomplete response",
+      "bertscore_f1": -0.394764
+    },
+    {
+      "feedback_id": "48b3dd5c-740e-4cfe-af3b-438e37510c95",
+      "question": "provide me details of perseverance rover",
+      "candidate": "The Mars Perseverance Rover has significantly advanced our understanding of the Martian surface and its potential habitability. Launched on July 30, 2020, as part of NASA's Mars 2020 mission, Perseverance was designed to search for signs of ancient life, collect samples, and prepare for future human",
+      "reference": "inaccurate",
+      "bertscore_f1": -0.385125
+    },
+    {
+      "feedback_id": "872c28eb-690b-42a4-800a-927250d51bc8",
+      "question": "tell me about JUICE",
+      "candidate": "The Joint Ulysses Mission to Jupiter's Ice Moons (JUICE) aims to explore Europa, Ganymede, Callisto, and their environments. This mission will study the dynamics of Jupiter's magnetosphere and the subsurface oceans on these moons. Its payload includes radio science instruments and spectrometers to a",
+      "reference": "JUICE (Jupiter Icy Moons Explorer) is the European Space Agency (ESA)'s flagship mission to study the gas giant Jupiter and three of its largest, ocean-bearing icy moons: Ganymede, Callisto, and Europa. Launched in April 2023, it relies on a series of planetary gravity assists to reach the outer Sol",
+      "bertscore_f1": 0.132116
+    },
+    {
+      "feedback_id": "4be17f4d-1d9c-46dd-89fe-0f302b7edf1c",
+      "question": "PSLV C1 launch",
+      "candidate": "The PSLV-C1 mission launched on 22 September 1993. It deployed the Rohini satellite into a 400 km circular orbit. This mission marked ISRO's first successful operational launch of the PSLV.",
+      "reference": "The PSLV-C1 mission was launched by Indian Space Research Organisation on 29 September 1997. It successfully placed the IRS-1D into a Sun-synchronous orbit. The mission demonstrated the growing reliability of the Polar Satellite Launch Vehicle (PSLV), which later became ISRO's workhorse launch vehic",
+      "bertscore_f1": 0.465568
+    },
+    {
+      "feedback_id": "1be59af5-b1c3-42fa-9b08-9fe7468f26a4",
+      "question": "IRS 1D",
+      "candidate": "IRS 1D was an Indian Remote Sensing satellite designed for Earth observation. Launched on 19 December 1997 using a PSLV-D2 vehicle, it provided imagery in visible and infrared bands, supporting applications like agriculture, forestry, and disaster management.",
+      "reference": "IRS-1D was an Indian Remote Sensing satellite designed for Earth observation. It was launched on 29 September 1997 aboard the PSLV-C1 launch vehicle into a Sun-synchronous orbit. The satellite carried PAN, LISS-3, and WiFS imaging sensors that provided data in visible and infrared bands, supporting ",
+      "bertscore_f1": 0.639613
+    },
+    {
+      "feedback_id": "d254861a-467b-4e64-be61-08104e02c76d",
+      "question": "IRS 1E",
+      "candidate": "IRS 1E was an Earth observation satellite developed by ISRO, launched on 18 February 1998 aboard a PSLV-D3. It carried a Charge Coupled Device (CCD) imager providing high-resolution images for resource mapping and environmental monitoring.",
+      "reference": "IRS-1E was an experimental Earth observation satellite developed by the Indian Space Research Organisation (ISRO). It was launched on 20 September 1993 aboard the PSLV-D1 launch vehicle, the first developmental flight of the Polar Satellite Launch Vehicle. The satellite carried the LISS-I sensor and",
+      "bertscore_f1": 0.430293
+    },
+    {
+      "feedback_id": "b55ea4e3-e404-49a2-a4ca-3c436b895f12",
+      "question": "Apollo 11",
+      "candidate": "Apollo 11 was the first human mission to land on the Moon. Launched on July 16, 1969, the spacecraft consisted of the Command Module Columbia and Lunar Module Eagle, commanded by Neil A. Armstrong, Michael Collins, and Edwin E. 'Buzz' Aldrin. Armstrong and Aldrin landed on the lunar surface at 02:56",
+      "reference": "Apollo 11 was the first human mission to land on the Moon. Launched on July 16, 1969, the spacecraft consisted of the Command Module Columbia and the Lunar Module Eagle. The crew comprised Neil Armstrong, Buzz Aldrin, and Michael Collins. Eagle landed on the lunar surface at 20:17 UTC on July 20, 19",
+      "bertscore_f1": 0.774351
+    },
+    {
+      "feedback_id": "1bd6dfc8-0078-4f36-b21e-0299bbeb070f",
+      "question": "SROSS-C",
+      "candidate": "SROSS-C does not correspond to any known space mission or spacecraft. It might be a typographical error. If you intended to refer to a different mission, such as SROSS-A or SROSS-B, or perhaps SROSS-C as part of a series, please clarify.",
+      "reference": "SROSS-C (Stretched Rohini Satellite Series-C) was an Indian scientific satellite developed by ISRO. It was launched on 20 May 1992 aboard the ASLV-D3 launch vehicle. The mission carried instruments for gamma-ray burst studies and upper atmospheric research. Its successful launch marked a significant",
+      "bertscore_f1": -0.051774
+    },
+    {
+      "feedback_id": "2620d88b-7d88-4832-8a75-1b5307b3edea",
+      "question": "ADITYA",
+      "candidate": "The Aditya Solar Telescope is an Indian solar observatory, launched by ISRO on September 22, 2017. It aims to study the Sun's corona, particularly its structure and dynamics. The telescope is designed to provide high-resolution images of the solar atmosphere and contribute to understanding solar act",
+      "reference": "Aditya-L1 is India's first dedicated solar observation mission, developed by ISRO. It was launched on 2 September 2023 and operates around the Sun–Earth L1 Lagrange point. The mission studies the Sun's corona, photosphere, chromosphere, solar wind, and magnetic activity. Its payloads include the Sol",
+      "bertscore_f1": 0.400381
+    },
+    {
+      "feedback_id": "f68abd95-50b6-45ac-88a1-87f92ce4f1d3",
+      "question": "SROSS-C",
+      "candidate": "I specialize in space missions. Please consult a general-purpose assistant. The SROSS-C mission does not correspond to any known space program.",
+      "reference": "SROSS-C (Stretched Rohini Satellite Series-C) was an Indian scientific satellite developed by ISRO. It was launched on 20 May 1992 aboard the ASLV-D3 launch vehicle. The mission carried instruments for gamma-ray burst studies and upper atmospheric research. Its successful launch marked a significant",
+      "bertscore_f1": 0.010279
+    },
+    {
+      "feedback_id": "10a91dd7-a188-4d03-acab-febfc7cf394e",
+      "question": "XRISM (X-ray Imaging and Spectroscopy Mission)",
+      "candidate": "The XRISM mission is led by JAXA with contributions from NASA. It was launched on November 25, 2023 using the H-IIA rocket. XRISM carries X-Ray microcalorimeter (Resolve) and X-Ray imaging spectrometer (Xtend). Its objectives include studying hot gas in galaxy clusters, supernova remnants, and activ",
+      "reference": "XRISM (X-Ray Imaging and Spectroscopy Mission) is a JAXA-led X-ray astronomy mission developed in collaboration with NASA and with participation from ESA. It was launched on September 6, 2023 (UTC) aboard the H-IIA Launch Vehicle No. 47. The spacecraft carries two primary instruments: Resolve, a hig",
+      "bertscore_f1": 0.569476
+    },
+    {
+      "feedback_id": "166febcb-0696-4bff-9558-f077d2a4e8b3",
+      "question": "Why doesn't a geostationary orbit exist around Mars in the same practical sense as Earth?",
+      "candidate": "A true geostationary orbit exists only where the planet's rotational period matches the orbital period of a satellite. Earth is about 24 hours fast, which means a satellite in a circular orbit approximately 35,786 kilometers above the equator takes one full revolution per day, matching the planet's ",
+      "reference": "A true areostationary orbit does exist around Mars.\n\nThe reason Mars does not have an equivalent of Earth's geostationary satellite belt is largely economic and operational, not physical.\n\nKey reasons:\n\nVery little communication demand\nEarth has thousands of TV, internet, weather, and military users",
+      "bertscore_f1": -0.023929
+    }
+  ],
+  "metadata": {
+    "events_processed": 46,
+    "bertscore_model": "roberta-large"
+  }
+}
