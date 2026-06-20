@@ -59,6 +59,7 @@ Before writing your answer, silently work through these steps:
 OUTPUT RULES:
 - Write a thorough, technically accurate, educational explanation.
 - Aim for 300–600 words. Do not pad; stop when the explanation is complete.
+- Make sure that the response is complete if not complete make sure it is complete and is abiding the rules of the this program like max tokens = 1024.
 - Use flowing paragraphs. No bullet lists.
 - Open directly with substance — never with "This overview covers..." or similar.
 - Show technical depth: include specific mission names, instrument names, orbital parameters,
