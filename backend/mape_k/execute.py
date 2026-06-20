@@ -77,7 +77,7 @@ MAPE_DIR.mkdir(parents=True, exist_ok=True)
 class ExecutorConfig:
     # HuggingFace
     hf_repo_id:              str   = "AdityaPS/SpaceLLM_v1"   # updated per version
-    hf_token_env:            str   = "HF_TOKEN"               # env var name
+    hf_token_env:            str   = "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"               # env var name
 
     # Fine-tuning script
     finetune_script:         str   = str(FINE_TUNING_DIR / "lora_finetuning_v4.py")
