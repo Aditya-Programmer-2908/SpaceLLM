@@ -54,7 +54,7 @@ log = logging.getLogger("spacellm.executor")
 
 BASE_DIR            = Path("/mnt/DATA/saurabh/aditya/SpaceLLM/backend")
 MAPE_DIR            = BASE_DIR / "mape_k"
-FINE_TUNING_DIR     = Path("/mnt/DATA/saurabh/aditya/SpaceLLM/fine_tuning_v2")
+FINE_TUNING_DIR     = Path("/mnt/DATA/saurabh/aditya/SpaceLLM/Model_training_&_Data_Extraction/fine_tuning_v2")
 ADAPTER_OUTPUT_DIR  = FINE_TUNING_DIR / "outputs" / "spacellm_lora_final"
 TRAIN_DATA_DIR      = Path("/mnt/DATA/saurabh/aditya/SpaceLLM/data_processing/DatasetA_core_QA_v2")
 CORRECTION_TRAIN_FILE = MAPE_DIR / "correction_train_injection.json"
