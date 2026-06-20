@@ -88,7 +88,7 @@ class AnalyserConfig:
     repeated_failure_critical:  int   = 10
 
     # Min corrections needed to recommend retraining
-    min_corrections_to_retrain: int   = 5
+    min_corrections_to_retrain: int   = 1
 
 
 # ---------------------------------------------------------------------------
