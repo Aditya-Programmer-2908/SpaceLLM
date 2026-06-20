@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from peft import PeftModel
 from pydantic import BaseModel
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,6 +24,13 @@ log = logging.getLogger("spacellm")
 FEEDBACK_LOG     = Path("feedback_log.jsonl")
 BASE_MODEL_ID    = "openai/gpt-oss-20b"
 ADAPTER_MODEL_ID = "AdityaPS/SpaceLLM_v1"
+
+# GPT-OSS is a native reasoning model: every generation writes a hidden
+# "analysis" (chain-of-thought) pass before the visible "final" pass, and both
+# consume max_new_tokens. "low" keeps the hidden pass short so the budget is
+# spent on the answer instead of being eaten by reasoning tokens.
+# Only settable via apply_chat_template — pipeline() does not expose it reliably.
+REASONING_EFFORT = "low"
 
 # ── System prompts ─────────────────────────────────────────────────────────────
 
@@ -77,26 +84,33 @@ SHORT_INTENT = {
     "keep it short",
 }
 
-# Keywords that trigger the detailed path
+# Keywords that trigger the detailed path.
+# NOTE: bare "how", "why", "about", "tell me" were removed — they're too
+# generic and false-positive on everyday short queries/greetings (e.g. "how
+# are you", "show me the rover" via substring match on "how"). The phrasal
+# versions below already capture genuine detail-seeking intent.
 DETAIL_INTENT = {
     "explain", "tell me about", "describe", "detail", "details", "detailed",
     "how does", "how do", "how did", "why did", "why does", "why is",
     "what is", "what are", "what was", "what were",
     "teach me", "elaborate", "compare", "history", "background",
-    "overview", "in depth", "deep dive", "walk me through", "about",
-    "tell me", "how", "why",
+    "overview", "in depth", "deep dive", "walk me through",
 }
+
+# Compiled once at import time. \b word-boundary matching prevents partial-word
+# hits like "how" matching inside "show"/"somehow", or "is" matching inside "this".
+_SHORT_PATTERN  = re.compile(r"\b(" + "|".join(re.escape(k) for k in SHORT_INTENT)  + r")\b")
+_DETAIL_PATTERN = re.compile(r"\b(" + "|".join(re.escape(k) for k in DETAIL_INTENT) + r")\b")
 
 model     = None
 tokenizer = None
-pipe      = None
 
 
 # ── Model lifecycle ────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global model, tokenizer, pipe
+    global model, tokenizer
 
     log.info("Loading tokenizer: %s", ADAPTER_MODEL_ID)
     tokenizer = AutoTokenizer.from_pretrained(ADAPTER_MODEL_ID, trust_remote_code=True)
@@ -143,11 +157,10 @@ async def lifespan(app: FastAPI):
     model.eval()
     log.info("SpaceLLM ready.")
 
-    pipe = pipeline("text-generation", model=model, tokenizer=tokenizer)
     yield
 
     log.info("Shutting down.")
-    del model, tokenizer, pipe
+    del model, tokenizer
     torch.cuda.empty_cache()
 
 
@@ -167,7 +180,7 @@ class ChatMessage(BaseModel):
 
 class GenerateRequest(BaseModel):
     messages:       list[ChatMessage]
-    max_new_tokens: int   = 1024
+    max_new_tokens: int   = 1536   # was 1024 — 600-word detail answers need headroom
     temperature:    float = 0.7
     top_p:          float = 0.9
     do_sample:      bool  = True
@@ -175,6 +188,7 @@ class GenerateRequest(BaseModel):
 class GenerateResponse(BaseModel):
     response:      str
     model_version: str = "SpaceLLM_v1"
+    truncated:     bool = False
 
 class FeedbackRequest(BaseModel):
     message_id:    str
@@ -195,16 +209,18 @@ def classify_request(messages: list[dict]) -> str:
     """
     Returns 'short' or 'detail' by scanning the last 3 user turns.
     SHORT_INTENT wins if present; then DETAIL_INTENT; else 'short'.
+    Uses word-boundary regex matching so phrases only match whole words
+    (e.g. "how" in DETAIL_INTENT won't fire on "show" or "somehow").
     """
     text = " ".join(
         m["content"].lower()
         for m in messages[-3:]
         if m["role"] == "user"
     )
-    if any(kw in text for kw in SHORT_INTENT):
+    if _SHORT_PATTERN.search(text):
         log.info("classify=short (short-intent keyword) | %.120s", text)
         return "short"
-    if any(kw in text for kw in DETAIL_INTENT):
+    if _DETAIL_PATTERN.search(text):
         log.info("classify=detail | %.120s", text)
         return "detail"
     log.info("classify=short (default) | %.120s", text)
@@ -250,37 +266,58 @@ def clean_response(text: str) -> str:
     return "\n".join(lines).strip()
 
 
-def run_pipe(messages: list[dict], req: GenerateRequest, temperature: float,
-             min_new_tokens: int) -> str:
-    result = pipe(
+def run_generate(messages: list[dict], req: GenerateRequest, temperature: float,
+                  min_new_tokens: int) -> tuple[str, bool]:
+    """
+    Calls model.generate() directly (instead of the high-level pipeline) so
+    that reasoning_effort can be passed through apply_chat_template — this is
+    not reliably exposed via pipeline(). Also detects whether generation hit
+    the max_new_tokens ceiling, which is the main signal for truncated output.
+    """
+    inputs = tokenizer.apply_chat_template(
         messages,
-        max_new_tokens=req.max_new_tokens,
-        min_new_tokens=min_new_tokens,
-        temperature=temperature,
-        top_p=req.top_p if req.do_sample else 1.0,
-        do_sample=req.do_sample,
-        repetition_penalty=1.1,
-        pad_token_id=tokenizer.eos_token_id,
-        return_full_text=False,
-    )
-    raw = result[0]["generated_text"]
-    if isinstance(raw, list):
-        raw = raw[-1].get("content", "")
+        add_generation_prompt=True,
+        return_tensors="pt",
+        return_dict=True,
+        reasoning_effort=REASONING_EFFORT,
+    ).to(model.device)
+
+    input_len = inputs["input_ids"].shape[-1]
+
+    with torch.no_grad():
+        output_ids = model.generate(
+            **inputs,
+            max_new_tokens=req.max_new_tokens,
+            min_new_tokens=min_new_tokens,
+            temperature=temperature,
+            top_p=req.top_p if req.do_sample else 1.0,
+            do_sample=req.do_sample,
+            repetition_penalty=1.1,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+
+    new_tokens = output_ids[0][input_len:]
+    truncated  = new_tokens.shape[0] >= req.max_new_tokens
+    if truncated:
+        log.warning("Hit max_new_tokens=%d before EOS — response likely truncated.",
+                     req.max_new_tokens)
+
+    raw = tokenizer.decode(new_tokens, skip_special_tokens=True)
     log.info("\n=== RAW ===\n%s\n===========", raw)
-    return clean_response(raw)
+    return clean_response(raw), truncated
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
-    ready = pipe is not None
+    ready = model is not None
     return {"status": "ok" if ready else "loading", "model": ADAPTER_MODEL_ID, "ready": ready}
 
 
 @app.post("/generate", response_model=GenerateResponse)
 def generate(req: GenerateRequest):
-    if pipe is None:
+    if model is None:
         raise HTTPException(status_code=503, detail="Model still loading.")
 
     raw  = [m.model_dump() for m in req.messages]
@@ -294,10 +331,11 @@ def generate(req: GenerateRequest):
     # - detail: 400 tokens minimum (~300 words), model stops naturally when complete
     min_tok = 400 if mode == "detail" else 30
 
-    response = run_pipe(msgs, req, temperature, min_new_tokens=min_tok)
+    response, truncated = run_generate(msgs, req, temperature, min_new_tokens=min_tok)
 
-    log.info("mode=%s | %d chars | ~%d words", mode, len(response), len(response.split()))
-    return GenerateResponse(response=response)
+    log.info("mode=%s | truncated=%s | %d chars | ~%d words",
+              mode, truncated, len(response), len(response.split()))
+    return GenerateResponse(response=response, truncated=truncated)
 
 
 @app.post("/feedback", response_model=FeedbackResponse)
