@@ -1,86 +1,209 @@
 """
-mape_k/controller.py
---------------------
-The MAPE-K controller: ties Monitor → Analyze → Plan → Execute together.
-Called by APScheduler every N hours AND can be triggered manually via the
-/admin/mape-run endpoint.
+SpaceLLM MAPE-K :: Controller
+================================
+Orchestrates the full loop:  Monitor → Analyser → Planner → Executor
+
+Run once (single cycle):
+    python controller.py
+
+Run on a schedule (e.g. every 30 minutes):
+    python controller.py --interval 1800
+
+The controller also reads frontend_patch.md and topic_guardrail.json to
+expose the *current effective system prompt* — useful for the FastAPI
+server to call get_system_prompt() at startup without duplicating the
+patch-file parsing logic.
+
+Author: SpaceLLM Project
 """
 
+from __future__ import annotations
+
+import argparse
 import logging
-from typing import Optional
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
-from database.db import AsyncSessionLocal
-from database import knowledge as kb
-from mape_k import analyze, plan, execute
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+)
+log = logging.getLogger("spacellm.controller")
 
-logger = logging.getLogger(__name__)
+# Base path — same across all MAPE-K modules
+BASE_DIR            = Path("/mnt/DATA/saurabh/aditya/SpaceLLM/backend")
+MAPE_DIR            = BASE_DIR / "mape_k"
+FRONTEND_PATCH_FILE = BASE_DIR / "frontend_patch.md"
+TOPIC_GUARDRAIL_FILE = MAPE_DIR / "topic_guardrail.json"
 
 
-async def run_mape_cycle(triggered_by: str = "scheduler") -> dict:
+# ---------------------------------------------------------------------------
+# System-prompt assembly  (used by FastAPI / inference core)
+# ---------------------------------------------------------------------------
+
+BASE_SYSTEM_PROMPT = (
+    "You are SpaceLLM, an expert assistant specialising in space exploration, "
+    "satellite systems, launch vehicles, and astronomy. "
+    "Answer questions accurately, cite uncertainty when relevant, and provide "
+    "structured content (tables, timelines, step-by-step lists) when the user "
+    "asks for it."
+)
+
+
+def _parse_patch_blocks(patch_file: Path) -> dict[str, str]:
     """
-    Execute one full MAPE-K cycle.
-
-    Returns a summary dict suitable for API responses.
+    Parse frontend_patch.md for PATCH_START / PATCH_END sentinel blocks.
+    Returns {patch_key: patch_text} — last block wins for each key (dedup).
     """
-    async with AsyncSessionLocal() as db:
-        run_id = await kb.start_mape_run(db, triggered_by=triggered_by)
-        log_lines: list[str] = []
+    if not patch_file.exists():
+        return {}
 
+    patches: dict[str, str] = {}
+    current_key:  str | None = None
+    current_lines: list[str] = []
+
+    for line in patch_file.read_text(encoding="utf-8").splitlines():
+        if line.startswith("<!-- PATCH_START"):
+            # e.g. <!-- PATCH_START patch_key=incomplete_answer_structural_dodge applied_at=... -->
+            for part in line.split():
+                if part.startswith("patch_key="):
+                    current_key = part.split("=", 1)[1].rstrip(" -->")
+            current_lines = []
+        elif line.startswith("<!-- PATCH_END") and current_key:
+            patches[current_key] = "\n".join(current_lines).strip()
+            current_key = None
+            current_lines = []
+        elif current_key is not None:
+            current_lines.append(line)
+
+    return patches
+
+
+def get_system_prompt() -> str:
+    """
+    Assemble the live system prompt by layering active patches over the base.
+    Call this from the FastAPI server at startup (and optionally poll it).
+    """
+    patches = _parse_patch_blocks(FRONTEND_PATCH_FILE)
+    parts   = [BASE_SYSTEM_PROMPT]
+
+    if patches:
+        parts.append("\n\n# Active behaviour patches\n")
+        for key, text in patches.items():
+            parts.append(f"[{key}] {text}")
+        log.info("System prompt assembled with %d active patch(es): %s",
+                 len(patches), list(patches.keys()))
+    else:
+        log.info("No active patches — using base system prompt.")
+
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Controller
+# ---------------------------------------------------------------------------
+
+class Controller:
+
+    def __init__(self) -> None:
+        # Lazy imports so each component's own logging fires after basicConfig
+        from monitor import Monitor
+        from analyze import Analyser
+        from plan    import Planner
+        from execute import Executor
+
+        self.monitor  = Monitor()
+        self.analyser = Analyser()
+        self.planner  = Planner()
+        self.executor = Executor()
+
+    def run_cycle(self) -> dict[str, Any]:
+        """Execute one full MAPE-K cycle and return a summary dict."""
+        started = datetime.now(timezone.utc)
+        log.info("╔══════════════════════════════════╗")
+        log.info("║  MAPE-K Cycle  %s  ║", started.strftime("%Y-%m-%d %H:%M:%S UTC"))
+        log.info("╚══════════════════════════════════╝")
+
+        # ── Monitor ───────────────────────────────────────────────────────────
+        log.info("── MONITOR ──")
         try:
-            # ── ANALYZE ──────────────────────────────────────────────────
-            report = await analyze.analyze(db)
-            log_lines.append(
-                f"[A] feedback={report.total_feedback} "
-                f"neg_ratio={report.neg_ratio:.2%} "
-                f"new_samples={len(report.new_sample_ids)}"
-            )
-
-            # ── PLAN ─────────────────────────────────────────────────────
-            retrain_plan = await plan.plan(db, report)
-            log_lines.append(f"[P] {retrain_plan.reason}")
-
-            new_version: Optional[str] = None
-
-            if retrain_plan.should_retrain:
-                # ── EXECUTE ──────────────────────────────────────────────
-                log_lines.append(
-                    f"[E] Starting training → {retrain_plan.new_version_tag}"
-                )
-                result = await execute.execute(db, retrain_plan)
-
-                if result.success:
-                    new_version = result.new_version_tag
-                    log_lines.append(
-                        f"[E] Success — {result.hf_repo_id} "
-                        f"BERTScore={result.bertscore}"
-                    )
-                else:
-                    log_lines.append(f"[E] Failed — {result.error}")
-
-            await kb.finish_mape_run(
-                db,
-                run_id=run_id,
-                status="done",
-                samples_found=len(report.new_sample_ids),
-                retrain_decided=retrain_plan.should_retrain,
-                new_version=new_version,
-                log="\n".join(log_lines),
-            )
-
-            return {
-                "run_id": run_id,
-                "status": "done",
-                "retrained": retrain_plan.should_retrain,
-                "new_version": new_version,
-                "log": log_lines,
-            }
-
+            monitor_events = self.monitor.run()
         except Exception as exc:
-            logger.error("MAPE-K cycle failed: %s", exc, exc_info=True)
-            await kb.finish_mape_run(
-                db,
-                run_id=run_id,
-                status="failed",
-                log=f"Exception: {exc}",
-            )
-            return {"run_id": run_id, "status": "failed", "error": str(exc)}
+            log.error("Monitor failed: %s", exc, exc_info=True)
+            monitor_events = []
+
+        # ── Analyser ──────────────────────────────────────────────────────────
+        log.info("── ANALYSER ──")
+        try:
+            report = self.analyser.run()
+        except Exception as exc:
+            log.error("Analyser failed: %s", exc, exc_info=True)
+            report = None
+
+        # ── Planner ───────────────────────────────────────────────────────────
+        log.info("── PLANNER ──")
+        try:
+            plan = self.planner.run()
+        except Exception as exc:
+            log.error("Planner failed: %s", exc, exc_info=True)
+            plan = None
+
+        # ── Executor ──────────────────────────────────────────────────────────
+        log.info("── EXECUTOR ──")
+        try:
+            exec_records = self.executor.run()
+        except Exception as exc:
+            log.error("Executor failed: %s", exc, exc_info=True)
+            exec_records = []
+
+        elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+
+        summary = {
+            "timestamp":        started.isoformat(),
+            "elapsed_s":        round(elapsed, 1),
+            "monitor_events":   len(monitor_events),
+            "severity":         report.severity      if report else "N/A",
+            "should_retrain":   report.should_retrain if report else False,
+            "plan_actions":     len(plan.actions)    if plan   else 0,
+            "exec_executed":    sum(1 for r in exec_records if r.status == "EXECUTED"),
+            "exec_failed":      sum(1 for r in exec_records if r.status == "FAILED"),
+        }
+
+        log.info("Cycle complete in %.1fs. Summary: %s", elapsed, summary)
+        return summary
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="SpaceLLM MAPE-K Controller")
+    parser.add_argument(
+        "--interval", type=int, default=0,
+        help="Seconds between cycles. 0 = run once (default).",
+    )
+    args = parser.parse_args()
+
+    controller = Controller()
+
+    if args.interval <= 0:
+        controller.run_cycle()
+    else:
+        log.info("Scheduler mode: running every %ds. Ctrl-C to stop.", args.interval)
+        while True:
+            try:
+                controller.run_cycle()
+            except KeyboardInterrupt:
+                log.info("Interrupted — shutting down.")
+                break
+            except Exception as exc:
+                log.error("Unexpected error in cycle: %s", exc, exc_info=True)
+            log.info("Sleeping %ds until next cycle...", args.interval)
+            time.sleep(args.interval)
+
+
+if __name__ == "__main__":
+    main()
