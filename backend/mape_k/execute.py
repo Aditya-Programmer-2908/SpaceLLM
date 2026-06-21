@@ -108,9 +108,10 @@ STATE_FILE            = MAPE_DIR / ".executor_state.json"
 FAILED_LOG            = MAPE_DIR / "executor_failed.jsonl"
 
 # Fine-tuning script & dataset output directory
-FINETUNE_SCRIPT       = FINE_TUNING_DIR / "correction_fine_tuning.py"
-FINETUNE_DATASET_DIR  = MAPE_DIR / "retrain_datasets"
-ADAPTER_OUTPUT_DIR    = FINE_TUNING_DIR / "outputs"
+FINETUNE_SCRIPT         = FINE_TUNING_DIR / "correction_fine_tuning.py"
+FINETUNE_DATASET_DIR    = MAPE_DIR / "retrain_datasets"
+CORRECTION_TRAIN_FILE   = MAPE_DIR / "correction_train_injection.json"   # hardcoded default in the script
+ADAPTER_OUTPUT_DIR      = FINE_TUNING_DIR / "outputs"
 
 MAPE_DIR.mkdir(parents=True, exist_ok=True)
 FINETUNE_DATASET_DIR.mkdir(parents=True, exist_ok=True)
@@ -335,54 +336,78 @@ class Executor:
             raise ValueError("RETRAIN_ADAPTER payload has no training_examples.")
 
         # Write dataset
-        ts          = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        dataset_path = FINETUNE_DATASET_DIR / f"{self.config.dataset_file_prefix}_{ts}.jsonl"
+        ts           = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        # Also write a timestamped backup for traceability
+        backup_path  = FINETUNE_DATASET_DIR / f"{self.config.dataset_file_prefix}_{ts}.json"
         valid_ids: list[str] = []
+        records_for_training: list[dict] = []
 
-        with dataset_path.open("w", encoding="utf-8") as fh:
-            for ex in examples:
-                question  = (ex.get("question")  or "").strip()
-                candidate = (ex.get("candidate") or "").strip()
-                reference = (ex.get("reference") or "").strip()
-                fid       = ex.get("feedback_id", "")
+        for ex in examples:
+            question  = (ex.get("question")  or "").strip()
+            candidate = (ex.get("candidate") or "").strip()
+            reference = (ex.get("reference") or "").strip()
+            fid       = ex.get("feedback_id", "")
 
-                if not question or not reference:
-                    log.warning("Skipping training example %s — empty question or reference.", fid)
-                    continue
+            if not question or not reference:
+                log.warning("Skipping training example %s — empty question or reference.", fid)
+                continue
 
-                record = {
-                    "instruction": question,
-                    "input":       candidate,
-                    "output":      reference,
-                    "feedback_id": fid,
-                    "bertscore":   ex.get("bertscore"),
-                }
-                fh.write(json.dumps(record) + "\n")
-                valid_ids.append(fid)
+            # correction_fine_tuning.py expects:
+            # { "messages": [ {"role": "user", "content": <question>},
+            #                  {"role": "assistant", "content": <reference>} ],
+            #   "feedback_id": ..., "bertscore": ... }
+            # The candidate (original bad answer) is intentionally excluded —
+            # the script masks prompt tokens and trains only on the assistant turn.
+            record = {
+                "messages": [
+                    {"role": "user",      "content": question},
+                    {"role": "assistant", "content": reference},
+                ],
+                "feedback_id": fid,
+                "bertscore":   ex.get("bertscore"),
+            }
+            records_for_training.append(record)
+            valid_ids.append(fid)
 
-        log.info("Dataset written: %s  (%d examples)", dataset_path, len(valid_ids))
+        # Write to the path the script reads by default (--train_file default)
+        import json as _json
+        CORRECTION_TRAIN_FILE.write_text(
+            _json.dumps(records_for_training, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        # Timestamped backup
+        backup_path.write_text(
+            _json.dumps(records_for_training, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        log.info("Dataset written: %s  (%d examples)", CORRECTION_TRAIN_FILE, len(valid_ids))
+        log.info("Backup written:  %s", backup_path)
 
         if not valid_ids:
             raise ValueError("All training examples were invalid — nothing written to dataset.")
 
-        # Build subprocess command
-        #
-        # correction_fine_tuning.py is expected to accept:
-        #   --dataset   path to the JSONL file we just wrote
-        #   --output    directory where the adapter will be saved
-        #   --run_name  human-readable label for this adapter
-        #
-        # If the script's CLI differs, adjust the arg list here (not elsewhere).
-        adapter_dir = ADAPTER_OUTPUT_DIR / target_label
+        # Build subprocess command matching correction_fine_tuning.py's actual CLI:
+        #   --train_file   path to the JSON file we just wrote
+        #   --output_dir   directory where the adapter will be saved
+        #   --base_adapter existing HF adapter repo to continue training from (optional)
+        #   --epochs / --lr / --lora_r / --lora_alpha passed through for full control
+        adapter_dir = ADAPTER_OUTPUT_DIR / "spacellm_lora_final"
         adapter_dir.mkdir(parents=True, exist_ok=True)
+
+        # If a previous adapter exists locally, continue from it (continual learning)
+        base_adapter = self._state.get("last_adapter", {}).get("hf_repo_id") or None
 
         cmd = [
             self.config.python_executable,
             str(FINETUNE_SCRIPT),
-            "--dataset",   str(dataset_path),
-            "--output",    str(adapter_dir),
-            "--run_name",  target_label,
+            "--train_file",  str(CORRECTION_TRAIN_FILE),
+            "--output_dir",  str(adapter_dir),
+            "--lora_r",      "64",
+            "--lora_alpha",  "128",
         ]
+        if base_adapter:
+            cmd += ["--base_adapter", base_adapter]
+            log.info("Continuing from existing adapter: %s", base_adapter)
 
         log.info("Launching fine-tuning: %s", " ".join(cmd))
         log.info("Timeout: %ds", self.config.retrain_timeout_seconds)
@@ -458,7 +483,8 @@ class Executor:
         return {
             "target_adapter_label": target_label,
             "adapter_path":         str(adapter_dir),
-            "dataset_path":         str(dataset_path),
+            "train_file":           str(CORRECTION_TRAIN_FILE),
+            "backup_path":          str(backup_path),
             "examples_used":        len(valid_ids),
             "returncode":           returncode,
             "stdout_tail":          stdout_lines[-20:],
