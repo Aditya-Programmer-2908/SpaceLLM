@@ -475,11 +475,10 @@ class Executor:
         self._state["last_adapter"] = {
             "target_label":  target_label,
             "adapter_path":  str(adapter_dir),
-            "dataset_path":  str(dataset_path),
+            "dataset_path":  str(backup_path),
             "example_count": len(valid_ids),
             "timestamp":     datetime.now(timezone.utc).isoformat(),
         }
-
         return {
             "target_adapter_label": target_label,
             "adapter_path":         str(adapter_dir),
