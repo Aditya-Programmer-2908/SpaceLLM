@@ -1,30 +1,67 @@
 """
 SpaceLLM MAPE-K :: Executor Component
 =======================================
-Responsibility: Read Planner actions → execute them → update statuses.
-
-Actions handled:
-  RETRAIN_ADAPTER  → build correction_train_injection.json
-                   → run lora_finetuning_v5.py (delta training on corrections only)
-                   → push new adapter to HuggingFace
-                   → update ADAPTER_MODEL_ID in main.py
-                   → mark corrections as used_in_training=True in feedback_log.jsonl
-                   → restart uvicorn and wait for /health ready=true
-
-  PROMPT_PATCH     → inject patch_text into SYSTEM_PROMPT in main.py → restart
-
-  TOPIC_GUARDRAIL  → log to human_review_queue.jsonl
-
-  FLAG_FOR_REVIEW  → log to human_review_queue.jsonl
-
-  NO_ACTION        → log and skip
+Responsibility: Read Planner output → execute each action → update status
+                PENDING → EXECUTED | FAILED → write execution_log.jsonl.
 
 Pipeline position:
+    Monitor (monitor_events.jsonl)
+        ↓
+    Analyser (analysis_report.json)
+        ↓
     Planner (plan_actions.jsonl)
         ↓
     Executor  ← YOU ARE HERE
-        ↓
-    SpaceLLM_v(N+1) live on GPU
+        (execution_log.jsonl, updated plan_actions.jsonl)
+
+Action handlers
+---------------
+RETRAIN_ADAPTER
+    Converts the training_examples list from the Planner payload into the
+    JSONL format expected by correction_fine_tuning.py / lora_finetuning_v2.py
+    (instruction-tuning pairs with the human correction as the target), writes
+    them to a timestamped dataset file, then launches the fine-tuning script
+    via subprocess.  The process is captured line-by-line so progress is
+    visible in execution_log.jsonl and a hard wall-clock timeout
+    (ExecutorConfig.retrain_timeout_seconds) prevents runaway jobs.
+    On success the new adapter path is recorded and feedback_log.jsonl is
+    updated to flip used_in_training=True for every example that went into
+    the run.
+
+PROMPT_PATCH
+    Appends a dated patch block to frontend_patch.md.  The controller /
+    FastAPI startup code is expected to read this file and inject the active
+    patches into its system prompt — the Executor never touches running
+    inference processes directly.  Each patch block is tagged with the
+    patch_key so duplicates can be detected and de-duped by the reader.
+
+TOPIC_GUARDRAIL
+    Writes (or merges) a JSON entry into mape_k/topic_guardrail.json.  The
+    FastAPI core should read this file on startup (and optionally poll it)
+    to decide whether to tighten uncertainty language or add a topic caveat
+    to the system prompt.
+
+FLAG_FOR_REVIEW
+    Appends structured records to mape_k/human_review_queue.jsonl and
+    increments a per-category counter in mape_k/review_stats.json so a
+    dashboard can surface the backlog without reading every line.
+
+NO_ACTION
+    Marked EXECUTED immediately; logged at INFO level.
+
+Design principles (matching the rest of the MAPE-K codebase)
+-------------------------------------------------------------
+- Atomic JSON/JSONL writes via tmp-file + rename — a killed process never
+  leaves a half-written file.
+- Poison-pill guard per action — one bad action can't block the rest of the
+  batch; failures are logged to executor_failed.jsonl and the action is
+  marked FAILED in plan_actions.jsonl.
+- Persisted, version-aware state in .executor_state.json so the Executor
+  knows which action_ids it has already processed across scheduler cycles.
+- The retrain subprocess is non-blocking from the MAPE loop's perspective
+  only in the sense that the Executor waits for it (within the timeout) and
+  records the outcome — this keeps the MAPE loop honest about whether the
+  retrain actually succeeded before it can be counted in `last_retrain_at`.
 
 Author: SpaceLLM Project
 """
@@ -34,11 +71,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import subprocess
 import sys
-import time
-import urllib.request
 import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -56,34 +90,30 @@ logging.basicConfig(
 log = logging.getLogger("spacellm.executor")
 
 # ---------------------------------------------------------------------------
-# Paths
+# Paths  (mirror the layout used by monitor / analyser / planner)
 # ---------------------------------------------------------------------------
 
-BASE_DIR             = Path("/mnt/DATA/saurabh/aditya/SpaceLLM/backend")
-MAPE_DIR             = BASE_DIR / "mape_k"
-FINE_TUNING_DIR      = Path("/mnt/DATA/saurabh/aditya/SpaceLLM/fine_tuning_v2")
+BASE_DIR              = Path("/mnt/DATA/saurabh/aditya/SpaceLLM/backend")
+MAPE_DIR              = BASE_DIR / "mape_k"
+FINE_TUNING_DIR       = BASE_DIR.parent / "fine_tuning_v2"  # ../fine_tuning_v2
 
-# v5 adapter output dir  (matches FINAL_DIR in lora_finetuning_v5.py)
-ADAPTER_OUTPUT_DIR   = FINE_TUNING_DIR / "outputs_v5" / "spacellm_lora_final"
+PLAN_ACTIONS_LOG      = MAPE_DIR / "plan_actions.jsonl"
+EXECUTION_LOG         = MAPE_DIR / "execution_log.jsonl"
+FEEDBACK_LOG          = BASE_DIR / "feedback_log.jsonl"
+FRONTEND_PATCH_FILE   = BASE_DIR / "frontend_patch.md"
+TOPIC_GUARDRAIL_FILE  = MAPE_DIR / "topic_guardrail.json"
+REVIEW_QUEUE_FILE     = MAPE_DIR / "human_review_queue.jsonl"
+REVIEW_STATS_FILE     = MAPE_DIR / "review_stats.json"
+STATE_FILE            = MAPE_DIR / ".executor_state.json"
+FAILED_LOG            = MAPE_DIR / "executor_failed.jsonl"
 
-# Original train data for replay buffer (used by v5)
-ORIGINAL_TRAIN_FILE  = Path(
-    "/mnt/DATA/saurabh/aditya/SpaceLLM/data_processing/DatasetA_core_QA_v2/train.json"
-)
-VAL_FILE             = Path(
-    "/mnt/DATA/saurabh/aditya/SpaceLLM/data_processing/DatasetA_core_QA_v2/validate.json"
-)
-
-# MAPE-K files
-CORRECTION_FILE      = MAPE_DIR / "correction_train_injection.json"
-PLAN_ACTIONS_LOG     = MAPE_DIR / "plan_actions.jsonl"
-FEEDBACK_LOG         = BASE_DIR / "feedback_log.jsonl"
-MAIN_PY_PATH         = BASE_DIR / "main.py"
-HUMAN_REVIEW_QUEUE   = MAPE_DIR / "human_review_queue.jsonl"
-EXECUTION_LOG        = MAPE_DIR / "execution_log.jsonl"
-STATE_FILE           = MAPE_DIR / ".executor_state.json"
+# Fine-tuning script & dataset output directory
+FINETUNE_SCRIPT       = FINE_TUNING_DIR / "correction_fine_tuning.py"
+FINETUNE_DATASET_DIR  = MAPE_DIR / "retrain_datasets"
+ADAPTER_OUTPUT_DIR    = FINE_TUNING_DIR / "outputs"
 
 MAPE_DIR.mkdir(parents=True, exist_ok=True)
+FINETUNE_DATASET_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -91,63 +121,54 @@ MAPE_DIR.mkdir(parents=True, exist_ok=True)
 
 @dataclass
 class ExecutorConfig:
-    # Fine-tuning script — v5 does delta training (corrections + replay only)
-    finetune_script:          str   = str(FINE_TUNING_DIR / "lora_finetuning_v5.py")
-    cuda_visible_devices:     str   = "1"
+    # Retrain subprocess
+    retrain_timeout_seconds: int  = 7200          # 2 hours hard cap
+    python_executable:       str  = sys.executable # same venv that runs execute.py
 
-    # v5 hyperparams (smaller than v4 since dataset is tiny)
-    finetune_epochs:          int   = 3
-    finetune_lr:              float = 5e-5
-    finetune_replay_ratio:    float = 0.30   # 30% replay buffer
-    finetune_max_seq_len:     int   = 2048
-
-    # HuggingFace push
-    hf_token_env:             str   = "HF_TOKEN"
-    hf_base_org:              str   = "AdityaPS"
-
-    # Backend restart
-    uvicorn_host:             str   = "localhost"
-    uvicorn_port:             int   = 8000
-    uvicorn_startup_wait_s:   int   = 360    # 6 min for model to load
+    # Dataset naming
+    dataset_file_prefix: str = "retrain_dataset"
 
     # Prompt patch
-    system_prompt_marker:     str   = "SYSTEM_PROMPT = ("
-    system_prompt_close:      str   = "\n)"
+    patch_file_max_bytes: int = 500_000            # guard against unbounded growth
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Data models
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ExecutionRecord:
+    execution_id:  str
+    action_id:     str
+    action_type:   str
+    plan_id:       str
+    status:        str            # "EXECUTED" | "FAILED" | "SKIPPED"
+    started_at:    str
+    finished_at:   str
+    duration_s:    float
+    result:        dict[str, Any] = field(default_factory=dict)
+    error:         str | None     = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+# ---------------------------------------------------------------------------
+# Atomic-write helper (matches the pattern in monitor / analyser / planner)
 # ---------------------------------------------------------------------------
 
 def _atomic_write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     tmp.replace(path)
 
 
-def _append_jsonl(path: Path, record: dict) -> None:
+def _atomic_write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(record) + "\n")
-
-
-# ---------------------------------------------------------------------------
-# Result model
-# ---------------------------------------------------------------------------
-
-@dataclass
-class ExecutionResult:
-    action_id:   str
-    action_type: str
-    status:      str       # "EXECUTED" | "FAILED" | "SKIPPED"
-    timestamp:   str
-    duration_s:  float
-    details:     dict = field(default_factory=dict)
-    error:       str  = ""
-
-    def to_dict(self) -> dict:
-        return asdict(self)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
 
 
 # ---------------------------------------------------------------------------
@@ -159,508 +180,641 @@ class Executor:
     def __init__(self, config: ExecutorConfig | None = None) -> None:
         self.config = config or ExecutorConfig()
         self._state = self._load_state()
-        log.info("Executor initialised.")
+        log.info(
+            "Executor initialised. executed_action_ids=%d",
+            len(self._state.get("executed_ids", [])),
+        )
 
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
 
-    def run(self) -> list[ExecutionResult]:
+    def run(self) -> list[ExecutionRecord]:
+        """
+        Full execution cycle:
+          1. Load all PENDING actions from plan_actions.jsonl (unseen only).
+          2. Sort by priority descending so CRITICAL actions go first.
+          3. Execute each in isolation — one failure can't poison the batch.
+          4. Persist execution records and update action statuses.
+        Returns all ExecutionRecords produced this cycle.
+        """
         log.info("=" * 60)
         log.info("Executor cycle starting.")
 
-        actions = self._load_pending_actions()
-        if not actions:
-            log.info("No PENDING actions found.")
+        pending = self._load_pending_actions()
+        if not pending:
+            log.info("No new PENDING actions to execute.")
             return []
 
         # Highest priority first
-        actions.sort(key=lambda a: a.get("priority", 0), reverse=True)
-        log.info("Found %d PENDING action(s).", len(actions))
+        pending.sort(key=lambda a: a.get("priority", 0), reverse=True)
+        log.info("Executing %d pending action(s).", len(pending))
 
-        results: list[ExecutionResult] = []
-        for action in actions:
-            result = self._execute_action(action)
-            results.append(result)
-            _append_jsonl(EXECUTION_LOG, result.to_dict())
-            self._update_action_status(
-                action["action_id"], result.status, result.error
-            )
+        records: list[ExecutionRecord] = []
+        updated_ids: dict[str, str] = {}   # action_id -> new status
 
+        for action in pending:
+            action_id   = action.get("action_id", str(uuid.uuid4()))
+            action_type = action.get("action_type", "UNKNOWN")
+            plan_id     = action.get("plan_id", "unknown")
+
+            started_at = datetime.now(timezone.utc).isoformat()
+            log.info("→ [%s] action_id=%s  priority=%s",
+                     action_type, action_id[:8], action.get("priority"))
+
+            try:
+                result = self._dispatch(action)
+                finished_at = datetime.now(timezone.utc).isoformat()
+                duration_s  = (
+                    datetime.fromisoformat(finished_at) -
+                    datetime.fromisoformat(started_at)
+                ).total_seconds()
+
+                rec = ExecutionRecord(
+                    execution_id = str(uuid.uuid4()),
+                    action_id    = action_id,
+                    action_type  = action_type,
+                    plan_id      = plan_id,
+                    status       = "EXECUTED",
+                    started_at   = started_at,
+                    finished_at  = finished_at,
+                    duration_s   = round(duration_s, 3),
+                    result       = result,
+                )
+                updated_ids[action_id] = "EXECUTED"
+                log.info("  ✓ EXECUTED in %.1fs", duration_s)
+
+            except Exception as exc:
+                finished_at = datetime.now(timezone.utc).isoformat()
+                duration_s  = (
+                    datetime.fromisoformat(finished_at) -
+                    datetime.fromisoformat(started_at)
+                ).total_seconds()
+
+                log.error(
+                    "  ✗ FAILED action %s (%s): %s",
+                    action_id[:8], action_type, exc, exc_info=True,
+                )
+                self._log_failed_action(action, exc)
+                rec = ExecutionRecord(
+                    execution_id = str(uuid.uuid4()),
+                    action_id    = action_id,
+                    action_type  = action_type,
+                    plan_id      = plan_id,
+                    status       = "FAILED",
+                    started_at   = started_at,
+                    finished_at  = finished_at,
+                    duration_s   = round(duration_s, 3),
+                    error        = str(exc),
+                )
+                updated_ids[action_id] = "FAILED"
+
+            self._append_execution_log(rec)
+            records.append(rec)
+            self._state.setdefault("executed_ids", []).append(action_id)
+
+        # Rewrite plan_actions.jsonl with updated statuses
+        self._update_action_statuses(updated_ids)
         self._save_state()
-        log.info("Executor cycle complete. %d action(s) processed.", len(results))
+
+        executed = sum(1 for r in records if r.status == "EXECUTED")
+        failed   = sum(1 for r in records if r.status == "FAILED")
+        log.info("Cycle complete. %d EXECUTED, %d FAILED.", executed, failed)
         log.info("=" * 60)
-        return results
+        return records
 
     # ------------------------------------------------------------------
-    # Dispatcher
+    # Action dispatcher
     # ------------------------------------------------------------------
 
-    def _execute_action(self, action: dict) -> ExecutionResult:
-        atype = action.get("action_type", "UNKNOWN")
-        aid   = action.get("action_id", "?")
-        t0    = time.time()
-        log.info("Executing [%s] action_id=%s ...", atype, aid[:8])
+    def _dispatch(self, action: dict) -> dict[str, Any]:
+        action_type = action.get("action_type")
+        payload     = action.get("payload", {})
 
-        try:
-            if atype == "RETRAIN_ADAPTER":
-                details = self._execute_retrain(action)
-            elif atype == "PROMPT_PATCH":
-                details = self._execute_prompt_patch(action)
-            elif atype == "TOPIC_GUARDRAIL":
-                details = self._execute_guardrail(action)
-            elif atype == "FLAG_FOR_REVIEW":
-                details = self._execute_flag_for_review(action)
-            elif atype == "NO_ACTION":
-                details = {"message": "No action required this cycle."}
-                log.info("NO_ACTION — skipping.")
-            else:
-                raise ValueError(f"Unknown action_type: {atype}")
+        dispatch_map = {
+            "RETRAIN_ADAPTER": self._execute_retrain,
+            "PROMPT_PATCH":    self._execute_prompt_patch,
+            "TOPIC_GUARDRAIL": self._execute_topic_guardrail,
+            "FLAG_FOR_REVIEW": self._execute_flag_for_review,
+            "NO_ACTION":       self._execute_no_action,
+        }
 
-            return ExecutionResult(
-                action_id   = aid,
-                action_type = atype,
-                status      = "EXECUTED",
-                timestamp   = datetime.now(timezone.utc).isoformat(),
-                duration_s  = round(time.time() - t0, 2),
-                details     = details,
-            )
+        handler = dispatch_map.get(action_type)
+        if handler is None:
+            raise ValueError(f"Unknown action_type: {action_type!r}")
 
-        except Exception as exc:
-            log.error("Action [%s] %s FAILED: %s", atype, aid[:8], exc, exc_info=True)
-            return ExecutionResult(
-                action_id   = aid,
-                action_type = atype,
-                status      = "FAILED",
-                timestamp   = datetime.now(timezone.utc).isoformat(),
-                duration_s  = round(time.time() - t0, 2),
-                error       = str(exc),
-            )
+        return handler(payload, action)
 
     # ------------------------------------------------------------------
-    # RETRAIN_ADAPTER
+    # Handler: RETRAIN_ADAPTER
     # ------------------------------------------------------------------
 
-    def _execute_retrain(self, action: dict) -> dict:
-        payload       = action.get("payload", {})
-        base_version  = payload.get("base_model_version", "SpaceLLM_v1")
-        target_label  = payload.get("target_adapter_label", "SpaceLLM_v2")
-        examples      = payload.get("training_examples", [])
+    def _execute_retrain(self, payload: dict, action: dict) -> dict[str, Any]:
+        """
+        1. Validate and write training examples to a timestamped JSONL dataset.
+        2. Launch correction_fine_tuning.py as a subprocess.
+        3. Stream stdout/stderr into the execution result.
+        4. On success, mark used_in_training=True in feedback_log.jsonl.
+
+        The dataset format is one JSON object per line with keys:
+            instruction  (the question)
+            input        (the model's original, flawed answer)
+            output       (the human correction — the learning target)
+            feedback_id  (traceability back to feedback_log.jsonl)
+            bertscore    (float or null — can be used for loss weighting)
+
+        This matches the SFT format that correction_fine_tuning.py expects
+        (instruction / input / output triplets, where the LoRA model is
+        trained to produce `output` given `instruction + input`).
+        """
+        examples       = payload.get("training_examples", [])
+        base_version   = payload.get("base_model_version", "unknown")
+        target_label   = payload.get("target_adapter_label", "unknown")
 
         if not examples:
             raise ValueError("RETRAIN_ADAPTER payload has no training_examples.")
 
-        log.info("Retraining: %s -> %s  (%d correction examples)",
-                 base_version, target_label, len(examples))
+        # Write dataset
+        ts          = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        dataset_path = FINETUNE_DATASET_DIR / f"{self.config.dataset_file_prefix}_{ts}.jsonl"
+        valid_ids: list[str] = []
 
-        # 1. Write correction_train_injection.json
-        self._write_correction_file(examples)
+        with dataset_path.open("w", encoding="utf-8") as fh:
+            for ex in examples:
+                question  = (ex.get("question")  or "").strip()
+                candidate = (ex.get("candidate") or "").strip()
+                reference = (ex.get("reference") or "").strip()
+                fid       = ex.get("feedback_id", "")
 
-        # 2. Derive current adapter repo from main.py so v5 continues from it
-        current_adapter = self._read_current_adapter_from_main()
-        log.info("Continuing from adapter: %s", current_adapter)
+                if not question or not reference:
+                    log.warning("Skipping training example %s — empty question or reference.", fid)
+                    continue
 
-        # 3. Run lora_finetuning_v5.py (delta training)
-        self._run_finetuning_v5(current_adapter)
+                record = {
+                    "instruction": question,
+                    "input":       candidate,
+                    "output":      reference,
+                    "feedback_id": fid,
+                    "bertscore":   ex.get("bertscore"),
+                }
+                fh.write(json.dumps(record) + "\n")
+                valid_ids.append(fid)
 
-        # 4. Push new adapter to HuggingFace
-        new_repo_id = self._push_to_hf(target_label)
+        log.info("Dataset written: %s  (%d examples)", dataset_path, len(valid_ids))
 
-        # 5. Update ADAPTER_MODEL_ID in main.py
-        self._update_adapter_in_main_py(new_repo_id)
+        if not valid_ids:
+            raise ValueError("All training examples were invalid — nothing written to dataset.")
 
-        # 6. Mark corrections as used_in_training=True
-        feedback_ids = [e.get("feedback_id") for e in examples if e.get("feedback_id")]
-        self._mark_corrections_used(feedback_ids)
-
-        # 7. Restart backend
-        self._restart_backend()
-
-        return {
-            "base_version":          base_version,
-            "new_version":           target_label,
-            "new_repo_id":           new_repo_id,
-            "continued_from":        current_adapter,
-            "examples_used":         len(examples),
-            "feedback_ids_marked":   len(feedback_ids),
-        }
-
-    def _write_correction_file(self, examples: list[dict]) -> None:
-        """
-        Convert Planner correction examples into lora_finetuning_v5.py's
-        expected format: each example is a record with a `messages` list
-        containing a user turn (question) and an assistant turn (reference).
-        """
-        records = []
-        for i, ex in enumerate(examples):
-            question  = (ex.get("question")  or "").strip()
-            reference = (ex.get("reference") or "").strip()
-            if not question or not reference:
-                log.debug("Skipping example %d — missing question or reference.", i)
-                continue
-            records.append({
-                "sample_id":    f"correction_{i:04d}",
-                "source_id":    ex.get("feedback_id", f"fb_{i}"),
-                "mission_name": "MAPE-K Correction",
-                "organization": "SpaceLLM",
-                "aspect":       "correction",
-                "difficulty":   "medium",
-                "chain_id":     f"chain_correction_{i:04d}",
-                "bertscore":    ex.get("bertscore"),
-                "messages": [
-                    {"role": "user",      "content": question},
-                    {"role": "assistant", "content": reference},
-                ],
-            })
-
-        if not records:
-            raise ValueError(
-                "No valid correction records after filtering "
-                "(all had empty question or reference)."
-            )
-
-        CORRECTION_FILE.parent.mkdir(parents=True, exist_ok=True)
-        CORRECTION_FILE.write_text(
-            json.dumps(records, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        log.info("Correction file written: %d records -> %s",
-                 len(records), CORRECTION_FILE)
-
-    def _read_current_adapter_from_main(self) -> str:
-        """Read the current ADAPTER_MODEL_ID value from main.py."""
-        if not MAIN_PY_PATH.exists():
-            return "AdityaPS/SpaceLLM_v1"
-        content = MAIN_PY_PATH.read_text(encoding="utf-8")
-        match = re.search(r'ADAPTER_MODEL_ID\s*=\s*["\']([^"\']+)["\']', content)
-        if match:
-            return match.group(1)
-        log.warning("Could not parse ADAPTER_MODEL_ID from main.py — using default.")
-        return "AdityaPS/SpaceLLM_v1"
-
-    def _run_finetuning_v5(self, current_adapter: str) -> None:
-        """
-        Run lora_finetuning_v5.py with:
-          --correction_file  correction_train_injection.json
-          --adapter_base     <current live adapter>   (continue from it, not scratch)
-          --original_train   DatasetA_core_QA_v2/train.json  (replay buffer pool)
-          --replay_ratio     0.30
-          --epochs / --lr    from config
-        """
-        script = self.config.finetune_script
-        if not Path(script).exists():
-            raise FileNotFoundError(f"v5 fine-tuning script not found: {script}")
-
-        env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = self.config.cuda_visible_devices
+        # Build subprocess command
+        #
+        # correction_fine_tuning.py is expected to accept:
+        #   --dataset   path to the JSONL file we just wrote
+        #   --output    directory where the adapter will be saved
+        #   --run_name  human-readable label for this adapter
+        #
+        # If the script's CLI differs, adjust the arg list here (not elsewhere).
+        adapter_dir = ADAPTER_OUTPUT_DIR / target_label
+        adapter_dir.mkdir(parents=True, exist_ok=True)
 
         cmd = [
-            sys.executable, script,
-            "--correction_file", str(CORRECTION_FILE),
-            "--adapter_base",    current_adapter,
-            "--original_train",  str(ORIGINAL_TRAIN_FILE),
-            "--val_file",        str(VAL_FILE),
-            "--replay_ratio",    str(self.config.finetune_replay_ratio),
-            "--epochs",          str(self.config.finetune_epochs),
-            "--lr",              str(self.config.finetune_lr),
-            "--max_seq_len",     str(self.config.finetune_max_seq_len),
+            self.config.python_executable,
+            str(FINETUNE_SCRIPT),
+            "--dataset",   str(dataset_path),
+            "--output",    str(adapter_dir),
+            "--run_name",  target_label,
         ]
 
-        log.info("Running v5 fine-tuning: %s", " ".join(cmd))
-        result = subprocess.run(cmd, env=env, check=False)
-        if result.returncode != 0:
+        log.info("Launching fine-tuning: %s", " ".join(cmd))
+        log.info("Timeout: %ds", self.config.retrain_timeout_seconds)
+
+        stdout_lines: list[str] = []
+        stderr_lines: list[str] = []
+        returncode = None
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env={**os.environ},  # inherit CUDA_VISIBLE_DEVICES, HF_HOME, etc.
+            )
+
+            # Stream output so the execution log reflects real-time progress
+            import threading
+
+            def _drain(stream, store: list[str], label: str):
+                for line in stream:
+                    line = line.rstrip()
+                    store.append(line)
+                    log.info("[finetune %s] %s", label, line)
+
+            t_out = threading.Thread(target=_drain, args=(proc.stdout, stdout_lines, "STDOUT"))
+            t_err = threading.Thread(target=_drain, args=(proc.stderr, stderr_lines, "STDERR"))
+            t_out.start()
+            t_err.start()
+
+            try:
+                returncode = proc.wait(timeout=self.config.retrain_timeout_seconds)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                t_out.join(timeout=5)
+                t_err.join(timeout=5)
+                raise RuntimeError(
+                    f"Fine-tuning process timed out after {self.config.retrain_timeout_seconds}s "
+                    f"and was killed."
+                )
+
+            t_out.join()
+            t_err.join()
+
+        except FileNotFoundError:
             raise RuntimeError(
-                f"lora_finetuning_v5.py exited with code {result.returncode}."
+                f"Fine-tuning script not found at {FINETUNE_SCRIPT}. "
+                "Check FINE_TUNING_DIR path in execute.py."
             )
-        log.info("v5 fine-tuning complete.")
 
-    def _push_to_hf(self, target_label: str) -> str:
+        if returncode != 0:
+            tail_stderr = "\n".join(stderr_lines[-30:])
+            raise RuntimeError(
+                f"Fine-tuning exited with code {returncode}.\n"
+                f"Last stderr:\n{tail_stderr}"
+            )
+
+        # Mark examples as used in feedback_log.jsonl
+        marked = self._mark_used_in_training(set(valid_ids))
+        log.info("Marked %d/%d feedback records as used_in_training=True.",
+                 marked, len(valid_ids))
+
+        # Persist the new adapter path in executor state for reference
+        self._state["last_adapter"] = {
+            "target_label":  target_label,
+            "adapter_path":  str(adapter_dir),
+            "dataset_path":  str(dataset_path),
+            "example_count": len(valid_ids),
+            "timestamp":     datetime.now(timezone.utc).isoformat(),
+        }
+
+        return {
+            "target_adapter_label": target_label,
+            "adapter_path":         str(adapter_dir),
+            "dataset_path":         str(dataset_path),
+            "examples_used":        len(valid_ids),
+            "returncode":           returncode,
+            "stdout_tail":          stdout_lines[-20:],
+            "stderr_tail":          stderr_lines[-10:],
+            "marked_in_feedback":   marked,
+        }
+
+    def _mark_used_in_training(self, feedback_ids: set[str]) -> int:
         """
-        Push adapter from ADAPTER_OUTPUT_DIR to HuggingFace Hub.
-        Returns new repo_id e.g. 'AdityaPS/SpaceLLM_v2'.
+        Atomically rewrite feedback_log.jsonl, flipping used_in_training=True
+        for every record whose feedback_id is in the provided set.
+        Returns the count of records actually updated.
         """
-        from huggingface_hub import HfApi
-
-        hf_token = os.environ.get(self.config.hf_token_env)
-        if not hf_token:
-            raise EnvironmentError(
-                f"HF token not set. Run: export {self.config.hf_token_env}=<your_token>"
-            )
-
-        new_repo = f"{self.config.hf_base_org}/{target_label}"
-        api      = HfApi(token=hf_token)
-
-        # Create repo (idempotent)
-        api.create_repo(repo_id=new_repo, repo_type="model", exist_ok=True)
-        log.info("HF repo ready: %s", new_repo)
-
-        if not ADAPTER_OUTPUT_DIR.exists():
-            raise FileNotFoundError(
-                f"Adapter output directory not found: {ADAPTER_OUTPUT_DIR}\n"
-                f"Ensure lora_finetuning_v5.py completed successfully."
-            )
-
-        log.info("Uploading adapter %s -> %s ...", ADAPTER_OUTPUT_DIR, new_repo)
-        api.upload_folder(
-            folder_path    = str(ADAPTER_OUTPUT_DIR),
-            repo_id        = new_repo,
-            repo_type      = "model",
-            commit_message = f"MAPE-K auto-retrain: {target_label}",
-        )
-        log.info("Adapter pushed: https://huggingface.co/%s", new_repo)
-        return new_repo
-
-    def _update_adapter_in_main_py(self, new_repo_id: str) -> None:
-        """Patch ADAPTER_MODEL_ID in main.py to point at the new adapter."""
-        if not MAIN_PY_PATH.exists():
-            raise FileNotFoundError(f"main.py not found: {MAIN_PY_PATH}")
-
-        content = MAIN_PY_PATH.read_text(encoding="utf-8")
-        new_content = re.sub(
-            r'(ADAPTER_MODEL_ID\s*=\s*)["\'][^"\']+["\']',
-            f'\\1"{new_repo_id}"',
-            content,
-        )
-        if new_content == content:
-            raise ValueError("Could not find ADAPTER_MODEL_ID in main.py.")
-
-        MAIN_PY_PATH.write_text(new_content, encoding="utf-8")
-        log.info("main.py updated: ADAPTER_MODEL_ID = %s", new_repo_id)
-
-    def _mark_corrections_used(self, feedback_ids: list[str]) -> None:
-        """Flip used_in_training=True for all used feedback_ids."""
         if not FEEDBACK_LOG.exists() or not feedback_ids:
-            return
+            return 0
 
-        id_set    = set(feedback_ids)
-        updated   = 0
-        new_lines = []
-
+        updated  = 0
+        new_lines: list[str] = []
         with FEEDBACK_LOG.open("r", encoding="utf-8") as fh:
             for line in fh:
-                line = line.strip()
-                if not line:
+                stripped = line.strip()
+                if not stripped:
                     continue
                 try:
-                    record = json.loads(line)
-                    if record.get("feedback_id") in id_set:
+                    record = json.loads(stripped)
+                    if record.get("feedback_id") in feedback_ids:
                         record["used_in_training"] = True
                         updated += 1
                     new_lines.append(json.dumps(record))
                 except json.JSONDecodeError:
-                    new_lines.append(line)
+                    new_lines.append(stripped)  # preserve malformed lines as-is
 
         tmp = FEEDBACK_LOG.with_suffix(".jsonl.tmp")
         tmp.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
         tmp.replace(FEEDBACK_LOG)
-        log.info("Marked %d feedback record(s) as used_in_training=True.", updated)
-
-    def _restart_backend(self) -> None:
-        """Kill uvicorn, restart it, wait for /health ready=true."""
-        import signal as _signal
-
-        # Find and kill existing uvicorn
-        try:
-            result = subprocess.run(
-                ["pgrep", "-f", "uvicorn main:app"],
-                capture_output=True, text=True,
-            )
-            pids = [int(p) for p in result.stdout.strip().split() if p.isdigit()]
-        except Exception:
-            pids = []
-
-        for pid in pids:
-            try:
-                os.kill(pid, _signal.SIGTERM)
-                log.info("Sent SIGTERM to uvicorn PID %d.", pid)
-            except ProcessLookupError:
-                pass
-
-        time.sleep(5)   # let uvicorn shut down
-
-        env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = self.config.cuda_visible_devices
-
-        cmd = [
-            sys.executable, "-m", "uvicorn", "main:app",
-            "--host", self.config.uvicorn_host,
-            "--port", str(self.config.uvicorn_port),
-        ]
-        log.info("Starting uvicorn: %s", " ".join(cmd))
-        subprocess.Popen(cmd, env=env, cwd=str(BASE_DIR))
-
-        # Poll /health
-        health_url = (
-            f"http://{self.config.uvicorn_host}:{self.config.uvicorn_port}/health"
-        )
-        deadline = time.time() + self.config.uvicorn_startup_wait_s
-        log.info("Waiting for backend (up to %ds) ...",
-                 self.config.uvicorn_startup_wait_s)
-
-        while time.time() < deadline:
-            time.sleep(15)
-            try:
-                with urllib.request.urlopen(health_url, timeout=5) as resp:
-                    data = json.loads(resp.read())
-                    if data.get("ready"):
-                        log.info("Backend ready — new adapter loaded successfully.")
-                        return
-                    log.info("Backend starting... (ready=%s)", data.get("ready"))
-            except Exception as exc:
-                log.debug("Health check: %s", exc)
-
-        raise TimeoutError(
-            f"Backend did not become ready within {self.config.uvicorn_startup_wait_s}s."
-        )
+        return updated
 
     # ------------------------------------------------------------------
-    # PROMPT_PATCH
+    # Handler: PROMPT_PATCH
     # ------------------------------------------------------------------
 
-    def _execute_prompt_patch(self, action: dict) -> dict:
-        payload    = action.get("payload", {})
-        patch_text = (payload.get("patch_text") or "").strip()
-        patch_key  = payload.get("patch_key", "unknown")
+    def _execute_prompt_patch(self, payload: dict, action: dict) -> dict[str, Any]:
+        """
+        Append a versioned patch block to frontend_patch.md.
+
+        The file is read by the FastAPI server (or controller.py) at startup
+        to build the system prompt.  Format is Markdown so it's human-readable
+        and a simple parser can extract patch blocks by the sentinel lines.
+
+        Each block:
+            <!-- PATCH_START patch_key=<key> applied_at=<iso> -->
+            <patch_text>
+            <!-- PATCH_END patch_key=<key> -->
+
+        A reader that assembles the system prompt should collect all PATCH
+        blocks in file order and append their text to the base system prompt,
+        deduplicating by patch_key (last-write wins) so re-issuing a patch
+        after a cooldown cleanly replaces the old wording.
+        """
+        patch_key  = payload.get("patch_key", "unknown_patch")
+        patch_text = payload.get("patch_text", "").strip()
+        target     = payload.get("target", "system_prompt")
 
         if not patch_text:
-            raise ValueError("patch_text is empty in PROMPT_PATCH payload.")
-        if not MAIN_PY_PATH.exists():
-            raise FileNotFoundError(f"main.py not found: {MAIN_PY_PATH}")
+            raise ValueError(f"PROMPT_PATCH payload has empty patch_text for key '{patch_key}'.")
 
-        content = MAIN_PY_PATH.read_text(encoding="utf-8")
+        # Guard file size
+        current_size = FRONTEND_PATCH_FILE.stat().st_size if FRONTEND_PATCH_FILE.exists() else 0
+        if current_size > self.config.patch_file_max_bytes:
+            log.warning(
+                "frontend_patch.md is %.1f KB — consider archiving old patches.",
+                current_size / 1024,
+            )
 
-        marker    = self.config.system_prompt_marker
-        start_idx = content.find(marker)
-        if start_idx == -1:
-            raise ValueError(f"Could not find '{marker}' in main.py.")
+        applied_at = datetime.now(timezone.utc).isoformat()
+        block = (
+            f"\n<!-- PATCH_START patch_key={patch_key} applied_at={applied_at} -->\n"
+            f"{patch_text}\n"
+            f"<!-- PATCH_END patch_key={patch_key} -->\n"
+        )
 
-        # Find the closing paren of the SYSTEM_PROMPT tuple
-        close_idx = content.find("\n)", start_idx)
-        if close_idx == -1:
-            raise ValueError("Could not find closing ')' of SYSTEM_PROMPT in main.py.")
+        with FRONTEND_PATCH_FILE.open("a", encoding="utf-8") as fh:
+            fh.write(block)
 
-        # Append patch as a new concatenated string before the closing paren
-        patch_line  = f'\n    "{patch_text}"'
-        new_content = content[:close_idx] + patch_line + content[close_idx:]
-
-        MAIN_PY_PATH.write_text(new_content, encoding="utf-8")
-        log.info("Prompt patch '%s' applied.", patch_key)
-
-        # Restart backend to pick up new system prompt
-        self._restart_backend()
+        log.info("Patch '%s' appended to %s", patch_key, FRONTEND_PATCH_FILE)
 
         return {
-            "patch_key":  patch_key,
-            "patch_text": patch_text,
-            "applied_to": str(MAIN_PY_PATH),
+            "patch_key":   patch_key,
+            "target":      target,
+            "applied_at":  applied_at,
+            "patch_bytes": len(patch_text),
         }
 
     # ------------------------------------------------------------------
-    # TOPIC_GUARDRAIL
+    # Handler: TOPIC_GUARDRAIL
     # ------------------------------------------------------------------
 
-    def _execute_guardrail(self, action: dict) -> dict:
-        payload = action.get("payload", {})
-        record  = {
-            "type":           "TOPIC_GUARDRAIL",
-            "action_id":      action.get("action_id"),
-            "timestamp":      datetime.now(timezone.utc).isoformat(),
-            "topics":         payload.get("topics_reported", []),
-            "topic_specific": payload.get("topic_specific", False),
-            "suggestion":     payload.get("suggested_action", ""),
-            "reasoning":      action.get("reasoning", []),
+    def _execute_topic_guardrail(self, payload: dict, action: dict) -> dict[str, Any]:
+        """
+        Merge the guardrail directive into mape_k/topic_guardrail.json.
+
+        Schema of topic_guardrail.json:
+        {
+          "updated_at": "<ISO>",
+          "topic_specific": bool,
+          "topics_reported": [...],
+          "suggested_action": "...",
+          "history": [
+            { "applied_at": ..., "topics_reported": [...], "suggested_action": ... },
+            ...
+          ]
         }
-        _append_jsonl(HUMAN_REVIEW_QUEUE, record)
-        log.info("Topic guardrail written to human_review_queue.jsonl.")
-        return {"written_to": str(HUMAN_REVIEW_QUEUE)}
 
-    # ------------------------------------------------------------------
-    # FLAG_FOR_REVIEW
-    # ------------------------------------------------------------------
+        The FastAPI core or controller.py should read this file at startup
+        (and optionally poll it) to apply the suggested instructions.  The
+        executor doesn't reach into the running server — it writes a file
+        and the server is responsible for picking it up.
+        """
+        topics           = payload.get("topics_reported", [])
+        suggested_action = payload.get("suggested_action", "")
+        topic_specific   = payload.get("topic_specific", False)
+        now              = datetime.now(timezone.utc).isoformat()
 
-    def _execute_flag_for_review(self, action: dict) -> dict:
-        payload = action.get("payload", {})
-        record  = {
-            "type":              "FLAG_FOR_REVIEW",
-            "action_id":         action.get("action_id"),
-            "timestamp":         datetime.now(timezone.utc).isoformat(),
-            "flagged_questions": payload.get("flagged_questions", []),
-            "reasoning":         action.get("reasoning", []),
+        # Load existing state
+        existing: dict[str, Any] = {}
+        if TOPIC_GUARDRAIL_FILE.exists():
+            try:
+                existing = json.loads(TOPIC_GUARDRAIL_FILE.read_text(encoding="utf-8"))
+            except Exception as exc:
+                log.warning("Could not parse topic_guardrail.json (%s) — overwriting.", exc)
+
+        history: list[dict] = existing.get("history", [])
+        history.append({
+            "applied_at":      now,
+            "topics_reported": topics,
+            "suggested_action": suggested_action,
+        })
+
+        guardrail = {
+            "updated_at":      now,
+            "topic_specific":  topic_specific,
+            "topics_reported": topics,
+            "suggested_action": suggested_action,
+            "history":         history,
         }
-        _append_jsonl(HUMAN_REVIEW_QUEUE, record)
-        n = len(payload.get("flagged_questions", []))
-        log.info("Flagged %d question(s) for human review.", n)
-        return {"flagged_count": n, "written_to": str(HUMAN_REVIEW_QUEUE)}
+        _atomic_write_json(TOPIC_GUARDRAIL_FILE, guardrail)
+
+        log.info("Topic guardrail updated. topics=%s  topic_specific=%s", topics, topic_specific)
+
+        return {
+            "guardrail_file":   str(TOPIC_GUARDRAIL_FILE),
+            "topics_reported":  topics,
+            "topic_specific":   topic_specific,
+            "history_entries":  len(history),
+        }
 
     # ------------------------------------------------------------------
-    # plan_actions.jsonl management
+    # Handler: FLAG_FOR_REVIEW
+    # ------------------------------------------------------------------
+
+    def _execute_flag_for_review(self, payload: dict, action: dict) -> dict[str, Any]:
+        """
+        Append flagged items to mape_k/human_review_queue.jsonl and
+        update aggregate counters in mape_k/review_stats.json.
+
+        Two payload shapes are supported (as emitted by plan.py):
+          Shape A — repeated failures:
+            { "flagged_questions": [ { "question_key", "negative_count", "feedback_id" }, ... ] }
+          Shape B — retrain cooldown:
+            { "reason": "retrain_cooldown_active", "elapsed_hours": float }
+        """
+        now     = datetime.now(timezone.utc).isoformat()
+        appended = 0
+
+        # Load review stats
+        stats: dict[str, Any] = {}
+        if REVIEW_STATS_FILE.exists():
+            try:
+                stats = json.loads(REVIEW_STATS_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        stats.setdefault("total_flagged", 0)
+        stats.setdefault("by_reason", {})
+
+        with REVIEW_QUEUE_FILE.open("a", encoding="utf-8") as fh:
+
+            # Shape A: repeated-failure questions
+            if "flagged_questions" in payload:
+                for item in payload.get("flagged_questions", []):
+                    record = {
+                        "review_id":      str(uuid.uuid4()),
+                        "flagged_at":     now,
+                        "action_id":      action.get("action_id"),
+                        "plan_id":        action.get("plan_id"),
+                        "category":       "repeated_failure",
+                        "status":         "OPEN",
+                        **item,
+                    }
+                    fh.write(json.dumps(record) + "\n")
+                    appended += 1
+                stats["total_flagged"]                        += appended
+                stats["by_reason"]["repeated_failure"]         = (
+                    stats["by_reason"].get("repeated_failure", 0) + appended
+                )
+
+            # Shape B: retrain cooldown
+            elif "reason" in payload:
+                reason = payload.get("reason", "unknown")
+                record = {
+                    "review_id":    str(uuid.uuid4()),
+                    "flagged_at":   now,
+                    "action_id":    action.get("action_id"),
+                    "plan_id":      action.get("plan_id"),
+                    "category":     reason,
+                    "status":       "OPEN",
+                    "elapsed_hours": payload.get("elapsed_hours"),
+                    "reasoning":    action.get("reasoning", []),
+                }
+                fh.write(json.dumps(record) + "\n")
+                appended += 1
+                stats["total_flagged"]            += 1
+                stats["by_reason"][reason]         = stats["by_reason"].get(reason, 0) + 1
+
+        stats["last_updated"] = now
+        _atomic_write_json(REVIEW_STATS_FILE, stats)
+
+        log.info("Flagged %d item(s) for human review → %s", appended, REVIEW_QUEUE_FILE)
+
+        return {
+            "review_queue_file": str(REVIEW_QUEUE_FILE),
+            "items_appended":    appended,
+            "total_open":        stats["total_flagged"],
+        }
+
+    # ------------------------------------------------------------------
+    # Handler: NO_ACTION
+    # ------------------------------------------------------------------
+
+    def _execute_no_action(self, payload: dict, action: dict) -> dict[str, Any]:
+        log.info("NO_ACTION — all signals within normal thresholds this cycle.")
+        return {"note": "No intervention required this cycle."}
+
+    # ------------------------------------------------------------------
+    # plan_actions.jsonl I/O
     # ------------------------------------------------------------------
 
     def _load_pending_actions(self) -> list[dict]:
+        """
+        Read plan_actions.jsonl and return actions that are:
+          - status == "PENDING"
+          - auto_approved == True
+          - action_id not already in _state["executed_ids"]
+        """
         if not PLAN_ACTIONS_LOG.exists():
+            log.warning("plan_actions.jsonl not found: %s", PLAN_ACTIONS_LOG)
             return []
 
-        pending = []
-        seen    = set()
+        executed_ids = set(self._state.get("executed_ids", []))
+        pending: list[dict] = []
         with PLAN_ACTIONS_LOG.open("r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
+            for lineno, line in enumerate(fh, 1):
+                stripped = line.strip()
+                if not stripped:
                     continue
                 try:
-                    action = json.loads(line)
-                except json.JSONDecodeError:
+                    action = json.loads(stripped)
+                except json.JSONDecodeError as exc:
+                    log.warning("plan_actions.jsonl line %d: malformed JSON (%s)", lineno, exc)
                     continue
-                aid = action.get("action_id")
-                if not aid or aid in seen:
-                    continue
-                seen.add(aid)
-                if action.get("status") == "PENDING":
-                    pending.append(action)
 
+                action_id = action.get("action_id")
+                if not action_id:
+                    log.warning("plan_actions.jsonl line %d: missing action_id — skipping.", lineno)
+                    continue
+                if action_id in executed_ids:
+                    continue
+                if action.get("status") != "PENDING":
+                    continue
+                if not action.get("auto_approved", False):
+                    log.info("Action %s requires manual approval — skipping.", action_id[:8])
+                    continue
+                pending.append(action)
+
+        log.info("Loaded %d PENDING action(s).", len(pending))
         return pending
 
-    def _update_action_status(
-        self, action_id: str, status: str, error: str = ""
-    ) -> None:
-        if not PLAN_ACTIONS_LOG.exists():
+    def _update_action_statuses(self, updated_ids: dict[str, str]) -> None:
+        """
+        Atomically rewrite plan_actions.jsonl, updating the `status` field
+        for every action_id in `updated_ids`.
+        """
+        if not PLAN_ACTIONS_LOG.exists() or not updated_ids:
             return
 
-        new_lines = []
+        new_lines: list[str] = []
         with PLAN_ACTIONS_LOG.open("r", encoding="utf-8") as fh:
             for line in fh:
-                line = line.strip()
-                if not line:
+                stripped = line.strip()
+                if not stripped:
                     continue
                 try:
-                    record = json.loads(line)
-                    if record.get("action_id") == action_id:
-                        record["status"]      = status
-                        record["executed_at"] = datetime.now(timezone.utc).isoformat()
-                        if error:
-                            record["error"] = error
-                    new_lines.append(json.dumps(record))
+                    action = json.loads(stripped)
+                    aid    = action.get("action_id")
+                    if aid in updated_ids:
+                        action["status"]      = updated_ids[aid]
+                        action["executed_at"] = datetime.now(timezone.utc).isoformat()
+                    new_lines.append(json.dumps(action))
                 except json.JSONDecodeError:
-                    new_lines.append(line)
+                    new_lines.append(stripped)
 
         tmp = PLAN_ACTIONS_LOG.with_suffix(".jsonl.tmp")
         tmp.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
         tmp.replace(PLAN_ACTIONS_LOG)
+        log.info("Updated statuses for %d action(s) in plan_actions.jsonl.", len(updated_ids))
 
     # ------------------------------------------------------------------
-    # State
+    # Execution log
     # ------------------------------------------------------------------
 
-    def _load_state(self) -> dict:
+    def _append_execution_log(self, rec: ExecutionRecord) -> None:
+        try:
+            with EXECUTION_LOG.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec.to_dict()) + "\n")
+        except OSError as exc:
+            log.error("Failed to write execution log entry: %s", exc)
+
+    # ------------------------------------------------------------------
+    # State persistence
+    # ------------------------------------------------------------------
+
+    def _load_state(self) -> dict[str, Any]:
         if STATE_FILE.exists():
             try:
-                return json.loads(STATE_FILE.read_text())
+                return json.loads(STATE_FILE.read_text(encoding="utf-8"))
             except Exception as exc:
                 log.warning("Could not load executor state (%s). Starting fresh.", exc)
-        return {}
+        return {"executed_ids": []}
 
     def _save_state(self) -> None:
         _atomic_write_json(STATE_FILE, self._state)
+
+    # ------------------------------------------------------------------
+    # Failed-action logging (matches poison-pill pattern in the other components)
+    # ------------------------------------------------------------------
+
+    def _log_failed_action(self, action: dict, exc: Exception) -> None:
+        try:
+            with FAILED_LOG.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({
+                    "action_id":   action.get("action_id"),
+                    "action_type": action.get("action_type"),
+                    "error":       str(exc),
+                    "timestamp":   datetime.now(timezone.utc).isoformat(),
+                }) + "\n")
+        except OSError as write_exc:
+            log.error("Could not write to executor_failed.jsonl: %s", write_exc)
 
 
 # ---------------------------------------------------------------------------
@@ -669,19 +823,24 @@ class Executor:
 
 if __name__ == "__main__":
     executor = Executor()
-    results  = executor.run()
+    records  = executor.run()
 
     print(f"\n{'='*60}")
     print(f"  SpaceLLM Executor — Cycle Complete")
     print(f"{'='*60}")
-    if not results:
-        print("  No actions executed.")
+    if not records:
+        print("  No actions were executed this cycle.")
     else:
-        for r in results:
-            icon = "✓" if r.status == "EXECUTED" else "✗"
-            print(f"  {icon} [{r.action_type:<16}] {r.status:<8}  ({r.duration_s:.1f}s)")
-            if r.error:
-                print(f"      ERROR: {r.error}")
-    print(f"\n  Execution log  -> {EXECUTION_LOG}")
-    print(f"  Review queue   -> {HUMAN_REVIEW_QUEUE}")
+        for rec in records:
+            status_icon = "✓" if rec.status == "EXECUTED" else "✗"
+            print(
+                f"  {status_icon} [{rec.action_type:<20}] "
+                f"status={rec.status:<8}  "
+                f"duration={rec.duration_s:.1f}s  "
+                f"action_id={rec.action_id[:8]}"
+            )
+        executed = sum(1 for r in records if r.status == "EXECUTED")
+        failed   = sum(1 for r in records if r.status == "FAILED")
+        print(f"\n  Total: {executed} EXECUTED, {failed} FAILED")
+        print(f"\n  Execution log → {EXECUTION_LOG}")
     print(f"{'='*60}\n")
