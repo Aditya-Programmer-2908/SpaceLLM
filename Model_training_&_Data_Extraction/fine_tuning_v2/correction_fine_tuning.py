@@ -1,159 +1,312 @@
 """
 SpaceLLM :: Continual Correction Fine-Tuning
 ==============================================
-Responsibility: Take a small batch of human-corrected QA pairs (built by
-                execute.py's RETRAIN_ADAPTER step) and continue training
-                the currently-live LoRA adapter on top of the base model,
-                producing an updated adapter ready to push to HuggingFace.
+Responsibility: Take human-corrected QA pairs from correction_train_injection.json
+                and CONTINUE TRAINING the already fine-tuned SpaceLLM adapter,
+                producing an updated adapter at fine_tuning_v2/outputs/spacellm_lora_final/.
+
+This is CONTINUAL LEARNING — not training from scratch.
+    Cycle 0 : base_adapter = AdityaPS/SpaceLLM_v1   (HF fine-tuned adapter)
+    Cycle N : base_adapter = local adapter saved from cycle N-1
 
 Called by:
     backend/mape_k/execute.py  (RETRAIN_ADAPTER action)
 
-Typical invocation (as run by execute.py):
+Invocation:
     python correction_fine_tuning.py \
-        --train_file  /mnt/DATA/saurabh/aditya/SpaceLLM/backend/mape_k/correction_train_injection.json \
-        --output_dir  /mnt/DATA/saurabh/aditya/SpaceLLM/Model_training_&_Data_Extraction/fine_tuning_v2/outputs/spacellm_lora_final \
-        --epochs 3 --lr 2e-4 --max_seq_len 2048 \
-        --base_adapter AdityaPS/SpaceLLM_v3
+        --train_file  .../backend/mape_k/correction_train_injection.json \
+        --output_dir  .../fine_tuning_v2/outputs/spacellm_lora_final \
+        --base_adapter AdityaPS/SpaceLLM_v1 \
+        --lora_r 64 --lora_alpha 128
 
-Design notes
-------------
-- CONTINUAL, NOT FROM-SCRATCH. If --base_adapter is given, we load the
-  base model + that adapter with is_trainable=True and keep training it.
-  Correction batches are small (a handful to a few dozen examples), so
-  re-initializing a fresh LoRA from the base model every cycle would
-  throw away everything learned in prior retrain cycles. If --base_adapter
-  is omitted, a fresh LoRA is initialized (matches your established
-  r=16 / alpha=32, targeting "lm_head").
+Model loading pipeline (mirrors lora_finetuning_v4.py EXACTLY):
+    1.  Load base model to CPU  [Mxfp4Config(dequantize=True), device_map="cpu"]
+    2.  Untie lm_head BEFORE PEFT  [detach().clone()]
+    3.  Vocab resize + re-untie guard
+    4.  Loss injection pre-PEFT
+    5.  PeftModel.from_pretrained(base_model, base_adapter, is_trainable=True)
+        OR get_peft_model() for fresh LoRA
+    6.  enable_input_require_grads()
+    7.  gradient_checkpointing_enable()
+    8.  Explicit freeze of all non-LoRA params
+    9.  Loss injection post-PEFT pre-dispatch
+    10. dispatch_model() to GPUs via accelerate
+    11. Loss injection post-dispatch
+    12. DeviceAwareTrainer (moves labels to lm_head device each step)
 
-- MXFP4. gpt-oss-20b ships MXFP4-quantized. MXFP4 weights aren't directly
-  differentiable, so we load with Mxfp4Config(dequantize=True) when the
-  installed transformers version supports it. This is the fix for the
-  "MXFP4 quantization blocking" crash noted in your earlier fine-tuning
-  work — if you hit a similar block again, the first thing to check is
-  whether `dequantize=True` actually took effect for your transformers
-  version.
-
-- lm_head-ONLY LoRA. Matches your established config. For an MoE model
-  this also sidesteps touching the expert/router weights with a tiny,
-  noisy correction batch — a meaningful source of the NaN/gradient-spike
-  instability you debugged previously. If you want to expand
-  target_modules later, do it deliberately and watch the loss curve.
-
-- NO BLIND resize_token_embeddings(). The CUDA "label out of range" bug
-  you hit before came from resizing embeddings unconditionally. Here we
-  only touch the pad token id (reusing eos_token if no pad token exists)
-  and never call resize_token_embeddings — vocab size is left untouched.
-
-- ASSISTANT-ONLY LOSS. Each training example is a 2-turn
-  [user question, assistant corrected-answer] pair. Loss is computed only
-  on the assistant tokens (prompt tokens are masked to -100), so the model
-  isn't penalized for "predicting" the question back.
-
-- NaN GUARD. A callback watches the logged loss every step; on the first
-  NaN/Inf it stops training and the script exits non-zero, so
-  execute.py's `if result.returncode != 0: raise RuntimeError(...)` stops
-  the pipeline before a broken adapter gets pushed to HuggingFace.
-
-- HF TOKEN. Read from the env var named by $HF_TOKEN (inherited from
-  execute.py's subprocess environment). Needed only if --base_adapter
-  is a private repo. Never hardcode a token in this file.
+NOTE: prepare_model_for_kbit_training is NOT called — lora_finetuning_v4.py
+      does not use it and neither do we. It was the source of the OOM crash.
 
 Author: SpaceLLM Project
 """
 
 from __future__ import annotations
 
+# ── TRITON PATCH — must be the very first thing ───────────────────────────────
+import sys
+import types
+
+
+def _patch_triton():
+    class _StubDriver:
+        def __getattr__(self, name): return _StubDriver()
+        def __call__(self, *a, **kw): return _StubDriver()
+        def __bool__(self): return False
+
+    class _StubCudaUtils:
+        def __init__(self): pass
+        def __getattr__(self, name): return lambda *a, **kw: None
+
+    class _ActiveDriverDescriptor:
+        def __get__(self, obj, objtype=None): return _StubDriver()
+        def __set__(self, obj, value): pass
+
+    class _StubDriverManager:
+        active  = _ActiveDriverDescriptor()
+        default = _StubDriver()
+        def __init__(self):
+            self._active  = _StubDriver()
+            self._default = _StubDriver()
+
+    def _make_module(name, parent=None):
+        mod = types.ModuleType(name)
+        sys.modules[name] = mod
+        if parent:
+            leaf = name.split(".")[-1]
+            setattr(parent, leaf, mod)
+        return mod
+
+    try:
+        import triton  # noqa: F401
+        return
+    except Exception:
+        pass
+
+    triton_mod          = _make_module("triton")
+    triton_runtime      = _make_module("triton.runtime",                triton_mod)
+    triton_runtime_drv  = _make_module("triton.runtime.driver",         triton_runtime)
+    triton_runtime_bld  = _make_module("triton.runtime.build",          triton_runtime)
+    triton_runtime_jit  = _make_module("triton.runtime.jit",            triton_runtime)
+    triton_backends     = _make_module("triton.backends",               triton_mod)
+    triton_backends_nv  = _make_module("triton.backends.nvidia",        triton_backends)
+    triton_backends_drv = _make_module("triton.backends.nvidia.driver", triton_backends_nv)
+
+    drv_singleton = _StubDriverManager()
+    triton_runtime_drv.driver = drv_singleton
+    triton_runtime_bld._build                  = lambda *a, **kw: None
+    triton_runtime_bld.compile_module_from_src = lambda *a, **kw: types.ModuleType("_stub")
+    triton_runtime_bld.load_module             = lambda *a, **kw: types.ModuleType("_stub")
+
+    class _StubJITFunction:
+        def __init__(self, fn): self.fn = fn
+        def __call__(self, *a, **kw):
+            try: return self.fn(*a, **kw)
+            except Exception: return None
+        def __getattr__(self, name): return lambda *a, **kw: None
+
+    triton_runtime_jit.JITFunction = _StubJITFunction
+    triton_mod.jit = lambda fn=None, **kw: (
+        _StubJITFunction(fn) if fn is not None else (lambda f: _StubJITFunction(f))
+    )
+    triton_backends_drv.CudaUtils = _StubCudaUtils
+    triton_mod.runtime  = triton_runtime
+    triton_mod.backends = triton_backends
+
+
+_patch_triton()
+
+# ── Imports ───────────────────────────────────────────────────────────────────
+
 import argparse
 import json
 import logging
 import math
 import os
-import sys
-from dataclasses import dataclass
+import time
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
+import torch
+import torch.nn as nn
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
-)
-log = logging.getLogger("spacellm.correction_finetune")
-
-# ---------------------------------------------------------------------------
-# Default paths (overridable via CLI; execute.py passes these explicitly)
-# ---------------------------------------------------------------------------
+# ── Paths ─────────────────────────────────────────────────────────────────────
 
 _MAPE_DIR        = Path("/mnt/DATA/saurabh/aditya/SpaceLLM/backend/mape_k")
 _FINE_TUNING_DIR = Path("/mnt/DATA/saurabh/aditya/SpaceLLM/Model_training_&_Data_Extraction/fine_tuning_v2")
 
-DEFAULT_TRAIN_FILE  = _MAPE_DIR / "correction_train_injection.json"
-DEFAULT_OUTPUT_DIR  = _FINE_TUNING_DIR / "outputs" / "spacellm_lora_final"
+DEFAULT_TRAIN_FILE = _MAPE_DIR / "correction_train_injection.json"
+DEFAULT_OUTPUT_DIR = _FINE_TUNING_DIR / "outputs" / "spacellm_lora_final"
+
+OUTPUT_DIR = _FINE_TUNING_DIR / "outputs"
+LOG_DIR    = OUTPUT_DIR / "logs"
+GRAPH_DIR  = OUTPUT_DIR / "graphs"
+for _d in (LOG_DIR, GRAPH_DIR):
+    _d.mkdir(parents=True, exist_ok=True)
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+
+RUN_ID   = datetime.now().strftime("%Y%m%d_%H%M%S")
+LOG_FILE = LOG_DIR / f"correction_finetune_{RUN_ID}.log"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%H:%M:%S",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+    ],
+)
+logger = logging.getLogger("SpaceLLM.correction")
+
+# ── Device-aware CE loss (copied exactly from lora_finetuning_v4.py) ──────────
+
+def _make_device_aware_ce_loss():
+    """
+    MoE models shard across GPUs. lm_head may land on cuda:1 or cuda:2
+    while Trainer places labels on cuda:0. Moves labels to match logits
+    before computing CE, then returns loss to cuda:0.
+    """
+    def _device_aware_ce_loss(logits, labels, vocab_size=None, **kwargs):
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+
+        logits_device = shift_logits.device
+        if shift_labels.device != logits_device:
+            shift_labels = shift_labels.to(logits_device)
+
+        vocab_size = shift_logits.size(-1)
+
+        oob_mask = (shift_labels != -100) & (
+            (shift_labels < 0) | (shift_labels >= vocab_size)
+        )
+        if oob_mask.any():
+            shift_labels = shift_labels.clone()
+            shift_labels[oob_mask] = -100
+
+        loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+        loss = loss_fct(
+            shift_logits.view(-1, vocab_size),
+            shift_labels.view(-1).long(),
+        )
+        return loss.to("cuda:0")
+
+    return _device_aware_ce_loss
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+_DEVICE_AWARE_CE_LOSS = _make_device_aware_ce_loss()
+
+
+def _inject_loss_function(model, label=""):
+    replaced = False
+    candidates = [model]
+    if hasattr(model, "base_model"):
+        candidates.append(model.base_model)
+    if hasattr(model, "base_model") and hasattr(model.base_model, "model"):
+        candidates.append(model.base_model.model)
+    for child in list(model.children()):
+        candidates.append(child)
+
+    for obj in candidates:
+        if obj is not None and hasattr(obj, "loss_function"):
+            if getattr(obj, "loss_function") is not _DEVICE_AWARE_CE_LOSS:
+                setattr(obj, "loss_function", _DEVICE_AWARE_CE_LOSS)
+                replaced = True
+                logger.info(
+                    f"  ✅ Replaced loss_function on {type(obj).__name__}"
+                    + (f" ({label})" if label else "")
+                )
+    return replaced
+
+# ── CLI args ──────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Continual LoRA correction fine-tuning for SpaceLLM.")
-
-    p.add_argument("--base_model", default="openai/gpt-oss-20b",
-                    help="Base model to load (MXFP4-quantized, dequantized for training).")
-    p.add_argument("--base_adapter", default=None,
-                    help="HF repo id of an existing LoRA adapter to continue training from. "
-                         "Omit to initialize a fresh LoRA from --base_model instead.")
-
-    p.add_argument("--train_file", default=str(DEFAULT_TRAIN_FILE),
-                    help="JSON file of correction records (list of {... , messages: [...]}).")
-    p.add_argument("--output_dir", default=str(DEFAULT_OUTPUT_DIR),
-                    help="Where to save the resulting adapter.")
-
-    p.add_argument("--epochs", type=int, default=3)
-    p.add_argument("--lr", type=float, default=2e-4)
-    p.add_argument("--max_seq_len", type=int, default=2048)
-
-    p.add_argument("--lora_r", type=int, default=32)
-    p.add_argument("--lora_alpha", type=int, default=128)
-    p.add_argument("--lora_dropout", type=float, default=0.1)
-    p.add_argument("--target_modules", default="lm_head",
-                    help="Comma-separated module names for LoRA. Default matches your "
-                         "established config (lm_head only).")
-
-    p.add_argument("--per_device_train_batch_size", type=int, default=1)
-    p.add_argument("--gradient_accumulation_steps", type=int, default=8)
-    p.add_argument("--warmup_ratio", type=float, default=0.03)
-    p.add_argument("--max_grad_norm", type=float, default=1.0)
-    p.add_argument("--min_reference_words", type=int, default=3,
-                    help="Skip records whose assistant content has fewer words than this "
-                         "(filters out near-empty / junk corrections).")
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--hf_token_env", default="HF_TOKEN",
-                    help="Name of the env var holding your HF token (for pulling a private "
-                         "--base_adapter). Never pass a literal token here.")
-
+    p = argparse.ArgumentParser(description="SpaceLLM continual correction fine-tuning")
+    p.add_argument("--base_model",    default="openai/gpt-oss-20b",
+                   help="Base foundation model (MXFP4 checkpoint)")
+    p.add_argument("--base_adapter",  default=None,
+                   help="HF repo id OR local path of existing LoRA adapter to continue from. "
+                        "First cycle: AdityaPS/SpaceLLM_v1. Later cycles: local output path.")
+    p.add_argument("--train_file",    default=str(DEFAULT_TRAIN_FILE))
+    p.add_argument("--output_dir",    default=str(DEFAULT_OUTPUT_DIR))
+    p.add_argument("--epochs",        type=int,   default=3)
+    p.add_argument("--lr",            type=float, default=2e-4)
+    p.add_argument("--max_seq_len",   type=int,   default=2048)
+    p.add_argument("--lora_r",        type=int,   default=64)
+    p.add_argument("--lora_alpha",    type=int,   default=128)
+    p.add_argument("--lora_dropout",  type=float, default=0.1)
+    p.add_argument("--target_modules",default="lm_head")
+    p.add_argument("--batch_size",    type=int,   default=1)
+    p.add_argument("--grad_accum",    type=int,   default=8)
+    p.add_argument("--warmup_ratio",  type=float, default=0.03)
+    p.add_argument("--max_grad_norm", type=float, default=0.3)
+    p.add_argument("--min_reference_words", type=int, default=3)
+    p.add_argument("--seed",          type=int,   default=42)
+    p.add_argument("--hf_token_env",  default="HF_TOKEN")
     return p.parse_args()
 
+# ── GPU helpers (same as v4) ──────────────────────────────────────────────────
 
-# ---------------------------------------------------------------------------
-# Data loading
-# ---------------------------------------------------------------------------
+def log_gpu_memory(label: str = ""):
+    try:
+        if not torch.cuda.is_available():
+            logger.warning("No CUDA device — running on CPU")
+            return
+        for i in range(torch.cuda.device_count()):
+            props  = torch.cuda.get_device_properties(i)
+            alloc  = torch.cuda.memory_allocated(i)  / 1024**3
+            reserv = torch.cuda.memory_reserved(i)   / 1024**3
+            total  = props.total_memory               / 1024**3
+            logger.info(
+                f"GPU {i} [{props.name}] {label} | "
+                f"Allocated={alloc:.2f}GB  Reserved={reserv:.2f}GB  Total={total:.2f}GB"
+            )
+    except Exception as e:
+        logger.warning(f"GPU memory report failed: {e}")
+
+
+def log_trainable_parameters(model):
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total     = sum(p.numel() for p in model.parameters())
+    pct       = 100.0 * trainable / total if total else 0.0
+    logger.info("─" * 55)
+    logger.info(f"Total parameters     : {total:>15,}")
+    logger.info(f"Trainable parameters : {trainable:>15,}  ({pct:.6f}%)")
+    logger.info(f"Frozen parameters    : {total - trainable:>15,}")
+    logger.info("─" * 55)
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            logger.info(
+                f"  {name:<60}  shape={str(list(param.shape)):<20}  ({param.numel():,} params)"
+            )
+
+# ── Data loading ──────────────────────────────────────────────────────────────
+
+IGNORE_INDEX = -100
+
 
 def load_correction_examples(train_file: Path, min_reference_words: int) -> list[dict]:
+    """
+    Load correction_train_injection.json written by execute.py.
+    Expected format — list of:
+        {
+          "messages": [
+              {"role": "user",      "content": "<question>"},
+              {"role": "assistant", "content": "<human_correction>"}
+          ],
+          "feedback_id": "...",
+          "bertscore":   0.87
+        }
+    """
     if not train_file.exists():
         raise FileNotFoundError(f"Training file not found: {train_file}")
 
     raw = json.loads(train_file.read_text(encoding="utf-8"))
     if not isinstance(raw, list):
-        raise ValueError(f"Expected a JSON list of records in {train_file}, got {type(raw)}.")
+        raise ValueError(f"Expected a JSON list in {train_file}, got {type(raw)}")
 
-    examples = []
-    skipped = 0
+    examples, skipped = [], 0
     for rec in raw:
         messages = rec.get("messages")
         if not messages or len(messages) < 2:
@@ -163,263 +316,556 @@ def load_correction_examples(train_file: Path, min_reference_words: int) -> list
         if not assistant_turns:
             skipped += 1
             continue
-        last_assistant = assistant_turns[-1].get("content", "") or ""
-        if len(last_assistant.split()) < min_reference_words:
+        last_asst = (assistant_turns[-1].get("content") or "").strip()
+        if len(last_asst.split()) < min_reference_words:
             skipped += 1
             continue
         examples.append(rec)
 
     if skipped:
-        log.warning("Skipped %d/%d record(s) (missing/short assistant content).",
-                    skipped, len(raw))
+        logger.warning(f"Skipped {skipped}/{len(raw)} record(s) (missing/short assistant content).")
     if not examples:
         raise ValueError("No usable training examples after filtering.")
 
-    log.info("Loaded %d usable correction example(s) from %s.", len(examples), train_file)
+    logger.info(f"Loaded {len(examples)} usable correction example(s) from {train_file}.")
     return examples
 
 
-def build_supervised_example(tokenizer, messages: list[dict], max_seq_len: int) -> dict[str, list[int]]:
+def tokenise_record(record: dict, tokenizer, max_seq_len: int) -> dict | None:
     """
-    Tokenize a [user, assistant] (or longer) conversation and mask every
-    token except the final assistant turn with -100, so loss is only
-    computed on the corrected answer.
+    Tokenize one correction pair. Masks all prompt tokens with IGNORE_INDEX
+    so loss is computed only on the corrected assistant answer.
+    Mirrors lora_finetuning_v4.py's tokenise_record() exactly.
     """
-    prompt_messages = messages[:-1]
+    messages = record.get("messages", [])
+    hf_messages = []
+    for msg in messages:
+        role    = "system" if msg.get("role") == "developer" else msg.get("role", "user")
+        content = (msg.get("content") or "").strip()
+        if content:
+            hf_messages.append({"role": role, "content": content})
 
-    full_text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=False,
-    )
-    prompt_text = tokenizer.apply_chat_template(
-        prompt_messages, tokenize=False, add_generation_prompt=True,
-    )
+    if not hf_messages:
+        return None
 
-    full_ids = tokenizer(
-        full_text, truncation=True, max_length=max_seq_len, add_special_tokens=False,
-    )["input_ids"]
-    prompt_ids = tokenizer(
-        prompt_text, truncation=True, max_length=max_seq_len, add_special_tokens=False,
-    )["input_ids"]
+    try:
+        full_text = tokenizer.apply_chat_template(
+            hf_messages, tokenize=False, add_generation_prompt=False)
+    except Exception as e:
+        logger.warning(f"apply_chat_template failed: {e} — skipping")
+        return None
 
-    prompt_len = min(len(prompt_ids), len(full_ids))
-    labels = list(full_ids)
-    for i in range(prompt_len):
-        labels[i] = -100
+    full_enc  = tokenizer(full_text, truncation=True, max_length=max_seq_len,
+                          padding=False, return_tensors=None)
+    input_ids = full_enc["input_ids"]
+    if len(input_ids) < 4:
+        return None
+
+    prefix_msgs = [m for m in hf_messages if m["role"] != "assistant"]
+    try:
+        prefix_text = tokenizer.apply_chat_template(
+            prefix_msgs, tokenize=False, add_generation_prompt=True)
+    except Exception:
+        return None
+
+    prefix_enc = tokenizer(prefix_text, truncation=True, max_length=max_seq_len,
+                           padding=False, return_tensors=None)
+    prefix_len = len(prefix_enc["input_ids"])
+
+    if prefix_len >= len(input_ids):
+        return None
+
+    labels   = [IGNORE_INDEX] * prefix_len + input_ids[prefix_len:]
+    labels   = labels[:len(input_ids)]
+    n_active = sum(1 for l in labels if l != IGNORE_INDEX)
+
+    if n_active < 4:
+        return None
 
     return {
-        "input_ids": full_ids,
-        "attention_mask": [1] * len(full_ids),
-        "labels": labels,
+        "input_ids":      input_ids,
+        "attention_mask": full_enc["attention_mask"],
+        "labels":         labels,
+        "n_active":       n_active,
     }
 
 
-def build_dataset(tokenizer, examples: list[dict], max_seq_len: int):
+def build_dataset(tokenizer, examples: list[dict], max_seq_len: int, vocab_size: int):
     from datasets import Dataset
 
-    rows = [build_supervised_example(tokenizer, ex["messages"], max_seq_len) for ex in examples]
-    # Drop any example that collapsed to an empty/fully-masked sequence.
-    rows = [r for r in rows if any(l != -100 for l in r["labels"])]
-    if not rows:
-        raise ValueError("All examples collapsed to empty/fully-masked sequences after tokenization.")
-    return Dataset.from_list(rows)
+    tokenised, skipped, clamped = [], 0, 0
+    active_counts = []
 
+    for rec in examples:
+        result = tokenise_record(rec, tokenizer, max_seq_len)
+        if result is None:
+            skipped += 1
+            continue
 
-class PaddingCollator:
-    """Pads input_ids/attention_mask/labels to the longest sequence in the batch."""
+        n_active = result.pop("n_active")
+        active_counts.append(n_active)
 
-    def __init__(self, pad_token_id: int):
-        self.pad_token_id = pad_token_id
+        # Clamp OOV labels (same guard as v4's build_hf_dataset)
+        new_labels, had_oob = [], False
+        for lbl in result["labels"]:
+            if lbl != IGNORE_INDEX and (lbl < 0 or lbl >= vocab_size):
+                new_labels.append(IGNORE_INDEX)
+                had_oob = True
+            else:
+                new_labels.append(lbl)
+        if had_oob:
+            result["labels"] = new_labels
+            clamped += 1
 
-    def __call__(self, batch: list[dict]) -> dict:
-        import torch
+        if all(lbl == IGNORE_INDEX for lbl in result["labels"]):
+            skipped += 1
+            continue
 
-        max_len = max(len(b["input_ids"]) for b in batch)
-        input_ids, attention_mask, labels = [], [], []
+        tokenised.append(result)
 
-        for b in batch:
-            pad_len = max_len - len(b["input_ids"])
-            input_ids.append(b["input_ids"] + [self.pad_token_id] * pad_len)
-            attention_mask.append(b["attention_mask"] + [0] * pad_len)
-            labels.append(b["labels"] + [-100] * pad_len)
+    if skipped:
+        logger.warning(f"Tokenisation: skipped {skipped}/{len(examples)} examples.")
+    if clamped:
+        logger.warning(f"Tokenisation: clamped OOV labels in {clamped} examples.")
+    if not tokenised:
+        raise ValueError("All examples collapsed after tokenisation — cannot train.")
 
-        return {
-            "input_ids": torch.tensor(input_ids, dtype=torch.long),
-            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
-            "labels": torch.tensor(labels, dtype=torch.long),
-        }
-
-
-# ---------------------------------------------------------------------------
-# Model loading
-# ---------------------------------------------------------------------------
-
-def load_model_and_tokenizer(args: argparse.Namespace):
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(args.base_model)
-    if tokenizer.pad_token is None:
-        # Reuse eos as pad — do NOT resize embeddings for this.
-        tokenizer.pad_token = tokenizer.eos_token
-
-    quantization_config = None
-    try:
-        from transformers import Mxfp4Config
-        quantization_config = Mxfp4Config(dequantize=True)
-        log.info("Using Mxfp4Config(dequantize=True) for trainable MXFP4 weights.")
-    except ImportError:
-        log.warning(
-            "Mxfp4Config not available in this transformers version. Loading without "
-            "explicit MXFP4 dequantization — if you hit a 'quantized tensor has no "
-            "grad_fn' style error, upgrade transformers."
-        )
-
-    load_kwargs: dict[str, Any] = dict(
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
+    lengths      = [len(r["input_ids"]) for r in tokenised]
+    mean_active  = sum(active_counts) / len(active_counts) if active_counts else 0
+    logger.info(
+        f"Dataset: {len(tokenised)} rows | "
+        f"seq_len min={min(lengths)} max={max(lengths)} mean={sum(lengths)/len(lengths):.0f} | "
+        f"active_tokens min={min(active_counts)} mean={mean_active:.1f} max={max(active_counts)}"
     )
-    if quantization_config is not None:
-        load_kwargs["quantization_config"] = quantization_config
 
-    log.info("Loading base model %s ...", args.base_model)
-    base_model = AutoModelForCausalLM.from_pretrained(args.base_model, **load_kwargs)
-    base_model.config.use_cache = False  # required alongside gradient checkpointing
+    if mean_active < 10:
+        logger.warning(f"⚠️  mean active tokens={mean_active:.1f} — label masking may be too aggressive.")
 
-    from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
+    return Dataset.from_list(tokenised)
 
-    base_model = prepare_model_for_kbit_training(base_model, use_gradient_checkpointing=True)
-
-    if args.base_adapter:
-        hf_token = os.environ.get(args.hf_token_env)
-        log.info("Loading existing adapter for continual training: %s", args.base_adapter)
-        model = PeftModel.from_pretrained(
-            base_model, args.base_adapter, is_trainable=True, token=hf_token,
-        )
-    else:
-        target_modules = [m.strip() for m in args.target_modules.split(",") if m.strip()]
-        log.info("No --base_adapter given — initializing fresh LoRA (r=%d, alpha=%d, targets=%s).",
-                  args.lora_r, args.lora_alpha, target_modules)
-        lora_config = LoraConfig(
-            r=args.lora_r,
-            lora_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-            target_modules=target_modules,
-            bias="none",
-            task_type="CAUSAL_LM",
-        )
-        model = get_peft_model(base_model, lora_config)
-
-    model.print_trainable_parameters()
-    return model, tokenizer
-
-
-# ---------------------------------------------------------------------------
-# NaN guard
-# ---------------------------------------------------------------------------
-
-class NaNGuardCallback:
-    """
-    transformers.TrainerCallback subclass built lazily (after transformers
-    is imported) — see make_nan_guard_callback() below. Stops training the
-    moment a NaN/Inf loss is logged, so we never save or push a broken
-    adapter.
-    """
-    nan_detected: bool = False
-
+# ── NaN guard (same as v4) ────────────────────────────────────────────────────
 
 def make_nan_guard_callback():
     from transformers import TrainerCallback
 
-    class _NaNGuard(TrainerCallback, NaNGuardCallback):
+    class _NaNGuard(TrainerCallback):
+        def __init__(self):
+            self.nan_detected = False
+
         def on_log(self, args, state, control, logs=None, **kwargs):
             if not logs or "loss" not in logs:
                 return control
             loss = logs["loss"]
             if loss is None or (isinstance(loss, float) and (math.isnan(loss) or math.isinf(loss))):
-                log.error("NaN/Inf loss detected at step %s — stopping training.", state.global_step)
+                logger.error(f"NaN/Inf loss at step {state.global_step} — stopping training.")
                 self.nan_detected = True
                 control.should_training_stop = True
             return control
 
     return _NaNGuard()
 
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> int:
     args = parse_args()
 
-    import torch
-    from transformers import Trainer, TrainingArguments
+    logger.info("=" * 60)
+    logger.info("  SpaceLLM — Continual Correction Fine-Tuning")
+    logger.info(f"  Run ID       : {RUN_ID}")
+    logger.info(f"  Base model   : {args.base_model}")
+    logger.info(f"  Base adapter : {args.base_adapter or 'None — fresh LoRA (not recommended)'}  ← CONTINUAL LEARNING")
+    logger.info(f"  Train file   : {args.train_file}")
+    logger.info(f"  Output dir   : {args.output_dir}")
+    logger.info(f"  LoRA r={args.lora_r}  alpha={args.lora_alpha}  target={args.target_modules}")
+    logger.info(f"  Epochs={args.epochs}  LR={args.lr}  batch={args.batch_size}  grad_accum={args.grad_accum}")
+    logger.info(f"  CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'unset')}")
+    logger.info("=" * 60)
 
+    import torch
     torch.manual_seed(args.seed)
+
+    from transformers import (
+        AutoModelForCausalLM, AutoTokenizer, TrainingArguments,
+        DataCollatorForSeq2Seq, Trainer, TrainerCallback, Mxfp4Config,
+    )
+    from peft import LoraConfig, TaskType, PeftModel, get_peft_model
 
     train_file = Path(args.train_file)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # ── Load correction examples ──────────────────────────────────────────
     examples = load_correction_examples(train_file, args.min_reference_words)
-    model, tokenizer = load_model_and_tokenizer(args)
-    dataset = build_dataset(tokenizer, examples, args.max_seq_len)
-    collator = PaddingCollator(pad_token_id=tokenizer.pad_token_id)
 
+    # ── Tokenizer ─────────────────────────────────────────────────────────
+    logger.info(f"\nLoading tokenizer: {args.base_model}")
+    tokenizer = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token    = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+        logger.info("pad_token set to eos_token")
+    tokenizer.padding_side = "right"
+    logger.info(f"Vocab size: {tokenizer.vocab_size:,}  len(tokenizer): {len(tokenizer):,}")
+    logger.info(f"Chat template: {'found' if tokenizer.chat_template else 'NOT FOUND'}")
+
+    # =========================================================================
+    # MODEL LOADING PIPELINE — mirrors lora_finetuning_v4.py EXACTLY
+    # NOTE: prepare_model_for_kbit_training is NOT called — v4 does not use
+    # it and it was the source of the CUDA OOM crash (float32 cast on full GPU)
+    # =========================================================================
+
+    # ── Step 1: Load base model to CPU ───────────────────────────────────
+    # device_map="cpu" is CRITICAL — prevents MXFP4 dequantization from
+    # running on GPU during model load, which causes illegal memory access.
+    # GPU placement happens later via dispatch_model().
+    logger.info(f"\nLoading base model to CPU: {args.base_model}  [MXFP4 → BF16 dequantize]")
+    log_gpu_memory("before model load")
+    t0 = time.time()
+
+    model = AutoModelForCausalLM.from_pretrained(
+        args.base_model,
+        quantization_config=Mxfp4Config(dequantize=True),
+        device_map="cpu",
+        trust_remote_code=True,
+        ignore_mismatched_sizes=True,
+    )
+    logger.info(f"Model loaded in {time.time() - t0:.1f}s  |  dtype: {next(model.parameters()).dtype}")
+    model.config.use_cache = False
+
+    # ── Step 2: Untie lm_head BEFORE get_peft_model() ────────────────────
+    # tie_word_embeddings=True means lm_head.weight and embed_tokens.weight
+    # are the SAME tensor in memory. PEFT wraps lm_head, but autograd sees
+    # the weight as belonging to the frozen embed_tokens path → gradients
+    # to lora_A.weight are cut. detach().clone() materializes lm_head as
+    # its own independent Parameter BEFORE PEFT ever touches the model.
+    logger.info("\n── Vocab & lm_head alignment ────────────────────────")
+    model.config.tie_word_embeddings = False
+    lm_head = model.get_output_embeddings()
+    lm_head.weight = nn.Parameter(lm_head.weight.detach().clone())
+    logger.info("✅ lm_head weight untied and cloned as independent tensor")
+
+    # ── Step 3: Vocab resize + re-untie guard ─────────────────────────────
+    _current_vocab = model.get_output_embeddings().weight.shape[0]
+    model.resize_token_embeddings(_current_vocab, pad_to_multiple_of=64)
+    model.resize_token_embeddings(len(tokenizer),  pad_to_multiple_of=64)
+
+    actual_vocab = model.get_output_embeddings().weight.shape[0]
+    model.config.vocab_size = actual_vocab
+
+    assert model.get_input_embeddings().weight.shape[0]  == actual_vocab
+    assert model.get_output_embeddings().weight.shape[0] == actual_vocab
+    logger.info(f"  Vocab alignment PASSED  (vocab={actual_vocab:,}  padded to multiple of 64)")
+
+    # Guard: resize_token_embeddings sometimes re-ties the weights
+    embed_id   = id(model.get_input_embeddings().weight)
+    lm_head_id = id(model.get_output_embeddings().weight)
+    if embed_id == lm_head_id:
+        logger.warning("  resize_token_embeddings re-tied lm_head — re-untying now")
+        lm_head = model.get_output_embeddings()
+        lm_head.weight = nn.Parameter(lm_head.weight.detach().clone())
+        logger.info("  ✅ Re-untied lm_head after resize")
+    else:
+        logger.info("  ✅ lm_head still independent after resize (tie not re-introduced)")
+
+    # ── Step 4: Loss injection pre-PEFT ──────────────────────────────────
+    logger.info("\n── Injecting CE loss (pre-PEFT) ─────────────────────")
+    _inject_loss_function(model, label="pre-PEFT")
+
+    # ── Step 5: Load adapter / apply LoRA on CPU ─────────────────────────
+    # CONTINUAL LEARNING: always load from an existing adapter so we build
+    # on SpaceLLM_v1's knowledge rather than resetting to raw gpt-oss-20b.
+    #
+    # is_trainable=True tells PEFT to keep LoRA weights in training mode.
+    # The model (base weights) stays on CPU here — dispatch happens later.
+    logger.info("\n── Loading adapter for continual fine-tuning ────────")
+    target_modules = [m.strip() for m in args.target_modules.split(",") if m.strip()]
+
+    if args.base_adapter:
+        hf_token = os.environ.get(args.hf_token_env)
+        logger.info(f"  Continuing from: {args.base_adapter}")
+        model = PeftModel.from_pretrained(
+            model,
+            args.base_adapter,
+            is_trainable=True,
+            token=hf_token,
+        )
+        logger.info("✅ PeftModel.from_pretrained() — adapter loaded, weights trainable")
+    else:
+        # Fallback: fresh LoRA (should only happen in testing, not production)
+        logger.warning(
+            "  No --base_adapter provided! Initializing fresh LoRA on raw gpt-oss-20b. "
+            "This throws away SpaceLLM_v1 fine-tuning. Pass --base_adapter AdityaPS/SpaceLLM_v1."
+        )
+        lora_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM,
+            target_modules=target_modules,
+            init_lora_weights=True,
+        )
+        model = get_peft_model(model, lora_config)
+        logger.info("✅ get_peft_model() — fresh LoRA initialized on CPU")
+
+    # ── Step 6 & 7: enable grads + gradient checkpointing ────────────────
+    # enable_input_require_grads: hooks into forward so frozen embeddings
+    #   still propagate gradients to LoRA layers.
+    # gradient_checkpointing_enable: called AFTER PEFT wraps the model so
+    #   the hook attaches to the correct forward() method.
+    model.enable_input_require_grads()
+    logger.info("✅ enable_input_require_grads() called")
+
+    model.gradient_checkpointing_enable()
+    logger.info("✅ gradient_checkpointing_enable() called (post-PEFT)")
+
+    # ── Step 8: Explicit freeze of all non-LoRA params ───────────────────
+    logger.info("\n── Explicit parameter freeze (pre-dispatch) ─────────")
+    frozen_count, lora_count = 0, 0
+    for name, param in model.named_parameters():
+        if "lora_" in name:
+            param.requires_grad_(True)
+            lora_count += 1
+        else:
+            param.requires_grad_(False)
+            frozen_count += 1
+    logger.info(f"  Frozen : {frozen_count} tensors")
+    logger.info(f"  LoRA   : {lora_count} tensors (requires_grad=True)")
+
+    leaked = [(n, p.shape) for n, p in model.named_parameters()
+              if p.requires_grad and "lora_" not in n]
+    if leaked:
+        logger.error("  ❌ Non-LoRA params still trainable — aborting:")
+        for n, s in leaked:
+            logger.error(f"     {n}  {s}")
+        return 1
+    logger.info("  ✅ No non-LoRA params leaked as trainable")
+
+    # Loss injection post-PEFT pre-dispatch
+    logger.info("\n── Re-injecting CE loss (post-PEFT, pre-dispatch) ───")
+    _inject_loss_function(model, label="post-PEFT pre-dispatch")
+
+    log_trainable_parameters(model)
+    log_gpu_memory("after LoRA init (CPU)")
+
+    # ── Step 9: GPU dispatch via accelerate ──────────────────────────────
+    # Same logic as lora_finetuning_v4.py — infer device map, leave 4 GB
+    # headroom per GPU for activations, dispatch the PEFT-wrapped model.
+    logger.info("\nDispatching PEFT model across GPUs ...")
+    t1 = time.time()
+    try:
+        from accelerate import dispatch_model, infer_auto_device_map
+
+        no_split = []
+        for name, module in model.named_modules():
+            cls      = type(module)
+            cls_name = cls.__name__.lower()
+            if (
+                issubclass(cls, nn.Module) and cls is not nn.Module
+                and ("layer" in cls_name or "block" in cls_name)
+                and cls.__name__ not in no_split
+                and sum(p.numel() for p in module.parameters()) > 1_000_000
+            ):
+                no_split.append(cls.__name__)
+        no_split = list(dict.fromkeys(no_split))
+        logger.info(f"no_split_module_classes : {no_split}")
+
+        n_gpus     = torch.cuda.device_count()
+        max_memory = {}
+        for i in range(n_gpus):
+            free  = torch.cuda.mem_get_info(i)[0]
+            alloc = max(0, free - 4 * 1024**3)
+            max_memory[i] = f"{int(alloc / 1024**3)}GiB"
+        max_memory["cpu"] = "80GiB"
+        logger.info(f"max_memory per device  : {max_memory}")
+
+        device_map = infer_auto_device_map(
+            model, max_memory=max_memory, no_split_module_classes=no_split)
+        model = dispatch_model(model, device_map=device_map)
+
+    except Exception as e:
+        logger.warning(f"dispatch_model failed ({e}) — falling back to cuda:0")
+        model = model.to("cuda:0")
+
+    logger.info(f"GPU dispatch done in {time.time() - t1:.1f}s")
+    if hasattr(model, "hf_device_map"):
+        from collections import Counter
+        dev_counts = Counter(str(v) for v in model.hf_device_map.values())
+        for dev, count in sorted(dev_counts.items()):
+            logger.info(f"  {dev} : {count} layers")
+    log_gpu_memory("after dispatch")
+
+    # ── Step 10: Loss injection post-dispatch ─────────────────────────────
+    logger.info("\n── Re-injecting CE loss (post-dispatch) ─────────────")
+    _inject_loss_function(model, label="post-dispatch")
+
+    # Vocab check post-dispatch
+    logger.info("\n── Vocab alignment (post-dispatch) ──────────────────")
+    _post_peft_vocab = model.get_output_embeddings().weight.shape[0]
+    if _post_peft_vocab != model.config.vocab_size:
+        logger.warning(f"  lm_head vocab ({_post_peft_vocab}) != config ({model.config.vocab_size}) — fixing")
+        model.config.vocab_size = _post_peft_vocab
+    logger.info(f"  lm_head vocab = {_post_peft_vocab:,}  ✅")
+
+    # ── Build dataset ──────────────────────────────────────────────────────
+    logger.info("\n── Tokenising correction examples ───────────────────")
+    train_dataset = build_dataset(tokenizer, examples, args.max_seq_len, _post_peft_vocab)
+
+    # ── Training arguments (mirroring v4) ─────────────────────────────────
+    MAX_GRAD_NORM = args.max_grad_norm
+    logger.info("\n── Training configuration ───────────────────────────")
+    training_args = TrainingArguments(
+        output_dir                  = str(output_dir / "_trainer_ckpts"),
+        num_train_epochs            = args.epochs,
+        per_device_train_batch_size = args.batch_size,
+        gradient_accumulation_steps = args.grad_accum,
+        learning_rate               = args.lr,
+        lr_scheduler_type           = "cosine",
+        warmup_ratio                = args.warmup_ratio,
+        max_grad_norm               = MAX_GRAD_NORM,
+        optim                       = "adamw_torch_fused",
+        weight_decay                = 0.01,
+        bf16                        = True,
+        fp16                        = False,
+        logging_steps               = 1,
+        logging_first_step          = True,
+        save_strategy               = "no",
+        eval_strategy               = "no",
+        report_to                   = [],
+        dataloader_num_workers      = 0,
+        remove_unused_columns       = False,
+        seed                        = args.seed,
+        gradient_checkpointing      = True,
+    )
+    logger.info(f"  epochs={args.epochs}  lr={args.lr}  batch={args.batch_size}  "
+                f"grad_accum={args.grad_accum}  eff_batch={args.batch_size * args.grad_accum}")
+    logger.info(f"  lora_r={args.lora_r}  lora_alpha={args.lora_alpha}  "
+                f"max_grad_norm={MAX_GRAD_NORM}  optimizer=adamw_torch_fused")
+
+    # ── Data collator (same as v4) ─────────────────────────────────────────
+    data_collator = DataCollatorForSeq2Seq(
+        tokenizer=tokenizer,
+        model=model,
+        padding=True,
+        pad_to_multiple_of=64,
+        label_pad_token_id=IGNORE_INDEX,
+    )
+
+    # ── NaN guard ──────────────────────────────────────────────────────────
     nan_guard = make_nan_guard_callback()
 
-    training_args = TrainingArguments(
-        output_dir=str(output_dir / "_trainer_ckpts"),
-        num_train_epochs=args.epochs,
-        learning_rate=args.lr,
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        warmup_ratio=args.warmup_ratio,
-        max_grad_norm=args.max_grad_norm,
-        logging_steps=1,
-        save_strategy="no",
-        bf16=True,
-        gradient_checkpointing=True,
-        report_to=[],
-        seed=args.seed,
+    # ── DeviceAwareTrainer (copied exactly from lora_finetuning_v4.py) ────
+    class DeviceAwareTrainer(Trainer):
+        """
+        1. _prepare_inputs() moves labels to lm_head device each step.
+        2. training_step() adds explicit clip_grad_norm_ on trainable params
+           as belt-and-suspenders alongside max_grad_norm in TrainingArguments.
+        """
+        def _get_lm_head_device(self):
+            try:
+                return next(self.model.get_output_embeddings().parameters()).device
+            except Exception:
+                return None
+
+        def _prepare_inputs(self, inputs):
+            inputs    = super()._prepare_inputs(inputs)
+            lm_device = self._get_lm_head_device()
+            if lm_device is None:
+                return inputs
+            if "labels" in inputs and inputs["labels"].device != lm_device:
+                inputs["labels"] = inputs["labels"].to(lm_device)
+            return inputs
+
+        def training_step(self, model, inputs, num_items_in_batch=None):
+            if num_items_in_batch is not None:
+                loss = super().training_step(model, inputs, num_items_in_batch)
+            else:
+                loss = super().training_step(model, inputs)
+
+            # Explicit clip — guards against multi-GPU/BF16 scaler clip misses
+            trainable_params = [
+                p for p in model.parameters()
+                if p.requires_grad and p.grad is not None
+            ]
+            if trainable_params:
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=MAX_GRAD_NORM)
+
+            return loss
+
+    trainer = DeviceAwareTrainer(
+        model            = model,
+        args             = training_args,
+        train_dataset    = train_dataset,
+        processing_class = tokenizer,
+        data_collator    = data_collator,
+        callbacks        = [nan_guard],
     )
 
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=dataset,
-        data_collator=collator,
-        callbacks=[nan_guard],
-    )
+    # Final loss patch post-Trainer init (same as v4)
+    logger.info("\n── Final loss_function patch (post-Trainer init) ────")
+    _inject_loss_function(trainer.model, label="post-Trainer")
+    logger.info(f"  lm_head device: {trainer._get_lm_head_device()}")
 
-    log.info("Starting training: %d example(s), %d epoch(s), lr=%s, max_seq_len=%d",
-              len(dataset), args.epochs, args.lr, args.max_seq_len)
-    trainer.train()
+    # ── Train ──────────────────────────────────────────────────────────────
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info(f"  Starting correction training ({len(train_dataset)} examples, {args.epochs} epochs)")
+    logger.info(f"  Continuing from: {args.base_adapter or 'fresh LoRA'}")
+    logger.info("=" * 60)
 
-    if nan_guard.nan_detected:
-        log.error("Training aborted due to NaN/Inf loss. Adapter NOT saved.")
+    t_start = time.time()
+    try:
+        trainer.train()
+    except KeyboardInterrupt:
+        logger.warning("Interrupted — saving current state ...")
+        interrupted_dir = output_dir / "interrupted"
+        trainer.save_model(str(interrupted_dir))
+        tokenizer.save_pretrained(str(interrupted_dir))
+        logger.info(f"Saved to: {interrupted_dir}")
+        return 0
+    except Exception as e:
+        logger.error(f"Training failed: {e}", exc_info=True)
         return 1
 
-    log.info("Saving adapter to %s ...", output_dir)
+    elapsed = time.time() - t_start
+    logger.info(f"Training complete in {elapsed / 60:.1f} min")
+
+    if nan_guard.nan_detected:
+        logger.error("NaN/Inf loss detected — adapter NOT saved to avoid corrupting SpaceLLM.")
+        return 1
+
+    # ── Save adapter ────────────────────────────────────────────────────────
+    logger.info(f"\nSaving updated adapter → {output_dir}")
     model.save_pretrained(str(output_dir))
     tokenizer.save_pretrained(str(output_dir))
 
     metadata = {
-        "base_model": args.base_model,
-        "base_adapter": args.base_adapter,
-        "examples_used": len(dataset),
-        "epochs": args.epochs,
-        "lr": args.lr,
-        "max_seq_len": args.max_seq_len,
-        "lora_r": args.lora_r,
-        "lora_alpha": args.lora_alpha,
-        "target_modules": args.target_modules,
-        "trained_at": datetime.now(timezone.utc).isoformat(),
+        "run_id":          RUN_ID,
+        "base_model":      args.base_model,
+        "base_adapter":    args.base_adapter,    # what we continued FROM
+        "output_dir":      str(output_dir),      # what to pass as --base_adapter next cycle
+        "train_file":      str(train_file),
+        "examples_used":   len(train_dataset),
+        "epochs":          args.epochs,
+        "lr":              args.lr,
+        "max_seq_len":     args.max_seq_len,
+        "lora_r":          args.lora_r,
+        "lora_alpha":      args.lora_alpha,
+        "target_modules":  args.target_modules,
+        "trained_at":      datetime.now(timezone.utc).isoformat(),
+        "continual_learning": True,
     }
     (output_dir / "training_metadata.json").write_text(
         json.dumps(metadata, indent=2), encoding="utf-8",
     )
 
-    log.info("Done. Adapter saved → %s", output_dir)
+    logger.info("=" * 60)
+    logger.info("  SpaceLLM Correction Fine-Tuning — Complete")
+    logger.info("=" * 60)
+    logger.info(f"  Adapter saved  →  {output_dir}")
+    logger.info(f"  Log            →  {LOG_FILE}")
+    logger.info(f"  Next cycle use →  --base_adapter {output_dir}")
+    logger.info("=" * 60)
     return 0
 
 
