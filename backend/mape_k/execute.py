@@ -398,12 +398,12 @@ class Executor:
         base_adapter = self._state.get("last_adapter", {}).get("hf_repo_id") or None
 
         cmd = [
-            self.config.python_executable,
-            str(FINETUNE_SCRIPT),
-            "--train_file",  str(CORRECTION_TRAIN_FILE),
-            "--output_dir",  str(adapter_dir),
-            "--lora_r",      "64",
-            "--lora_alpha",  "128",
+          self.config.python_executable,
+          str(FINETUNE_SCRIPT),
+          "--train_file", str(CORRECTION_TRAIN_FILE),
+          "--output_dir", str(adapter_dir),
+          "--lora_r",     "64",
+          "--lora_alpha", "128",
         ]
         if base_adapter:
             cmd += ["--base_adapter", base_adapter]
