@@ -1,6 +1,6 @@
 """
-SpaceLLM MAPE-K :: Executor Component
-=======================================
+SpaceLLM MAPE-K :: Executor Component  (Retrieval-Augmented Continual Learning)
+================================================================================
 Responsibility: Read Planner output → execute each action → update status
                 PENDING → EXECUTED | FAILED → write execution_log.jsonl.
 
@@ -16,18 +16,26 @@ Pipeline position:
 
 Action handlers
 ---------------
-RETRAIN_ADAPTER
-    Converts the training_examples list from the Planner payload into the
-    messages format expected by correction_fine_tuning.py, writes them to
-    correction_train_injection.json (+ a timestamped backup), then launches
-    correction_fine_tuning.py via subprocess.
+RETRIEVAL_MEMORY_UPDATE   (replaces the old RETRAIN_ADAPTER / LoRA flow)
+    Takes the training_examples list from the Planner payload (question +
+    human-corrected reference answer), embeds each question, and writes
+    {question, correct_answer, embedding} records into a JSON-based
+    knowledge repository (KNOWLEDGE_REPO_FILE). No subprocess, no
+    fine-tuning run, no LoRA weights to merge/stack.
 
-    CONTINUAL LEARNING: On the very first cycle the script continues from
-    AdityaPS/SpaceLLM_v1 (the HF-hosted fine-tuned adapter). After each
-    successful retrain the local adapter path is stored in
-    .executor_state.json["last_adapter"]["adapter_path"] and used as the
-    --base_adapter on the next cycle, so every correction run builds on the
-    previous one rather than resetting to raw gpt-oss-20b weights.
+    WHY: a previous attempt at continual learning via stacked LoRA
+    adapters (trained on ~10-15 examples per cycle) caused generation
+    collapse (degenerate repeated-token outputs) at inference time —
+    a classic small-batch/over-fit LoRA failure mode. Retrieval-based
+    memory sidesteps this entirely: corrections are stored verbatim and
+    only ever *injected into the prompt* at inference time, so the base
+    model's weights (SpaceLLM_v1) are never touched and can never
+    collapse. This also means corrections are available immediately,
+    with no training latency — useful for a live demo.
+
+    Back-compat: action_type "RETRAIN_ADAPTER" is aliased to the same
+    handler, so any actions already queued by an older Planner build
+    still execute correctly.
 
 PROMPT_PATCH
     Appends a dated patch block to frontend_patch.md. The controller /
@@ -45,30 +53,39 @@ FLAG_FOR_REVIEW
 NO_ACTION
     Marked EXECUTED immediately.
 
+Inference-time retrieval (for controller.py / FastAPI request handler)
+------------------------------------------------------------------------
+    from execute import KnowledgeRepository, build_augmented_prompt
+
+    repo = KnowledgeRepository()                 # loads existing JSON repo
+    prompt = build_augmented_prompt(user_query, repo, top_k=3)
+    # ... send `prompt` to GPT-OSS-20B + SpaceLLM_v1 as usual ...
+
 Design principles
 -----------------
 - Atomic JSON/JSONL writes via tmp-file + rename.
 - Poison-pill guard per action — one failure can't block the rest.
 - Persisted state in .executor_state.json across scheduler cycles.
-- Subprocess stdout/stderr streamed live via threads.
-- Hard wall-clock timeout (ExecutorConfig.retrain_timeout_seconds).
+- No subprocess / wall-clock training timeout needed anymore — retrieval
+  updates are pure in-process JSON writes and complete in milliseconds.
 
 Author: SpaceLLM Project
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
-import subprocess
-import sys
-import threading
+import re
 import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -86,7 +103,6 @@ log = logging.getLogger("spacellm.executor")
 
 BASE_DIR             = Path("/mnt/DATA/saurabh/aditya/SpaceLLM/backend")
 MAPE_DIR             = BASE_DIR / "mape_k"
-FINE_TUNING_DIR      = Path("/mnt/DATA/saurabh/aditya/SpaceLLM/Model_training_&_Data_Extraction/fine_tuning_v2")
 
 PLAN_ACTIONS_LOG     = MAPE_DIR / "plan_actions.jsonl"
 EXECUTION_LOG        = MAPE_DIR / "execution_log.jsonl"
@@ -98,19 +114,12 @@ REVIEW_STATS_FILE    = MAPE_DIR / "review_stats.json"
 STATE_FILE           = MAPE_DIR / ".executor_state.json"
 FAILED_LOG           = MAPE_DIR / "executor_failed.jsonl"
 
-# Fine-tuning
-FINETUNE_SCRIPT       = FINE_TUNING_DIR / "correction_fine_tuning.py"
-FINETUNE_DATASET_DIR  = MAPE_DIR / "retrain_datasets"
-CORRECTION_TRAIN_FILE = MAPE_DIR / "correction_train_injection.json"
-ADAPTER_OUTPUT_DIR    = FINE_TUNING_DIR / "outputs"
-
-# The HF repo of the original fine-tuned adapter.
-# Used as --base_adapter on the FIRST correction cycle so we always build
-# on top of SpaceLLM_v1, never on raw gpt-oss-20b weights.
-INITIAL_BASE_ADAPTER = "AdityaPS/SpaceLLM_v1"
+# Retrieval-based continual learning
+KNOWLEDGE_REPO_FILE  = MAPE_DIR / "knowledge_repository.json"
+KNOWLEDGE_BACKUP_DIR = MAPE_DIR / "knowledge_repository_backups"
 
 MAPE_DIR.mkdir(parents=True, exist_ok=True)
-FINETUNE_DATASET_DIR.mkdir(parents=True, exist_ok=True)
+KNOWLEDGE_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -118,10 +127,10 @@ FINETUNE_DATASET_DIR.mkdir(parents=True, exist_ok=True)
 
 @dataclass
 class ExecutorConfig:
-    retrain_timeout_seconds: int = 7200           # 2-hour hard cap
-    python_executable:       str = sys.executable  # same venv as execute.py
-    dataset_file_prefix:     str = "retrain_dataset"
     patch_file_max_bytes:    int = 500_000
+    retrieval_top_k:         int = 3
+    retrieval_min_similarity: float = 0.55
+    dedup_similarity_threshold: float = 0.97   # near-identical question → overwrite, not duplicate
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +173,217 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Embeddings
+# ---------------------------------------------------------------------------
+#
+# Primary backend: sentence-transformers (good semantic quality, CPU-friendly,
+# tiny model). Falls back to a deterministic hashed bag-of-words embedding if
+# the package / model can't be loaded (e.g. no network access to download
+# weights) — this keeps the system fully functional for a live demo even in
+# a constrained environment, at the cost of weaker semantic matching.
+
+_EMBEDDER = None
+_EMBEDDER_BACKEND: str | None = None
+_HASH_DIM = 384  # matches all-MiniLM-L6-v2 dim, so vectors are interchangeable in size
+
+
+def _get_embedder():
+    global _EMBEDDER, _EMBEDDER_BACKEND
+    if _EMBEDDER_BACKEND is not None:
+        return _EMBEDDER, _EMBEDDER_BACKEND
+    try:
+        from sentence_transformers import SentenceTransformer
+        model_name = os.environ.get(
+            "SPACELLM_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
+        )
+        _EMBEDDER = SentenceTransformer(model_name)
+        _EMBEDDER_BACKEND = "sentence-transformers"
+        log.info("Embedding backend: sentence-transformers (%s)", model_name)
+    except Exception as exc:
+        log.warning(
+            "sentence-transformers unavailable (%s) — falling back to hashed "
+            "bag-of-words embeddings. Install `sentence-transformers` for "
+            "better retrieval quality.", exc,
+        )
+        _EMBEDDER = None
+        _EMBEDDER_BACKEND = "hashing_fallback"
+    return _EMBEDDER, _EMBEDDER_BACKEND
+
+
+def _hashing_embed(text: str) -> list[float]:
+    """Deterministic fallback embedding — hashed token counts, L2-normalised."""
+    vec = np.zeros(_HASH_DIM, dtype=np.float32)
+    tokens = re.findall(r"[a-z0-9]+", text.lower())
+    for tok in tokens:
+        idx = int(hashlib.md5(tok.encode("utf-8")).hexdigest(), 16) % _HASH_DIM
+        vec[idx] += 1.0
+    norm = np.linalg.norm(vec)
+    if norm > 0:
+        vec = vec / norm
+    return vec.tolist()
+
+
+def embed_text(text: str) -> list[float]:
+    """Embed a single string. Used both at write-time (storing corrections)
+    and at read-time (embedding the incoming user query)."""
+    model, backend = _get_embedder()
+    if backend == "sentence-transformers":
+        emb = model.encode(text, normalize_embeddings=True)
+        return emb.tolist()
+    return _hashing_embed(text)
+
+
+def cosine_similarity(a: list[float], b: list[float]) -> float:
+    va = np.asarray(a, dtype=np.float32)
+    vb = np.asarray(b, dtype=np.float32)
+    na, nb = np.linalg.norm(va), np.linalg.norm(vb)
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return float(np.dot(va, vb) / (na * nb))
+
+
+# ---------------------------------------------------------------------------
+# Knowledge repository (JSON-backed retrieval memory)
+# ---------------------------------------------------------------------------
+
+class KnowledgeRepository:
+    """
+    Flat JSON list of correction records:
+
+        [
+          {
+            "id": "<uuid>",
+            "question": "...",
+            "correct_answer": "...",
+            "embedding": [...],
+            "feedback_id": "...",
+            "created_at": "...",
+            "metadata": {...}
+          },
+          ...
+        ]
+
+    Loaded fully into memory (fine for thousands of corrections; if the
+    repo grows into the tens-of-thousands, swap the linear `query()` scan
+    for an ANN index such as FAISS/usearch — the on-disk schema doesn't
+    need to change).
+    """
+
+    def __init__(self, path: Path = KNOWLEDGE_REPO_FILE,
+                 dedup_threshold: float = 0.97) -> None:
+        self.path = path
+        self.dedup_threshold = dedup_threshold
+        self._entries: list[dict[str, Any]] = self._load()
+
+    def _load(self) -> list[dict[str, Any]]:
+        if not self.path.exists():
+            return []
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            return data if isinstance(data, list) else []
+        except Exception as exc:
+            log.warning(
+                "Could not parse %s (%s) — starting with an empty repository.",
+                self.path, exc,
+            )
+            return []
+
+    def _save(self) -> None:
+        _atomic_write_json(self.path, self._entries)
+
+    def _backup(self) -> Path:
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        backup_path = KNOWLEDGE_BACKUP_DIR / f"knowledge_repository_{ts}.json"
+        backup_path.write_text(
+            json.dumps(self._entries, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        return backup_path
+
+    def add(self, question: str, correct_answer: str, *,
+            feedback_id: str | None = None,
+            metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Embed `question` and upsert a correction record. If a
+        near-duplicate question already exists (cosine similarity above
+        `dedup_threshold`), it is overwritten in place rather than added
+        again, so repeated corrections to the same question don't bloat
+        the repository or create competing retrieval hits."""
+        embedding = embed_text(question)
+        entry = {
+            "id":             str(uuid.uuid4()),
+            "question":       question,
+            "correct_answer": correct_answer,
+            "embedding":      embedding,
+            "feedback_id":    feedback_id,
+            "created_at":     datetime.now(timezone.utc).isoformat(),
+            "metadata":       metadata or {},
+        }
+        for i, existing in enumerate(self._entries):
+            if cosine_similarity(existing["embedding"], embedding) >= self.dedup_threshold:
+                entry["id"] = existing["id"]
+                self._entries[i] = entry
+                self._save()
+                return entry
+        self._entries.append(entry)
+        self._save()
+        return entry
+
+    def query(self, question: str, top_k: int = 3,
+              min_similarity: float = 0.0) -> list[dict[str, Any]]:
+        """Embed `question` and return the top-k most similar stored
+        corrections (each with an added "similarity" field), filtered by
+        `min_similarity`."""
+        if not self._entries:
+            return []
+        q_emb = embed_text(question)
+        scored = []
+        for entry in self._entries:
+            sim = cosine_similarity(q_emb, entry["embedding"])
+            if sim >= min_similarity:
+                scored.append({**entry, "similarity": sim})
+        scored.sort(key=lambda e: e["similarity"], reverse=True)
+        return scored[:top_k]
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+
+def build_augmented_prompt(
+    query: str,
+    repository: "KnowledgeRepository | None" = None,
+    top_k: int = 3,
+    min_similarity: float = 0.55,
+) -> str:
+    """
+    INFERENCE-TIME entry point. Call this from controller.py / the FastAPI
+    request handler *before* sending the prompt to GPT-OSS-20B + SpaceLLM_v1.
+
+        repo = KnowledgeRepository()
+        prompt = build_augmented_prompt(user_message, repo)
+        response = model.generate(prompt)
+
+    If no sufficiently similar correction exists, the original query is
+    returned unchanged (no-op) — this keeps normal questions untouched and
+    only intervenes where a relevant human correction exists.
+    """
+    repository = repository or KnowledgeRepository()
+    hits = repository.query(query, top_k=top_k, min_similarity=min_similarity)
+    if not hits:
+        return query
+
+    lines = [
+        "# Relevant prior human-verified corrections "
+        "(use as grounding context; do not quote verbatim unless directly applicable):"
+    ]
+    for i, hit in enumerate(hits, 1):
+        lines.append(
+            f"{i}. Q: {hit['question']}\n   Verified correct answer: {hit['correct_answer']}"
+        )
+    lines.append("\n# User question:")
+    lines.append(query)
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Executor
 # ---------------------------------------------------------------------------
 
@@ -172,10 +392,11 @@ class Executor:
     def __init__(self, config: ExecutorConfig | None = None) -> None:
         self.config = config or ExecutorConfig()
         self._state = self._load_state()
+        self._repo  = KnowledgeRepository(dedup_threshold=self.config.dedup_similarity_threshold)
         log.info(
-            "Executor initialised. executed_action_ids=%d  last_adapter=%s",
+            "Executor initialised. executed_action_ids=%d  knowledge_repo_entries=%d",
             len(self._state.get("executed_ids", [])),
-            self._state.get("last_adapter", {}).get("adapter_path", "none"),
+            len(self._repo),
         )
 
     # ------------------------------------------------------------------
@@ -232,7 +453,7 @@ class Executor:
                     result       = result,
                 )
                 updated_ids[action_id] = "EXECUTED"
-                log.info("  ✓ EXECUTED in %.1fs", duration_s)
+                log.info("  ✓ EXECUTED in %.3fs", duration_s)
 
             except Exception as exc:
                 finished_at = datetime.now(timezone.utc).isoformat()
@@ -277,44 +498,38 @@ class Executor:
         action_type = action.get("action_type")
         payload     = action.get("payload", {})
         handler = {
-            "RETRAIN_ADAPTER": self._execute_retrain,
-            "PROMPT_PATCH":    self._execute_prompt_patch,
-            "TOPIC_GUARDRAIL": self._execute_topic_guardrail,
-            "FLAG_FOR_REVIEW": self._execute_flag_for_review,
-            "NO_ACTION":       self._execute_no_action,
+            "RETRIEVAL_MEMORY_UPDATE": self._execute_retrieval_update,
+            "RETRAIN_ADAPTER":         self._execute_retrieval_update,  # back-compat alias
+            "PROMPT_PATCH":            self._execute_prompt_patch,
+            "TOPIC_GUARDRAIL":         self._execute_topic_guardrail,
+            "FLAG_FOR_REVIEW":         self._execute_flag_for_review,
+            "NO_ACTION":               self._execute_no_action,
         }.get(action_type)
         if handler is None:
             raise ValueError(f"Unknown action_type: {action_type!r}")
         return handler(payload, action)
 
     # ------------------------------------------------------------------
-    # Handler: RETRAIN_ADAPTER
+    # Handler: RETRIEVAL_MEMORY_UPDATE  (replaces RETRAIN_ADAPTER)
     # ------------------------------------------------------------------
 
-    def _execute_retrain(self, payload: dict, action: dict) -> dict[str, Any]:
+    def _execute_retrieval_update(self, payload: dict, action: dict) -> dict[str, Any]:
         """
-        CONTINUAL LEARNING flow
-        -----------------------
-        Cycle 0  (no previous local adapter):
-            --base_adapter AdityaPS/SpaceLLM_v1   ← your HF fine-tuned model
-        Cycle 1+  (previous local adapter exists):
-            --base_adapter <local path saved from last cycle>
-
-        This means every correction run stacks on top of the previous one
-        instead of resetting to raw gpt-oss-20b weights each time.
+        Store each {question, corrected answer} pair from the Planner's
+        training_examples directly into the JSON knowledge repository.
+        No LoRA, no subprocess, no base-model weight changes — the
+        correction is retrievable on the very next request.
         """
-        examples     = payload.get("training_examples", [])
-        target_label = payload.get("target_adapter_label", "unknown")
-        base_version = payload.get("base_model_version", "unknown")
-
+        examples = payload.get("training_examples", [])
         if not examples:
-            raise ValueError("RETRAIN_ADAPTER payload has no training_examples.")
+            raise ValueError("RETRIEVAL_MEMORY_UPDATE payload has no training_examples.")
 
-        # ── Build training dataset in messages format ──────────────────
-        ts               = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        backup_path      = FINETUNE_DATASET_DIR / f"{self.config.dataset_file_prefix}_{ts}.json"
-        valid_ids:       list[str]  = []
-        records_for_training: list[dict] = []
+        # Snapshot before mutating, for audit / rollback.
+        backup_path = self._repo._backup()
+        log.info("Knowledge repository backed up to %s", backup_path)
+
+        added_entries:      list[dict[str, Any]] = []
+        valid_feedback_ids: list[str]             = []
 
         for ex in examples:
             question  = (ex.get("question")  or "").strip()
@@ -325,148 +540,39 @@ class Executor:
                 log.warning("Skipping example %s — empty question or reference.", fid)
                 continue
 
-            # correction_fine_tuning.py expects messages format:
-            #   [{"role": "user", "content": <question>},
-            #    {"role": "assistant", "content": <human_correction>}]
-            # Loss is masked so only the assistant turn is trained on.
-            records_for_training.append({
-                "messages": [
-                    {"role": "user",      "content": question},
-                    {"role": "assistant", "content": reference},
-                ],
-                "feedback_id": fid,
-                "bertscore":   ex.get("bertscore"),
-            })
-            valid_ids.append(fid)
+            entry = self._repo.add(
+                question, reference,
+                feedback_id=fid,
+                metadata={"bertscore": ex.get("bertscore")},
+            )
+            added_entries.append(entry)
+            if fid:
+                valid_feedback_ids.append(fid)
 
-        if not valid_ids:
-            raise ValueError("All training examples were invalid — nothing to train on.")
+        if not added_entries:
+            raise ValueError("All training examples were invalid — nothing stored.")
 
-        # Write to the default path correction_fine_tuning.py reads
-        CORRECTION_TRAIN_FILE.write_text(
-            json.dumps(records_for_training, indent=2, ensure_ascii=False),
-            encoding="utf-8",
+        marked = self._mark_used_in_training(set(valid_feedback_ids))
+        log.info(
+            "Stored %d correction(s) in knowledge repository (%s). Repo size now %d.",
+            len(added_entries), KNOWLEDGE_REPO_FILE, len(self._repo),
         )
-        # Timestamped backup for audit trail
-        backup_path.write_text(
-            json.dumps(records_for_training, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        log.info("Dataset written: %s  (%d examples)", CORRECTION_TRAIN_FILE, len(valid_ids))
-        log.info("Backup written:  %s", backup_path)
 
-        # ── Resolve base_adapter for continual learning ────────────────
-        #
-        # Priority order:
-        #   1. Local adapter saved from a previous correction cycle
-        #   2. AdityaPS/SpaceLLM_v1 (the original HF fine-tuned adapter)
-        #
-        # We never fall back to no adapter — that would train on raw
-        # gpt-oss-20b and throw away all prior fine-tuning.
-        last_adapter_path = self._state.get("last_adapter", {}).get("adapter_path")
-
-        if last_adapter_path and Path(last_adapter_path).exists():
-            base_adapter = last_adapter_path
-            log.info("Continual learning: continuing from local adapter: %s", base_adapter)
-        else:
-            base_adapter = INITIAL_BASE_ADAPTER
-            log.info("Continual learning: no local adapter found — starting from HF adapter: %s",
-                     base_adapter)
-
-        # ── Output directory ───────────────────────────────────────────
-        adapter_dir = ADAPTER_OUTPUT_DIR / "spacellm_lora_final"
-        adapter_dir.mkdir(parents=True, exist_ok=True)
-
-        # ── Build subprocess command ───────────────────────────────────
-        cmd = [
-            self.config.python_executable,
-            str(FINETUNE_SCRIPT),
-            "--train_file",   str(CORRECTION_TRAIN_FILE),
-            "--output_dir",   str(adapter_dir),
-            "--base_adapter", base_adapter,   # always set — continual learning
-            "--lora_r",       "64",
-            "--lora_alpha",   "128",
-        ]
-
-        log.info("Launching fine-tuning subprocess ...")
-        log.info("  cmd : %s", " ".join(cmd))
-        log.info("  timeout: %ds", self.config.retrain_timeout_seconds)
-
-        stdout_lines: list[str] = []
-        stderr_lines: list[str] = []
-
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                env={**os.environ},   # inherit CUDA_VISIBLE_DEVICES, HF_HOME, HF_TOKEN
-            )
-
-            def _drain(stream, store: list[str], label: str):
-                for line in stream:
-                    line = line.rstrip()
-                    store.append(line)
-                    log.info("[finetune %s] %s", label, line)
-
-            t_out = threading.Thread(target=_drain, args=(proc.stdout, stdout_lines, "STDOUT"))
-            t_err = threading.Thread(target=_drain, args=(proc.stderr, stderr_lines, "STDERR"))
-            t_out.start()
-            t_err.start()
-
-            try:
-                returncode = proc.wait(timeout=self.config.retrain_timeout_seconds)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                t_out.join(timeout=5)
-                t_err.join(timeout=5)
-                raise RuntimeError(
-                    f"Fine-tuning timed out after {self.config.retrain_timeout_seconds}s."
-                )
-
-            t_out.join()
-            t_err.join()
-
-        except FileNotFoundError:
-            raise RuntimeError(
-                f"Fine-tuning script not found: {FINETUNE_SCRIPT}"
-            )
-
-        if returncode != 0:
-            raise RuntimeError(
-                f"Fine-tuning exited with code {returncode}.\n"
-                f"Last stderr:\n" + "\n".join(stderr_lines[-30:])
-            )
-
-        # ── Mark feedback records as used ──────────────────────────────
-        marked = self._mark_used_in_training(set(valid_ids))
-        log.info("Marked %d/%d records as used_in_training=True.", marked, len(valid_ids))
-
-        # ── Persist adapter path for next cycle ────────────────────────
-        # Next cycle will use this local path as --base_adapter so
-        # corrections stack cumulatively: v1 → cycle1 → cycle2 → ...
-        self._state["last_adapter"] = {
-            "adapter_path":  str(adapter_dir),
-            "hf_repo_id":    None,           # local from here on
-            "target_label":  target_label,
-            "base_used":     base_adapter,
-            "example_count": len(valid_ids),
+        self._state["last_retrieval_update"] = {
+            "entries_added": len(added_entries),
+            "repo_size":     len(self._repo),
+            "backup_path":   str(backup_path),
             "timestamp":     datetime.now(timezone.utc).isoformat(),
         }
-        log.info("Saved adapter path for next cycle: %s", adapter_dir)
 
         return {
-            "target_adapter_label": target_label,
-            "adapter_path":         str(adapter_dir),
-            "base_adapter_used":    base_adapter,
-            "train_file":           str(CORRECTION_TRAIN_FILE),
-            "backup_path":          str(backup_path),
-            "examples_used":        len(valid_ids),
-            "returncode":           returncode,
-            "stdout_tail":          stdout_lines[-20:],
-            "stderr_tail":          stderr_lines[-10:],
-            "marked_in_feedback":   marked,
+            "knowledge_repo_file": str(KNOWLEDGE_REPO_FILE),
+            "backup_path":         str(backup_path),
+            "entries_added":       len(added_entries),
+            "added_ids":           [e["id"] for e in added_entries],
+            "repo_size_after":     len(self._repo),
+            "marked_in_feedback":  marked,
+            "embedding_backend":   _EMBEDDER_BACKEND or "uninitialised",
         }
 
     def _mark_used_in_training(self, feedback_ids: set[str]) -> int:
@@ -779,13 +885,14 @@ if __name__ == "__main__":
         for rec in records:
             icon = "✓" if rec.status == "EXECUTED" else "✗"
             print(
-                f"  {icon} [{rec.action_type:<20}] "
+                f"  {icon} [{rec.action_type:<24}] "
                 f"status={rec.status:<8}  "
-                f"duration={rec.duration_s:.1f}s  "
+                f"duration={rec.duration_s:.3f}s  "
                 f"action_id={rec.action_id[:8]}"
             )
         executed = sum(1 for r in records if r.status == "EXECUTED")
         failed   = sum(1 for r in records if r.status == "FAILED")
         print(f"\n  Total: {executed} EXECUTED, {failed} FAILED")
-        print(f"\n  Execution log → {EXECUTION_LOG}")
+        print(f"\n  Execution log     → {EXECUTION_LOG}")
+        print(f"  Knowledge repo    → {KNOWLEDGE_REPO_FILE}")
     print(f"{'='*60}\n")
