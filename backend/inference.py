@@ -149,6 +149,14 @@ def extract_prompt_and_reference(record: dict, tokenizer) -> tuple[str | None, s
     return prompt, ref_answer
 
 
+def get_input_device(model) -> torch.device:
+    """Return the device of the embedding layer (first layer inputs must go here)."""
+    try:
+        return next(model.get_input_embeddings().parameters()).device
+    except Exception:
+        return torch.device("cuda:0")
+
+
 def generate_one(model, tokenizer, prompt: str, device: str) -> tuple[torch.Tensor, str]:
     enc = tokenizer(
         prompt,
@@ -157,7 +165,10 @@ def generate_one(model, tokenizer, prompt: str, device: str) -> tuple[torch.Tens
         max_length=MAX_SEQ_LEN - MAX_NEW_TOKENS,
         padding=False,
     )
-    enc = {k: v.to(device) for k, v in enc.items()}
+    # Send inputs to wherever the embedding layer lives (may differ from DEVICE
+    # after dispatch_model shards the MoE model across multiple GPUs)
+    input_device = get_input_device(model)
+    enc = {k: v.to(input_device) for k, v in enc.items()}
 
     with torch.no_grad():
         gen_ids = model.generate(
@@ -233,20 +244,24 @@ def main():
         f"eos_id={tokenizer.eos_token_id}  pad_id={tokenizer.pad_token_id}"
     )
 
-    # ── Step 3: base model ────────────────────────────────────────────────
-    logger.info(f"\nLoading base model {MODEL_ID} to {DEVICE} ...")
+    # ── Step 3: base model — load to CPU first ────────────────────────────
+    # gpt-oss-20b is a MoE model. Loading directly to a single DEVICE string
+    # leaves MoE expert weight matrices on CPU, causing the grouped_mm device
+    # mismatch crash at inference time. Load to CPU first, then dispatch after
+    # resize + PEFT (same pattern as correction_fine_tuning.py).
+    logger.info(f"\nLoading base model {MODEL_ID} to CPU (will dispatch after PEFT) ...")
     t0 = time.time()
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
         quantization_config=Mxfp4Config(dequantize=True),
-        device_map=DEVICE,
+        device_map="cpu",
         trust_remote_code=True,
         ignore_mismatched_sizes=True,
     )
     logger.info(f"  Base model loaded in {time.time()-t0:.1f}s")
-    log_gpu_memory("after base model load")
+    log_gpu_memory("after base model load (CPU)")
 
-    # ── Step 4: untie + resize ────────────────────────────────────────────
+    # ── Step 4: untie + resize (on CPU, safe before PEFT) ────────────────
     untie_lm_head(model, "(base, pre-resize)")
 
     logger.info(f"\nResizing vocab to {TRAINED_VOCAB_SIZE:,} ...")
@@ -278,7 +293,57 @@ def main():
 
     model.eval()
     torch.cuda.empty_cache()
-    log_gpu_memory("after adapter load")
+
+    # ── Step 5b: dispatch model across GPUs ───────────────────────────────
+    # Must happen AFTER PEFT load so the adapter weights are included in the
+    # device map. Uses the same infer_auto_device_map strategy as training.
+    logger.info("\nDispatching model across GPUs ...")
+    t_dispatch = time.time()
+    try:
+        from accelerate import dispatch_model, infer_auto_device_map
+
+        # Identify no-split layer classes (same heuristic as training script)
+        no_split = []
+        for name, module in model.named_modules():
+            cls      = type(module)
+            cls_name = cls.__name__.lower()
+            if (
+                issubclass(cls, nn.Module) and cls is not nn.Module
+                and ("layer" in cls_name or "block" in cls_name)
+                and cls.__name__ not in no_split
+                and sum(p.numel() for p in module.parameters()) > 1_000_000
+            ):
+                no_split.append(cls.__name__)
+        no_split = list(dict.fromkeys(no_split))
+        logger.info(f"  no_split_module_classes: {no_split}")
+
+        # Reserve 4 GB headroom per GPU for activations during inference
+        n_gpus     = torch.cuda.device_count()
+        max_memory = {}
+        for i in range(n_gpus):
+            free  = torch.cuda.mem_get_info(i)[0]
+            alloc = max(0, free - 4 * 1024**3)
+            max_memory[i] = f"{int(alloc / 1024**3)}GiB"
+        max_memory["cpu"] = "80GiB"
+        logger.info(f"  max_memory per device: {max_memory}")
+
+        device_map = infer_auto_device_map(
+            model, max_memory=max_memory, no_split_module_classes=no_split
+        )
+        model = dispatch_model(model, device_map=device_map)
+        logger.info(f"  dispatch_model done in {time.time()-t_dispatch:.1f}s")
+
+        if hasattr(model, "hf_device_map"):
+            from collections import Counter
+            dev_counts = Counter(str(v) for v in model.hf_device_map.values())
+            for dev, count in sorted(dev_counts.items()):
+                logger.info(f"    {dev} : {count} modules")
+
+    except Exception as e:
+        logger.warning(f"  dispatch_model failed ({e}) — falling back to single GPU {DEVICE}")
+        model = model.to(DEVICE)
+
+    log_gpu_memory("after dispatch")
 
     # ── Step 6: smoke test ────────────────────────────────────────────────
     test_records = load_test_data(TEST_FILE)
