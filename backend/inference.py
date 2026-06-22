@@ -20,15 +20,21 @@ Why this replaces the adapter-stacking script:
 
 Pipeline:
     1. Load base model (openai/gpt-oss-20b, MXFP4 dequantize)
-    2. Load the SpaceLLM_v1 adapter — exactly as it works in production,
-       no resize/untie workarounds (those were only ever needed to paper
-       over the broken correction-adapter checkpoints)
-    3. Load the JSON knowledge repository (execute.py's KnowledgeRepository)
-    4. For each test record: retrieve top-k similar corrections for the
+    2. Detect the vocab size SpaceLLM_v1 was trained against from its saved
+       adapter tensors, and resize the freshly-loaded base model to match
+       if the base checkpoint's native vocab has drifted (e.g. HF re-pads
+       gpt-oss-20b's embedding table over time, independent of any LoRA
+       work). This is NOT the old adapter-stacking resize hack — it's
+       unavoidable bookkeeping any time you attach an adapter to a base
+       checkpoint whose shapes may have moved since the adapter was saved.
+    3. Load the SpaceLLM_v1 adapter — exactly one adapter, never modified,
+       never merged, never retrained
+    4. Load the JSON knowledge repository (execute.py's KnowledgeRepository)
+    5. For each test record: retrieve top-k similar corrections for the
        raw question, inject them into the user turn, then chat-template
        and generate
-    5. Token F1 + BERTScore, same as before
-    6. Optional ablation: run the same test set with RAG disabled to get
+    6. Token F1 + BERTScore, same as before
+    7. Optional ablation: run the same test set with RAG disabled to get
        a side-by-side delta for the paper
 
 Usage:
@@ -170,6 +176,56 @@ def inject_retrieval_context(
     return new_messages, num_retrieved, original_question
 
 
+def detect_adapter_vocab_size(adapter_path: str, hf_token: str | None = None) -> int:
+    """
+    Read the vocab size an adapter was trained against, straight from its
+    saved tensors — works for a local directory OR an HF repo id (e.g.
+    "AdityaPS/SpaceLLM_v1"), downloading just the safetensors file in the
+    latter case rather than guessing from tokenizer/config metadata, which
+    can drift from the actual checkpoint shapes.
+
+    Looks at every "lm_head" tensor in the adapter (base_layer.weight,
+    lora_A.weight, lora_B.weight — whichever are present) and takes the
+    largest dimension across all of them, since the vocab dimension is
+    always the larger side of an lm_head matrix.
+    """
+    from safetensors import safe_open
+
+    local_path = Path(adapter_path)
+    if local_path.exists() and (local_path / "adapter_model.safetensors").exists():
+        safetensors_path = local_path / "adapter_model.safetensors"
+    else:
+        from huggingface_hub import hf_hub_download
+        safetensors_path = Path(hf_hub_download(
+            repo_id=str(adapter_path), filename="adapter_model.safetensors", token=hf_token,
+        ))
+
+    candidates = []
+    with safe_open(str(safetensors_path), framework="pt") as f:
+        for key in f.keys():
+            if "lm_head" in key:
+                shape = f.get_slice(key).get_shape()
+                candidates.append((key, shape))
+
+    if not candidates:
+        raise RuntimeError(
+            f"No lm_head tensors found in {safetensors_path} — cannot determine "
+            f"the vocab size this adapter expects."
+        )
+
+    key, shape = max(candidates, key=lambda kv: max(kv[1]))
+    vocab = max(shape)
+    logger.info(f"  Detected required vocab size {vocab:,} from tensor '{key}' shape={list(shape)}")
+    return vocab
+
+
+def untie_lm_head(model, label: str = ""):
+    model.config.tie_word_embeddings = False
+    lm_head = model.get_output_embeddings()
+    lm_head.weight = nn.Parameter(lm_head.weight.detach().clone())
+    logger.info(f"  ✅ lm_head untied {label}")
+
+
 def get_input_device(model) -> torch.device:
     """Return the device of the embedding layer (first layer inputs must go here)."""
     try:
@@ -224,15 +280,23 @@ def looks_degenerate(token_ids: torch.Tensor) -> tuple[bool, str]:
 
 
 def load_model_and_tokenizer():
-    """Load SpaceLLM_v1 exactly as it runs in production — no vocab resize,
-    no lm_head untie, no adapter stacking. Those workarounds only ever
-    existed to paper over the broken correction-adapter checkpoints, which
-    no longer exist in this design."""
+    """Load SpaceLLM_v1. The base checkpoint's native lm_head size can drift
+    from what v1 was actually trained against (e.g. HF re-pads gpt-oss-20b's
+    vocab over time), so we detect v1's expected vocab size from its saved
+    tensors and resize the freshly-loaded base model to match BEFORE
+    attaching the adapter — otherwise PeftModel.from_pretrained fails with
+    a state_dict shape mismatch on lm_head. This is unrelated to the old
+    LoRA-stacking/retraining problem; it's just base-checkpoint drift."""
     from transformers import AutoModelForCausalLM, AutoTokenizer, Mxfp4Config
     from peft import PeftModel
 
+    hf_token = os.environ.get("HF_TOKEN")
+
+    logger.info("Detecting vocab size required by SpaceLLM_v1 adapter ...")
+    required_vocab = detect_adapter_vocab_size(SPACELLM_V1_ADAPTER, hf_token=hf_token)
+
     logger.info("Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(SPACELLM_V1_ADAPTER, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(SPACELLM_V1_ADAPTER, trust_remote_code=True, token=hf_token)
     if tokenizer.eos_token_id is None:
         raise RuntimeError("tokenizer.eos_token_id is None — fix tokenizer config before running.")
     if tokenizer.pad_token is None:
@@ -249,12 +313,35 @@ def load_model_and_tokenizer():
         quantization_config=Mxfp4Config(dequantize=True),
         device_map="cpu",
         trust_remote_code=True,
+        ignore_mismatched_sizes=True,
+        token=hf_token,
     )
     logger.info(f"  Base model loaded in {time.time()-t0:.1f}s")
     log_gpu_memory("after base model load (CPU)")
 
+    # ── Align vocab with what v1 was trained against ──────────────────────
+    untie_lm_head(model, "(base, pre-resize)")
+    current_vocab = model.get_output_embeddings().weight.shape[0]
+    if current_vocab != required_vocab:
+        logger.info(f"Resizing base model vocab {current_vocab:,} → {required_vocab:,} to match SpaceLLM_v1 ...")
+        model.resize_token_embeddings(required_vocab)
+        model.config.vocab_size = required_vocab
+        # resize can re-tie weights — guard against it
+        if id(model.get_input_embeddings().weight) == id(model.get_output_embeddings().weight):
+            untie_lm_head(model, "(re-untied after resize)")
+        actual_vocab = model.get_output_embeddings().weight.shape[0]
+        assert actual_vocab == required_vocab, (
+            f"Vocab resize mismatch: got {actual_vocab:,}, expected {required_vocab:,}"
+        )
+        logger.info(f"  ✅ Vocab confirmed at {actual_vocab:,}")
+    else:
+        logger.info("  Base model vocab already matches SpaceLLM_v1 — no resize needed.")
+
     logger.info(f"Loading SpaceLLM_v1 adapter from {SPACELLM_V1_ADAPTER} ...")
-    model = PeftModel.from_pretrained(model, SPACELLM_V1_ADAPTER, adapter_name="spacellm_v1", is_trainable=False)
+    model = PeftModel.from_pretrained(
+        model, SPACELLM_V1_ADAPTER, adapter_name="spacellm_v1",
+        is_trainable=False, token=hf_token,
+    )
     model.set_adapter("spacellm_v1")
     logger.info("  ✅ SpaceLLM_v1 adapter loaded and set as active (unmodified — no further training)")
 
