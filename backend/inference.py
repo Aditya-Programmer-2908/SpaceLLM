@@ -1,27 +1,51 @@
 """
-SpaceLLM — Correction Adapter Inference + BERTScore
-=====================================================
-Uses ONLY the locally saved correction adapter at spacellm_lora_final.
-That adapter already has SpaceLLM_v1 knowledge baked in via merge_and_unload(),
-so there is NO adapter stacking — one adapter, one load, no shape conflicts.
+SpaceLLM — Retrieval-Augmented Inference + BERTScore
+=======================================================
+Replaces the old "correction adapter" inference script. There is no LoRA
+adapter stacked on top of SpaceLLM_v1 anymore — the base model weights are
+NEVER modified post-deployment. Corrections live in a JSON knowledge
+repository (written by execute.py's RETRIEVAL_MEMORY_UPDATE handler) and
+are injected into the prompt at inference time, per-query.
+
+Why this replaces the adapter-stacking script:
+    The previous flow trained a new LoRA correction adapter on ~10-15
+    examples per cycle and merged it on top of SpaceLLM_v1. On a dataset
+    that small, the adapter overfit and caused generation collapse
+    (degenerate repeated-token outputs) — see the smoke-test guard that
+    used to live in this file. Retrieval-augmented generation sidesteps
+    the failure mode entirely: SpaceLLM_v1's weights are loaded once and
+    never touched, so there is nothing left to collapse. Corrections are
+    available the instant they're written to the repository — no
+    training run, no vocab-resize bookkeeping, no adapter-shape conflicts.
 
 Pipeline:
-    1. Detect true vocab size from the adapter checkpoint tensors
-    2. Load base model (openai/gpt-oss-20b, MXFP4 dequantize)
-    3. Untie lm_head
-    4. Resize vocab to match adapter
-    5. Load single correction adapter
-    6. Smoke test (5 samples) — abort if degenerate
-    7. Full inference + BERTScore
+    1. Load base model (openai/gpt-oss-20b, MXFP4 dequantize)
+    2. Load the SpaceLLM_v1 adapter — exactly as it works in production,
+       no resize/untie workarounds (those were only ever needed to paper
+       over the broken correction-adapter checkpoints)
+    3. Load the JSON knowledge repository (execute.py's KnowledgeRepository)
+    4. For each test record: retrieve top-k similar corrections for the
+       raw question, inject them into the user turn, then chat-template
+       and generate
+    5. Token F1 + BERTScore, same as before
+    6. Optional ablation: run the same test set with RAG disabled to get
+       a side-by-side delta for the paper
+
+Usage:
+    python retrieval_inference_bertscore.py
+    python retrieval_inference_bertscore.py --no-rag          # baseline, no retrieval
+    python retrieval_inference_bertscore.py --ablation        # runs both, reports delta
+    python retrieval_inference_bertscore.py --top-k 5 --min-similarity 0.5
 """
 
+import argparse
 import json
 import logging
 import os
+import sys
 import time
-from collections import Counter
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -29,67 +53,43 @@ import torch.nn as nn
 # ── Paths ──────────────────────────────────────────────────────────────────────
 
 BASE_DIR = Path("/mnt/DATA/saurabh/aditya/SpaceLLM")
-
-CORRECTION_ADAPTER_DIR = Path(
-    "/mnt/DATA/saurabh/aditya/SpaceLLM/Model_training_&_Data_Extraction/"
-    "fine_tuning_v2/outputs/spacellm_lora_final"
-)
+BACKEND_DIR = BASE_DIR / "backend"
+MAPE_DIR    = BACKEND_DIR / "mape_k"
 
 TEST_FILE = BASE_DIR / "Model_training_&_Data_Extraction/data_processing/DatasetA_core_QA_v2/test.json"
 OUT_DIR   = BASE_DIR / "Model_training_&_Data_Extraction/fine_tuning_v2/outputs/bertscore"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 RUN_ID   = datetime.now().strftime("%Y%m%d_%H%M%S")
-LOG_FILE = OUT_DIR / f"inference_correction_{RUN_ID}.log"
+LOG_FILE = OUT_DIR / f"inference_retrieval_{RUN_ID}.log"
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     handlers=[logging.StreamHandler(), logging.FileHandler(LOG_FILE, encoding="utf-8")],
 )
-logger = logging.getLogger("BERTEval")
+logger = logging.getLogger("RAGEval")
+
+# execute.py (KnowledgeRepository, build_augmented_prompt) lives under
+# backend/mape_k — make it importable without turning this script into a
+# package.
+sys.path.insert(0, str(MAPE_DIR))
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-MODEL_ID           = "openai/gpt-oss-20b"
-MAX_SEQ_LEN        = 2048
-MAX_NEW_TOKENS     = 256
-MAX_SAMPLES        = None       # set to an int to cap the eval set
-DEVICE             = "cuda:0"
-SMOKE_TEST_SAMPLES = 5
+MODEL_ID            = "openai/gpt-oss-20b"
+SPACELLM_V1_ADAPTER = "AdityaPS/SpaceLLM_v1"   # HF-hosted adapter — never modified
+MAX_SEQ_LEN          = 2048
+MAX_NEW_TOKENS       = 256
+MAX_SAMPLES          = None        # set to an int to cap the eval set
+DEVICE               = "cuda:0"
+SMOKE_TEST_SAMPLES   = 5
+
+DEFAULT_TOP_K          = 3
+DEFAULT_MIN_SIMILARITY = 0.55
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
-
-def detect_adapter_vocab_size(adapter_dir: Path) -> int:
-    """
-    Read the true vocab size directly from the saved adapter tensors.
-    lora_B for lm_head has shape [vocab_size, r] — take max(shape).
-    Raises RuntimeError if it cannot be determined (never fall back to a guess).
-    """
-    from safetensors import safe_open
-
-    safetensors_path = adapter_dir / "adapter_model.safetensors"
-    if not safetensors_path.exists():
-        raise FileNotFoundError(
-            f"adapter_model.safetensors not found at {safetensors_path}. "
-            "Make sure correction_fine_tuning.py ran successfully first."
-        )
-
-    with safe_open(str(safetensors_path), framework="pt") as f:
-        for key in f.keys():
-            if "lm_head" in key and ("lora_B" in key or "lora_b" in key):
-                shape = f.get_slice(key).get_shape()
-                vocab = max(shape)
-                logger.info(f"  Detected vocab size {vocab:,} from tensor '{key}' shape={list(shape)}")
-                return vocab
-
-    raise RuntimeError(
-        f"Could not find an lm_head lora_B tensor in {safetensors_path}. "
-        "Inspect the file manually: `python -c \"from safetensors import safe_open; "
-        "f=safe_open('adapter_model.safetensors', framework='pt'); print(list(f.keys()))\"`"
-    )
-
 
 def log_gpu_memory(label: str = ""):
     for i in range(torch.cuda.device_count()):
@@ -101,13 +101,6 @@ def log_gpu_memory(label: str = ""):
             f"GPU {i} [{props.name}] {label} | "
             f"Alloc={alloc:.2f}GB  Reserved={reserv:.2f}GB  Total={total:.2f}GB"
         )
-
-
-def untie_lm_head(model, label: str = ""):
-    model.config.tie_word_embeddings = False
-    lm_head = model.get_output_embeddings()
-    lm_head.weight = nn.Parameter(lm_head.weight.detach().clone())
-    logger.info(f"✅ lm_head untied {label}")
 
 
 def load_test_data(path: Path) -> list[dict]:
@@ -122,8 +115,15 @@ def load_test_data(path: Path) -> list[dict]:
     return data
 
 
-def extract_prompt_and_reference(record: dict, tokenizer) -> tuple[str | None, str | None]:
-    messages   = record.get("messages", [])
+def extract_messages_and_reference(record: dict) -> tuple[list[dict] | None, str | None]:
+    """
+    Like the old extract_prompt_and_reference, but stops BEFORE chat
+    templating and returns the raw HF message list instead. We need the
+    untemplated user turn so retrieval augmentation can be injected into
+    the right place before the template (and its special tokens) are
+    applied.
+    """
+    messages    = record.get("messages", [])
     hf_messages = []
     ref_answer  = ""
 
@@ -137,16 +137,37 @@ def extract_prompt_and_reference(record: dict, tokenizer) -> tuple[str | None, s
 
     if not hf_messages or not ref_answer:
         return None, None
+    return hf_messages, ref_answer
 
-    try:
-        prompt = tokenizer.apply_chat_template(
-            hf_messages, tokenize=False, add_generation_prompt=True
-        )
-    except Exception as e:
-        logger.warning(f"apply_chat_template failed: {e}")
-        return None, None
 
-    return prompt, ref_answer
+def inject_retrieval_context(
+    hf_messages: list[dict],
+    repo,
+    build_augmented_prompt,
+    top_k: int,
+    min_similarity: float,
+) -> tuple[list[dict], int, str]:
+    """
+    Finds the last user turn, retrieves similar past corrections for its
+    raw text, and replaces that turn's content with the augmented version.
+    Returns (possibly-modified messages, num_corrections_retrieved,
+    raw_question_text) so callers can log/inspect what was retrieved.
+    """
+    user_indices = [i for i, m in enumerate(hf_messages) if m["role"] == "user"]
+    if not user_indices:
+        return hf_messages, 0, ""
+
+    last_user_idx     = user_indices[-1]
+    original_question = hf_messages[last_user_idx]["content"]
+
+    augmented = build_augmented_prompt(
+        original_question, repo, top_k=top_k, min_similarity=min_similarity
+    )
+    num_retrieved = 0 if augmented == original_question else top_k  # exact count not returned by build_augmented_prompt
+
+    new_messages = [dict(m) for m in hf_messages]
+    new_messages[last_user_idx]["content"] = augmented
+    return new_messages, num_retrieved, original_question
 
 
 def get_input_device(model) -> torch.device:
@@ -157,7 +178,7 @@ def get_input_device(model) -> torch.device:
         return torch.device("cuda:0")
 
 
-def generate_one(model, tokenizer, prompt: str, device: str) -> tuple[torch.Tensor, str]:
+def generate_one(model, tokenizer, prompt: str) -> tuple[torch.Tensor, str]:
     enc = tokenizer(
         prompt,
         return_tensors="pt",
@@ -186,123 +207,65 @@ def generate_one(model, tokenizer, prompt: str, device: str) -> tuple[torch.Tens
 
 
 def looks_degenerate(token_ids: torch.Tensor) -> tuple[bool, str]:
+    """Kept as a cheap sanity check on the live deployment. With retrieval
+    replacing adapter retraining, the base model weights are never touched,
+    so this should essentially never trigger — if it does, something else
+    (e.g. a bad checkpoint swap) is wrong, not a retraining artifact."""
+    from collections import Counter
     ids = token_ids.tolist()
     if not ids:
         return True, "empty generation"
-    counts       = Counter(ids)
-    top_id, top_count = counts.most_common(1)[0]
+    counts             = Counter(ids)
+    top_id, top_count  = counts.most_common(1)[0]
     frac = top_count / len(ids)
     if frac > 0.6:
         return True, f"token id {top_id} makes up {frac:.0%} of the generation"
     return False, ""
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
-
-def main():
-    logger.info("=" * 60)
-    logger.info("  SpaceLLM — Correction Adapter Only (v1 merged in) — Inference + BERTScore")
-    logger.info(f"  Run ID     : {RUN_ID}")
-    logger.info(f"  Adapter    : {CORRECTION_ADAPTER_DIR}")
-    logger.info(f"  Test file  : {TEST_FILE}")
-    logger.info("=" * 60)
-
-    os.environ["CUDA_VISIBLE_DEVICES"] = "1"
-    for i in range(torch.cuda.device_count()):
-        props = torch.cuda.get_device_properties(i)
-        logger.info(f"GPU {i}: {props.name}  ({props.total_memory/1024**3:.1f} GB)")
-    log_gpu_memory("before model load")
-
+def load_model_and_tokenizer():
+    """Load SpaceLLM_v1 exactly as it runs in production — no vocab resize,
+    no lm_head untie, no adapter stacking. Those workarounds only ever
+    existed to paper over the broken correction-adapter checkpoints, which
+    no longer exist in this design."""
     from transformers import AutoModelForCausalLM, AutoTokenizer, Mxfp4Config
     from peft import PeftModel
 
-    # ── Step 1: detect vocab size from the adapter checkpoint ─────────────
-    logger.info("\n── Detecting vocab size from adapter checkpoint ──────")
-    TRAINED_VOCAB_SIZE = detect_adapter_vocab_size(CORRECTION_ADAPTER_DIR)
-    logger.info(f"  ✅ Vocab size = {TRAINED_VOCAB_SIZE:,}")
-
-    # ── Step 2: tokenizer ─────────────────────────────────────────────────
-    logger.info("\nLoading tokenizer...")
-    tokenizer_source = (
-        str(CORRECTION_ADAPTER_DIR)
-        if (CORRECTION_ADAPTER_DIR / "tokenizer_config.json").exists()
-        else MODEL_ID
-    )
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=True)
-    logger.info(f"  Tokenizer loaded from: {tokenizer_source}")
-
+    logger.info("Loading tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(SPACELLM_V1_ADAPTER, trust_remote_code=True)
     if tokenizer.eos_token_id is None:
         raise RuntimeError("tokenizer.eos_token_id is None — fix tokenizer config before running.")
     if tokenizer.pad_token is None:
         tokenizer.pad_token    = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
         logger.warning("  pad_token was unset — falling back to eos_token")
-
     tokenizer.padding_side = "left"
-    logger.info(
-        f"  vocab={tokenizer.vocab_size:,}  "
-        f"eos_id={tokenizer.eos_token_id}  pad_id={tokenizer.pad_token_id}"
-    )
+    logger.info(f"  vocab={tokenizer.vocab_size:,}  eos_id={tokenizer.eos_token_id}  pad_id={tokenizer.pad_token_id}")
 
-    # ── Step 3: base model — load to CPU first ────────────────────────────
-    # gpt-oss-20b is a MoE model. Loading directly to a single DEVICE string
-    # leaves MoE expert weight matrices on CPU, causing the grouped_mm device
-    # mismatch crash at inference time. Load to CPU first, then dispatch after
-    # resize + PEFT (same pattern as correction_fine_tuning.py).
-    logger.info(f"\nLoading base model {MODEL_ID} to CPU (will dispatch after PEFT) ...")
+    logger.info(f"Loading base model {MODEL_ID} to CPU (will dispatch after PEFT) ...")
     t0 = time.time()
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
         quantization_config=Mxfp4Config(dequantize=True),
         device_map="cpu",
         trust_remote_code=True,
-        ignore_mismatched_sizes=True,
     )
     logger.info(f"  Base model loaded in {time.time()-t0:.1f}s")
     log_gpu_memory("after base model load (CPU)")
 
-    # ── Step 4: untie + resize (on CPU, safe before PEFT) ────────────────
-    untie_lm_head(model, "(base, pre-resize)")
-
-    logger.info(f"\nResizing vocab to {TRAINED_VOCAB_SIZE:,} ...")
-    model.resize_token_embeddings(TRAINED_VOCAB_SIZE)
-    model.config.vocab_size = TRAINED_VOCAB_SIZE
-
-    # resize can re-tie weights — guard against it
-    if id(model.get_input_embeddings().weight) == id(model.get_output_embeddings().weight):
-        untie_lm_head(model, "(re-untied after resize)")
-
-    actual_vocab = model.get_output_embeddings().weight.shape[0]
-    assert actual_vocab == TRAINED_VOCAB_SIZE, (
-        f"Vocab resize mismatch: got {actual_vocab:,}, expected {TRAINED_VOCAB_SIZE:,}"
-    )
-    logger.info(f"  ✅ Vocab confirmed at {actual_vocab:,}")
-
-    # ── Step 5: load the single correction adapter ─────────────────────────
-    # This adapter was produced by merge_and_unload(SpaceLLM_v1) + fresh LoRA,
-    # so it already encodes v1 knowledge. No stacking required.
-    logger.info(f"\nLoading correction adapter from {CORRECTION_ADAPTER_DIR} ...")
-    model = PeftModel.from_pretrained(
-        model,
-        str(CORRECTION_ADAPTER_DIR),
-        adapter_name="correction",
-        is_trainable=False,
-    )
-    model.set_adapter("correction")
-    logger.info("  ✅ Correction adapter loaded and set as active")
+    logger.info(f"Loading SpaceLLM_v1 adapter from {SPACELLM_V1_ADAPTER} ...")
+    model = PeftModel.from_pretrained(model, SPACELLM_V1_ADAPTER, adapter_name="spacellm_v1", is_trainable=False)
+    model.set_adapter("spacellm_v1")
+    logger.info("  ✅ SpaceLLM_v1 adapter loaded and set as active (unmodified — no further training)")
 
     model.eval()
     torch.cuda.empty_cache()
 
-    # ── Step 5b: dispatch model across GPUs ───────────────────────────────
-    # Must happen AFTER PEFT load so the adapter weights are included in the
-    # device map. Uses the same infer_auto_device_map strategy as training.
-    logger.info("\nDispatching model across GPUs ...")
+    logger.info("Dispatching model across GPUs ...")
     t_dispatch = time.time()
     try:
         from accelerate import dispatch_model, infer_auto_device_map
 
-        # Identify no-split layer classes (same heuristic as training script)
         no_split = []
         for name, module in model.named_modules():
             cls      = type(module)
@@ -317,7 +280,6 @@ def main():
         no_split = list(dict.fromkeys(no_split))
         logger.info(f"  no_split_module_classes: {no_split}")
 
-        # Reserve 4 GB headroom per GPU for activations during inference
         n_gpus     = torch.cuda.device_count()
         max_memory = {}
         for i in range(n_gpus):
@@ -327,9 +289,7 @@ def main():
         max_memory["cpu"] = "80GiB"
         logger.info(f"  max_memory per device: {max_memory}")
 
-        device_map = infer_auto_device_map(
-            model, max_memory=max_memory, no_split_module_classes=no_split
-        )
+        device_map = infer_auto_device_map(model, max_memory=max_memory, no_split_module_classes=no_split)
         model = dispatch_model(model, device_map=device_map)
         logger.info(f"  dispatch_model done in {time.time()-t_dispatch:.1f}s")
 
@@ -344,19 +304,36 @@ def main():
         model = model.to(DEVICE)
 
     log_gpu_memory("after dispatch")
+    return model, tokenizer
 
-    # ── Step 6: smoke test ────────────────────────────────────────────────
-    test_records = load_test_data(TEST_FILE)
-    if MAX_SAMPLES:
-        test_records = test_records[:MAX_SAMPLES]
 
-    logger.info(f"\n── Smoke test ({SMOKE_TEST_SAMPLES} samples) ────────────────────")
+def run_eval(
+    model,
+    tokenizer,
+    test_records: list[dict],
+    use_rag: bool,
+    repo,
+    build_augmented_prompt,
+    top_k: int,
+    min_similarity: float,
+    tag: str,
+) -> dict:
+    """Run inference + BERTScore over test_records, optionally with
+    retrieval augmentation. `tag` distinguishes output filenames when
+    running an ablation (e.g. 'rag' vs 'no_rag')."""
+
+    logger.info(f"\n── Smoke test ({SMOKE_TEST_SAMPLES} samples, tag={tag}) ──────────")
     smoke_ok = True
     for i, record in enumerate(test_records[:SMOKE_TEST_SAMPLES]):
-        prompt, ref = extract_prompt_and_reference(record, tokenizer)
-        if prompt is None:
+        hf_messages, ref = extract_messages_and_reference(record)
+        if hf_messages is None:
             continue
-        token_ids, text = generate_one(model, tokenizer, prompt, DEVICE)
+        if use_rag:
+            hf_messages, _, _ = inject_retrieval_context(
+                hf_messages, repo, build_augmented_prompt, top_k, min_similarity
+            )
+        prompt = tokenizer.apply_chat_template(hf_messages, tokenize=False, add_generation_prompt=True)
+        token_ids, text = generate_one(model, tokenizer, prompt)
         bad, reason = looks_degenerate(token_ids)
         logger.info(f"  [{i}] {text[:100]!r}")
         if bad:
@@ -365,24 +342,38 @@ def main():
 
     if not smoke_ok:
         raise RuntimeError(
-            "Smoke test detected degenerate generation. Aborting before full eval. "
-            "Check vocab size detection and adapter loading above."
+            "Smoke test detected degenerate generation. Since SpaceLLM_v1's "
+            "weights are never modified in this setup, this points to a "
+            "loading/checkpoint problem, not a retraining artifact — check "
+            "the adapter path and tokenizer."
         )
     logger.info("  ✅ Smoke test passed — proceeding to full eval\n")
 
-    # ── Step 7: full inference ─────────────────────────────────────────────
-    logger.info(f"Running inference on {len(test_records):,} samples ...")
+    logger.info(f"Running inference on {len(test_records):,} samples (RAG={use_rag}) ...")
     references, hypotheses, predictions = [], [], []
     skipped = 0
+    retrieved_counts = []
     t_inf = time.time()
 
     for i, record in enumerate(test_records):
-        prompt, ref = extract_prompt_and_reference(record, tokenizer)
-        if prompt is None:
+        hf_messages, ref = extract_messages_and_reference(record)
+        if hf_messages is None:
             skipped += 1
             continue
+
+        retrieved_hits = []
+        if use_rag:
+            user_indices = [j for j, m in enumerate(hf_messages) if m["role"] == "user"]
+            raw_question = hf_messages[user_indices[-1]]["content"] if user_indices else ""
+            retrieved_hits = repo.query(raw_question, top_k=top_k, min_similarity=min_similarity) if raw_question else []
+            hf_messages, _, _ = inject_retrieval_context(
+                hf_messages, repo, build_augmented_prompt, top_k, min_similarity
+            )
+        retrieved_counts.append(len(retrieved_hits))
+
+        prompt = tokenizer.apply_chat_template(hf_messages, tokenize=False, add_generation_prompt=True)
         try:
-            _, generated = generate_one(model, tokenizer, prompt, DEVICE)
+            _, generated = generate_one(model, tokenizer, prompt)
         except Exception as e:
             logger.warning(f"  Generation failed [{i}]: {e}")
             skipped += 1
@@ -391,9 +382,11 @@ def main():
         references.append(ref)
         hypotheses.append(generated)
         predictions.append({
-            "sample_id": record.get("sample_id", i),
-            "reference": ref,
-            "generated": generated,
+            "sample_id":           record.get("sample_id", i),
+            "reference":           ref,
+            "generated":           generated,
+            "retrieved_corrections": len(retrieved_hits),
+            "top_similarity":      round(retrieved_hits[0]["similarity"], 4) if retrieved_hits else None,
         })
 
         if (i + 1) % 100 == 0:
@@ -401,26 +394,19 @@ def main():
             rate    = (i + 1) / elapsed
             eta     = (len(test_records) - i - 1) / rate
             logger.info(
-                f"  [{i+1}/{len(test_records)}] "
-                f"valid={len(predictions)}  skipped={skipped}  "
+                f"  [{i+1}/{len(test_records)}] valid={len(predictions)}  skipped={skipped}  "
                 f"speed={rate:.2f} it/s  ETA={eta/60:.1f} min"
             )
 
     inf_time = time.time() - t_inf
-    logger.info(
-        f"\nInference done — {len(predictions):,} samples  "
-        f"skipped={skipped}  time={inf_time/60:.1f} min"
-    )
+    logger.info(f"\nInference done (tag={tag}) — {len(predictions):,} samples  skipped={skipped}  time={inf_time/60:.1f} min")
 
     if not predictions:
         logger.error("No predictions generated — cannot compute BERTScore.")
-        return
+        return {}
 
-    # Save raw predictions
-    raw_path = OUT_DIR / f"predictions_raw_correction_{RUN_ID}.json"
-    raw_path.write_text(
-        json.dumps(predictions, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+    raw_path = OUT_DIR / f"predictions_raw_{tag}_{RUN_ID}.json"
+    raw_path.write_text(json.dumps(predictions, indent=2, ensure_ascii=False), encoding="utf-8")
     logger.info(f"Raw predictions saved → {raw_path}")
 
     # ── Token F1 ───────────────────────────────────────────────────────────
@@ -436,14 +422,12 @@ def main():
         else:
             f1 = 0.0
         token_f1s.append(f1)
-
     mean_token_f1 = sum(token_f1s) / len(token_f1s)
     logger.info(f"Token F1 mean: {mean_token_f1:.4f}")
 
     # ── BERTScore ──────────────────────────────────────────────────────────
     logger.info("\nComputing BERTScore ...")
     from bert_score import score as bert_score
-
     P, R, F1 = bert_score(
         hypotheses, references,
         lang="en", model_type="roberta-large",
@@ -457,18 +441,23 @@ def main():
         pred["bert_f1"]  = round(f1_list[i], 4)
         pred["token_f1"] = round(token_f1s[i], 4)
 
-    # ── Save results ───────────────────────────────────────────────────────
     results = {
-        "run_id":             RUN_ID,
-        "base_model":         MODEL_ID,
-        "adapter":            str(CORRECTION_ADAPTER_DIR),
-        "adapter_note":       "SpaceLLM_v1 merged into base via merge_and_unload(); correction LoRA on top — single adapter, no stacking",
+        "run_id":          RUN_ID,
+        "tag":             tag,
+        "base_model":      MODEL_ID,
+        "adapter":         SPACELLM_V1_ADAPTER,
+        "adapter_note":    "SpaceLLM_v1 only — never modified post-deployment. "
+                            "Corrections applied via retrieval, not retraining.",
+        "rag_enabled":     use_rag,
+        "rag_config": {
+            "top_k":          top_k,
+            "min_similarity": min_similarity,
+            "repo_size":      len(repo) if use_rag else None,
+            "mean_retrieved": round(sum(retrieved_counts) / len(retrieved_counts), 3) if retrieved_counts else 0,
+        },
         "config": {
-            "device":         DEVICE,
             "max_new_tokens": MAX_NEW_TOKENS,
             "max_seq_len":    MAX_SEQ_LEN,
-            "vocab_size":     TRAINED_VOCAB_SIZE,
-            "vocab_source":   "detected_from_adapter_checkpoint",
         },
         "summary": {
             "total_records":      len(test_records),
@@ -486,11 +475,75 @@ def main():
         "per_sample":    predictions,
     }
 
-    out_path = OUT_DIR / f"bertscore_results_correction_{RUN_ID}.json"
-    out_path.write_text(
-        json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
-    logger.info(f"Full results saved → {out_path}")
+    out_path = OUT_DIR / f"bertscore_results_{tag}_{RUN_ID}.json"
+    out_path.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
+    logger.info(f"Full results saved ({tag}) → {out_path}")
+    return results
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="SpaceLLM retrieval-augmented inference + BERTScore")
+    parser.add_argument("--no-rag", action="store_true", help="Disable retrieval augmentation (baseline run).")
+    parser.add_argument("--ablation", action="store_true", help="Run both with and without RAG, report the delta.")
+    parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
+    parser.add_argument("--min-similarity", type=float, default=DEFAULT_MIN_SIMILARITY)
+    args = parser.parse_args()
+
+    logger.info("=" * 60)
+    logger.info("  SpaceLLM — Retrieval-Augmented Inference + BERTScore")
+    logger.info(f"  Run ID     : {RUN_ID}")
+    logger.info(f"  Adapter    : {SPACELLM_V1_ADAPTER}  (unmodified)")
+    logger.info(f"  Test file  : {TEST_FILE}")
+    logger.info(f"  RAG top_k={args.top_k}  min_similarity={args.min_similarity}")
+    logger.info("=" * 60)
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+    for i in range(torch.cuda.device_count()):
+        props = torch.cuda.get_device_properties(i)
+        logger.info(f"GPU {i}: {props.name}  ({props.total_memory/1024**3:.1f} GB)")
+
+    from execute import KnowledgeRepository, build_augmented_prompt
+    repo = KnowledgeRepository()
+    logger.info(f"Knowledge repository loaded — {len(repo)} stored correction(s).")
+
+    model, tokenizer = load_model_and_tokenizer()
+
+    test_records = load_test_data(TEST_FILE)
+    if MAX_SAMPLES:
+        test_records = test_records[:MAX_SAMPLES]
+
+    if args.ablation:
+        baseline = run_eval(
+            model, tokenizer, test_records, use_rag=False,
+            repo=repo, build_augmented_prompt=build_augmented_prompt,
+            top_k=args.top_k, min_similarity=args.min_similarity, tag="no_rag",
+        )
+        rag_run = run_eval(
+            model, tokenizer, test_records, use_rag=True,
+            repo=repo, build_augmented_prompt=build_augmented_prompt,
+            top_k=args.top_k, min_similarity=args.min_similarity, tag="rag",
+        )
+        if baseline and rag_run:
+            delta_bert  = rag_run["bert_score"]["f1"] - baseline["bert_score"]["f1"]
+            delta_token = rag_run["token_f1_mean"] - baseline["token_f1_mean"]
+            logger.info("=" * 60)
+            logger.info("  ABLATION RESULT")
+            logger.info(f"  BERTScore F1   no_rag={baseline['bert_score']['f1']:.4f}  "
+                        f"rag={rag_run['bert_score']['f1']:.4f}  delta={delta_bert:+.4f}")
+            logger.info(f"  Token F1       no_rag={baseline['token_f1_mean']:.4f}  "
+                        f"rag={rag_run['token_f1_mean']:.4f}  delta={delta_token:+.4f}")
+            logger.info("=" * 60)
+    else:
+        use_rag = not args.no_rag
+        tag = "rag" if use_rag else "no_rag"
+        run_eval(
+            model, tokenizer, test_records, use_rag=use_rag,
+            repo=repo, build_augmented_prompt=build_augmented_prompt,
+            top_k=args.top_k, min_similarity=args.min_similarity, tag=tag,
+        )
+
     logger.info("=" * 60)
     logger.info("  Done.")
     logger.info("=" * 60)
