@@ -1,8 +1,10 @@
 """
 SpaceLLM MAPE-K :: Executor Component  (v2 — Dataset-Expansion Continual Learning)
+WITH AUTO-TRAINING INTEGRATION
 ====================================================================================
 Responsibility: Read Planner output → execute each action → update status
-                PENDING → EXECUTED | FAILED → write execution_log.jsonl.
+                PENDING → EXECUTED | FAILED → write execution_log.jsonl
+                PLUS: Optionally trigger offline retraining via correction_fine_tuning.py
 
 Pipeline position:
     Monitor (monitor_events.jsonl)
@@ -13,87 +15,21 @@ Pipeline position:
         ↓
     Executor  ← YOU ARE HERE
         (execution_log.jsonl, updated plan_actions.jsonl,
-         combined_dataset.json  ← NEW: ready for train_spacellm_fresh.py)
+         combined_dataset.json  ← ready for correction_fine_tuning.py)
+        ↓ (if auto_train=True)
+    correction_fine_tuning.py  ← Auto-triggered after DATASET_EXPANSION
+        (trains fresh adapter, saves to output_dir)
+        ↓
+    GPT-OSS-20B + SpaceLLM_v(N+1)
 
-═══════════════════════════════════════════════════════════════════════════
-  ARCHITECTURE CHANGE — v1 → v2
-═══════════════════════════════════════════════════════════════════════════
-  ABANDONED (v1)
-  ──────────────
-  • RETRAIN_ADAPTER / RETRIEVAL_MEMORY_UPDATE stored corrections in a
-    JSON knowledge repo and injected them into prompts at inference time.
-  • Experimentally tried stacking small correction LoRA adapters on top of
-    SpaceLLM_v1, which caused generation collapse (degenerate repeated-token
-    outputs) — a classic small-batch / over-fit LoRA failure mode.
-
-  NEW (v2)
-  ────────
-  • Validated corrections are appended to the *training dataset* directly,
-    in the same messages-format used by the original SpaceLLM dataset.
-  • COMBINED_DATASET_FILE (combined_dataset.json) accumulates:
-        Original SpaceLLM Dataset
-      + Validated Feedback / MAPE-K Corrections
-      = SpaceLLM_v2 Training Dataset
-  • train_spacellm_fresh.py is then run *offline* against that file to
-    produce a brand-new LM-head LoRA adapter (SpaceLLM_v2) that *replaces*
-    SpaceLLM_v1 entirely.  No stacking. No merging.
-  • The knowledge repository is kept for lightweight inference-time RAG
-    during the window between collecting corrections and the next offline
-    retraining cycle (so corrections are usable immediately).
-
-  Lifecycle
-  ─────────
-      GPT-OSS-20B + SpaceLLM_v1
-           ↓  (MAPE-K collects corrections)
-      DATASET_EXPANSION → combined_dataset.json grows
-           ↓  (offline, periodic)
-      train_spacellm_fresh.py --train_file combined_dataset.json
-           ↓
-      GPT-OSS-20B + SpaceLLM_v2   (v1 retired)
-           ↓  ...repeat...
-      GPT-OSS-20B + SpaceLLM_v3
-
-Action handlers
-───────────────
-DATASET_EXPANSION   ← PRIMARY new action
-    Converts each {question, corrected_answer} pair from the Planner
-    payload into a fully-formed SpaceLLM training record (messages format)
-    and appends it to COMBINED_DATASET_FILE.  Also mirrors the correction
-    into the knowledge repository for immediate inference-time RAG.
-
-    Back-compat: "RETRIEVAL_MEMORY_UPDATE" and "RETRAIN_ADAPTER" are
-    aliased to the same handler so any queued actions from older Planner
-    builds still execute correctly.
-
-PROMPT_PATCH
-    Appends a dated patch block to frontend_patch.md.
-
-TOPIC_GUARDRAIL
-    Writes / merges a JSON entry into mape_k/topic_guardrail.json.
-
-FLAG_FOR_REVIEW
-    Appends structured records to mape_k/human_review_queue.jsonl.
-
-NO_ACTION
-    Marked EXECUTED immediately.
-
-Inference-time retrieval (during the window before next retraining)
-────────────────────────────────────────────────────────────────────
-    from execute import KnowledgeRepository, build_augmented_prompt
-
-    repo   = KnowledgeRepository()
-    prompt = build_augmented_prompt(user_query, repo, top_k=3)
-    # send `prompt` to GPT-OSS-20B + current SpaceLLM adapter as usual
-
-Design principles
-─────────────────
-- Atomic JSON/JSONL writes via tmp-file + rename.
-- Poison-pill guard per action — one failure can't block the rest.
-- Persisted state in .executor_state.json across scheduler cycles.
-- combined_dataset.json is the single source of truth for the next
-  retraining run; it is never truncated, only appended to.
-
-Author: SpaceLLM Project
+NEW: Auto-Training Integration
+──────────────────────────────
+Instead of running correction_fine_tuning.py manually after execute.py completes,
+set AUTO_TRAIN=True in ExecutorConfig and the executor will:
+  1. Execute all MAPE-K actions (including DATASET_EXPANSION)
+  2. If any DATASET_EXPANSION succeeded, automatically trigger retraining
+  3. Monitor subprocess and log training progress
+  4. Save training status to executor state
 """
 
 from __future__ import annotations
@@ -103,6 +39,8 @@ import json
 import logging
 import os
 import re
+import subprocess
+import sys
 import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -139,9 +77,6 @@ STATE_FILE           = MAPE_DIR / ".executor_state.json"
 FAILED_LOG           = MAPE_DIR / "executor_failed.jsonl"
 
 # ── v2: dataset expansion ─────────────────────────────────────────────────
-# combined_dataset.json is the file passed to train_spacellm_fresh.py.
-# It starts as a copy of the original SpaceLLM training data and grows
-# as corrections are validated by MAPE-K.
 COMBINED_DATASET_FILE = BASE_DIR / "combined_dataset.json"
 DATASET_BACKUP_DIR    = MAPE_DIR / "dataset_backups"
 
@@ -149,9 +84,16 @@ DATASET_BACKUP_DIR    = MAPE_DIR / "dataset_backups"
 KNOWLEDGE_REPO_FILE  = MAPE_DIR / "knowledge_repository.json"
 KNOWLEDGE_BACKUP_DIR = MAPE_DIR / "knowledge_repository_backups"
 
+# ── Training script location ──────────────────────────────────────────────
+CORRECTION_FINE_TUNING_SCRIPT = Path(
+    "/mnt/DATA/saurabh/aditya/Model_training_&_Data_Extraction/fine_tuning_v2/correction_fine_tuning.py"
+)
+TRAINING_OUTPUT_DIR = BASE_DIR / "spacellm_adapters"
+
 MAPE_DIR.mkdir(parents=True, exist_ok=True)
 KNOWLEDGE_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 DATASET_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+TRAINING_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -164,7 +106,6 @@ SPACELLM_SYSTEM_PROMPT = (
     "depth of your response to the complexity of the question."
 )
 
-# sample_id counter seed — pulled from state so it survives restarts
 _SAMPLE_ID_PREFIX = "SPC"
 
 
@@ -178,6 +119,15 @@ class ExecutorConfig:
     retrieval_top_k:            int   = 3
     retrieval_min_similarity:   float = 0.55
     dedup_similarity_threshold: float = 0.97
+    # ── NEW: Auto-training ────────────────────────────────
+    auto_train:                 bool  = True
+    """Automatically trigger correction_fine_tuning.py after DATASET_EXPANSION"""
+    auto_train_epochs:          int   = 15
+    auto_train_lr:              float = 2e-4
+    auto_train_batch_size:      int   = 1
+    auto_train_grad_accum:      int   = 32
+    auto_train_output_suffix:   str   = "_auto_trained"
+    """Suffix for auto-generated adapter dirs (e.g., spacellm_v1_auto_trained)"""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -280,26 +230,11 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Knowledge Repository  (inference-time RAG; bridging gap between retrains)
+# Knowledge Repository
 # ─────────────────────────────────────────────────────────────────────────────
 
 class KnowledgeRepository:
-    """
-    Flat JSON list of correction records used for inference-time RAG.
-    Corrections are retrievable on the very next request, before the next
-    offline retraining cycle produces a new adapter.
-
-    Schema per entry:
-        {
-          "id":             "<uuid>",
-          "question":       "...",
-          "correct_answer": "...",
-          "embedding":      [...],
-          "feedback_id":    "...",
-          "created_at":     "...",
-          "metadata":       {...}
-        }
-    """
+    """Inference-time RAG; bridging gap between retrains."""
 
     def __init__(self, path: Path = KNOWLEDGE_REPO_FILE,
                  dedup_threshold: float = 0.97) -> None:
@@ -331,8 +266,6 @@ class KnowledgeRepository:
     def add(self, question: str, correct_answer: str, *,
             feedback_id: str | None = None,
             metadata: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Upsert a correction record. Near-duplicates (cosine ≥ dedup_threshold)
-        are overwritten in place to avoid competing retrieval hits."""
         embedding = embed_text(question)
         entry = {
             "id":             str(uuid.uuid4()),
@@ -376,17 +309,7 @@ def build_augmented_prompt(
     top_k: int = 3,
     min_similarity: float = 0.55,
 ) -> str:
-    """
-    INFERENCE-TIME entry point. Call from controller.py / the FastAPI
-    request handler before sending the prompt to GPT-OSS-20B + current adapter.
-
-        repo   = KnowledgeRepository()
-        prompt = build_augmented_prompt(user_message, repo)
-        response = model.generate(prompt)
-
-    If no sufficiently similar correction exists the original query is returned
-    unchanged — normal questions are untouched.
-    """
+    """Inference-time entry point for RAG augmentation."""
     repository = repository or KnowledgeRepository()
     hits = repository.query(query, top_k=top_k, min_similarity=min_similarity)
     if not hits:
@@ -406,37 +329,16 @@ def build_augmented_prompt(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Dataset Exporter  — converts feedback corrections → training records
+# Dataset Exporter
 # ─────────────────────────────────────────────────────────────────────────────
 
 class DatasetExporter:
-    """
-    Manages COMBINED_DATASET_FILE — the unified training corpus fed to
-    train_spacellm_fresh.py.
-
-    File layout:
-        [
-          { "sample_id": "SPC_000001", "source_id": "...", ... "messages": [...] },
-          { "sample_id": "SPC_000002", ... },
-          ...
-        ]
-
-    Rules:
-    - Records are loaded once at init; appended atomically as corrections arrive.
-    - sample_id is auto-incremented using the highest existing SPC_XXXXXX counter
-      (persisted across restarts through the executor state).
-    - A correction is deduplicated against existing records by question text
-      (exact match after stripping) — if the question already exists the record
-      is *overwritten* (the corrected answer improves the old one).
-    - Backups are written to DATASET_BACKUP_DIR before every batch mutation.
-    """
+    """Manages COMBINED_DATASET_FILE — unified training corpus."""
 
     def __init__(self, path: Path = COMBINED_DATASET_FILE) -> None:
         self.path = path
         self._records: list[dict[str, Any]] = self._load()
         self._next_id: int = self._infer_next_id()
-
-    # ── I/O ──────────────────────────────────────────────────────────────
 
     def _load(self) -> list[dict[str, Any]]:
         if not self.path.exists():
@@ -468,10 +370,7 @@ class DatasetExporter:
         log.info("Dataset backed up → %s", backup_path)
         return backup_path
 
-    # ── sample_id management ──────────────────────────────────────────────
-
     def _infer_next_id(self) -> int:
-        """Find the highest existing SPC_XXXXXX counter and return next."""
         max_id = 0
         for rec in self._records:
             sid = rec.get("sample_id", "")
@@ -487,8 +386,6 @@ class DatasetExporter:
         self._next_id += 1
         return sid
 
-    # ── Conversion logic ──────────────────────────────────────────────────
-
     def _build_training_record(
         self,
         question: str,
@@ -497,28 +394,6 @@ class DatasetExporter:
         feedback_id: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """
-        Build a single training record in the SpaceLLM messages format:
-
-            {
-              "sample_id":    "SPC_000042",
-              "source_id":    "mapek_correction_<feedback_id>",
-              "mission_name": "<extracted or 'SpaceLLM MAPE-K Correction'>",
-              "organization": "<extracted or 'NASA'>",
-              "aspect":       "CORRECTION",
-              "difficulty":   "basic",
-              "chain_id":     "mapek_correction_<feedback_id>",
-              "source_url":   "",
-              "messages": [
-                { "role": "developer", "content": "<system prompt>" },
-                { "role": "user",      "content": "<question>" },
-                { "role": "assistant", "content": "<correct_answer>" }
-              ]
-            }
-
-        Fields extracted from metadata when available:
-            mission_name, organization, aspect, difficulty, source_url
-        """
         meta = metadata or {}
         fid  = feedback_id or str(uuid.uuid4())
 
@@ -547,44 +422,19 @@ class DatasetExporter:
             "chain_id":     chain_id,
             "source_url":   source_url,
             "messages": [
-                {
-                    "role":    "developer",
-                    "content": SPACELLM_SYSTEM_PROMPT,
-                },
-                {
-                    "role":    "user",
-                    "content": question,
-                },
-                {
-                    "role":    "assistant",
-                    "content": correct_answer,
-                },
+                {"role": "developer", "content": SPACELLM_SYSTEM_PROMPT},
+                {"role": "user",      "content": question},
+                {"role": "assistant", "content": correct_answer},
             ],
         }
-
-    # ── Public API ────────────────────────────────────────────────────────
 
     def append_corrections(
         self,
         examples: list[dict[str, Any]],
     ) -> tuple[list[dict[str, Any]], int]:
-        """
-        Convert and upsert a batch of correction examples.
-
-        Each example must contain:
-            question  (str)  — the user question
-            reference (str)  — the human-verified correct answer
-
-        Optional fields passed through to metadata:
-            feedback_id, mission_name, organization, aspect,
-            difficulty, source_url, bertscore
-
-        Returns (added_records, overwritten_count).
-        """
         added:       list[dict[str, Any]] = []
         overwritten: int = 0
 
-        # Build a lookup of existing questions for fast dedup
         existing_by_question: dict[str, int] = {
             _norm(self._extract_question(r)): i
             for i, r in enumerate(self._records)
@@ -611,9 +461,7 @@ class DatasetExporter:
 
             norm_q = _norm(question)
             if norm_q in existing_by_question:
-                # Overwrite the existing record (improved answer)
                 idx = existing_by_question[norm_q]
-                # Preserve original sample_id to avoid gaps
                 new_rec["sample_id"] = self._records[idx]["sample_id"]
                 self._records[idx] = new_rec
                 overwritten += 1
@@ -631,11 +479,8 @@ class DatasetExporter:
 
         return added, overwritten
 
-    # ── Helpers ───────────────────────────────────────────────────────────
-
     @staticmethod
     def _extract_question(record: dict) -> str:
-        """Pull the user-turn content from a messages record."""
         for msg in record.get("messages", []):
             if msg.get("role") == "user":
                 return (msg.get("content") or "").strip()
@@ -646,16 +491,10 @@ class DatasetExporter:
 
 
 def _norm(text: str) -> str:
-    """Normalise a question string for dedup comparison."""
     return re.sub(r"\s+", " ", text.lower().strip())
 
 
 def _extract_mission_hint(question: str) -> str | None:
-    """
-    Try to extract a mission name hint from the question text.
-    Looks for patterns like "the X mission" or "mission X".
-    Falls back to None if nothing is found.
-    """
     patterns = [
         r"(?:the\s+)?([A-Z][A-Za-z0-9 \-]+?)\s+[Mm]ission",
         r"[Mm]ission\s+([A-Z][A-Za-z0-9 \-]+)",
@@ -671,6 +510,124 @@ def _extract_mission_hint(question: str) -> str | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Auto-Training Trigger
+# ─────────────────────────────────────────────────────────────────────────────
+
+def trigger_auto_training(config: ExecutorConfig) -> dict[str, Any]:
+    """
+    Automatically trigger correction_fine_tuning.py after successful DATASET_EXPANSION.
+    
+    Returns training status dict with keys:
+        - triggered: bool (whether training was started)
+        - status: str ("success" | "failed" | "skipped")
+        - reason: str (explanation)
+        - training_output_dir: str | None
+        - training_log: str | None
+        - training_return_code: int | None
+    """
+    if not config.auto_train:
+        return {
+            "triggered": False,
+            "status": "skipped",
+            "reason": "auto_train=False in ExecutorConfig",
+        }
+
+    if not CORRECTION_FINE_TUNING_SCRIPT.exists():
+        return {
+            "triggered": False,
+            "status": "failed",
+            "reason": f"correction_fine_tuning.py not found: {CORRECTION_FINE_TUNING_SCRIPT}",
+        }
+
+    if not COMBINED_DATASET_FILE.exists():
+        return {
+            "triggered": False,
+            "status": "failed",
+            "reason": f"combined_dataset.json not found: {COMBINED_DATASET_FILE}",
+        }
+
+    # Generate unique output dir with timestamp
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    output_dir = TRAINING_OUTPUT_DIR / f"spacellm_adapter_{ts}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    log.info("=" * 70)
+    log.info("  AUTO-TRAINING: Triggering correction_fine_tuning.py")
+    log.info("=" * 70)
+    log.info("  Train file      : %s", COMBINED_DATASET_FILE)
+    log.info("  Output dir      : %s", output_dir)
+    log.info("  Epochs          : %d", config.auto_train_epochs)
+    log.info("  Learning rate   : %g", config.auto_train_lr)
+    log.info("  Batch size      : %d", config.auto_train_batch_size)
+    log.info("  Grad accum      : %d", config.auto_train_grad_accum)
+    log.info("=" * 70)
+
+    cmd = [
+        sys.executable,
+        str(CORRECTION_FINE_TUNING_SCRIPT),
+        "--train_file", str(COMBINED_DATASET_FILE),
+        "--output_dir", str(output_dir),
+        "--epochs", str(config.auto_train_epochs),
+        "--lr", str(config.auto_train_lr),
+        "--batch_size", str(config.auto_train_batch_size),
+        "--grad_accum", str(config.auto_train_grad_accum),
+    ]
+
+    # Add HF token if set
+    if os.environ.get("HF_TOKEN"):
+        cmd.extend(["--hf_token", os.environ["HF_TOKEN"]])
+
+    training_log_file = MAPE_DIR / f"auto_training_{ts}.log"
+
+    try:
+        with training_log_file.open("w", encoding="utf-8") as logfh:
+            result = subprocess.run(
+                cmd,
+                stdout=logfh,
+                stderr=subprocess.STDOUT,
+                timeout=None,  # No timeout — training can take hours
+                text=True,
+            )
+
+        if result.returncode == 0:
+            log.info("✓ Auto-training completed successfully")
+            log.info("  Adapter saved to: %s", output_dir)
+            log.info("  Training log: %s", training_log_file)
+            return {
+                "triggered": True,
+                "status": "success",
+                "training_output_dir": str(output_dir),
+                "training_log": str(training_log_file),
+                "training_return_code": result.returncode,
+            }
+        else:
+            log.error("✗ Auto-training failed with return code %d", result.returncode)
+            log.error("  Check log: %s", training_log_file)
+            return {
+                "triggered": True,
+                "status": "failed",
+                "reason": f"Training subprocess returned {result.returncode}",
+                "training_log": str(training_log_file),
+                "training_return_code": result.returncode,
+            }
+
+    except subprocess.TimeoutExpired:
+        return {
+            "triggered": True,
+            "status": "failed",
+            "reason": "Training subprocess timed out",
+            "training_log": str(training_log_file),
+        }
+    except Exception as exc:
+        log.error("✗ Failed to trigger auto-training: %s", exc, exc_info=True)
+        return {
+            "triggered": True,
+            "status": "failed",
+            "reason": str(exc),
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Executor
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -683,14 +640,17 @@ class Executor:
             dedup_threshold=self.config.dedup_similarity_threshold
         )
         self._export = DatasetExporter()
+        self._dataset_expansion_executed = False
         log.info(
             "Executor initialised. "
             "executed_action_ids=%d  "
             "knowledge_repo_entries=%d  "
-            "combined_dataset_size=%d",
+            "combined_dataset_size=%d  "
+            "auto_train=%s",
             len(self._state.get("executed_ids", [])),
             len(self._repo),
             len(self._export),
+            self.config.auto_train,
         )
 
     # ── Public entry point ────────────────────────────────────────────────
@@ -702,6 +662,8 @@ class Executor:
           2. Sort by priority descending (CRITICAL first).
           3. Execute each in isolation — one failure can't poison the batch.
           4. Persist records, update statuses, save state.
+          5. (NEW) If any DATASET_EXPANSION succeeded and auto_train=True,
+             trigger correction_fine_tuning.py.
         """
         log.info("=" * 60)
         log.info("Executor cycle starting.")
@@ -746,6 +708,10 @@ class Executor:
                 )
                 updated_ids[action_id] = "EXECUTED"
                 log.info("  ✓ EXECUTED in %.3fs", duration_s)
+                
+                # Track if DATASET_EXPANSION succeeded
+                if action_type == "DATASET_EXPANSION":
+                    self._dataset_expansion_executed = True
 
             except Exception as exc:
                 finished_at = datetime.now(timezone.utc).isoformat()
@@ -775,14 +741,22 @@ class Executor:
 
         self._update_action_statuses(updated_ids)
 
-        # Persist next_sample_id so it survives restarts
         self._state["dataset_next_sample_id"] = self._export._next_id
         self._save_state()
 
         executed = sum(1 for r in records if r.status == "EXECUTED")
         failed   = sum(1 for r in records if r.status == "FAILED")
         log.info("Cycle complete. %d EXECUTED, %d FAILED.", executed, failed)
+
+        # ── NEW: Trigger auto-training if DATASET_EXPANSION succeeded ──
+        training_status = {}
+        if self._dataset_expansion_executed and self.config.auto_train:
+            training_status = trigger_auto_training(self.config)
+            self._state["last_auto_training"] = training_status
+            self._save_state()
+
         log.info("=" * 60)
+        
         return records
 
     # ── Dispatcher ────────────────────────────────────────────────────────
@@ -791,12 +765,9 @@ class Executor:
         action_type = action.get("action_type")
         payload     = action.get("payload", {})
         handler = {
-            # v2 primary action
             "DATASET_EXPANSION":       self._execute_dataset_expansion,
-            # back-compat aliases from v1 Planner builds
             "RETRIEVAL_MEMORY_UPDATE": self._execute_dataset_expansion,
             "RETRAIN_ADAPTER":         self._execute_dataset_expansion,
-            # unchanged handlers
             "PROMPT_PATCH":            self._execute_prompt_patch,
             "TOPIC_GUARDRAIL":         self._execute_topic_guardrail,
             "FLAG_FOR_REVIEW":         self._execute_flag_for_review,
@@ -811,16 +782,6 @@ class Executor:
     def _execute_dataset_expansion(
         self, payload: dict, action: dict
     ) -> dict[str, Any]:
-        """
-        PRIMARY v2 HANDLER.
-
-        Two jobs in one pass:
-        1. Convert each {question, reference} pair into a SpaceLLM training
-           record and append / overwrite it in combined_dataset.json.
-           → consumed by: train_spacellm_fresh.py on the next offline cycle
-        2. Mirror the same correction into the KnowledgeRepository for
-           immediate inference-time RAG (no waiting for next retraining cycle).
-        """
         examples = payload.get("training_examples", [])
         if not examples:
             raise ValueError(
@@ -829,7 +790,6 @@ class Executor:
                 "{question, reference[, feedback_id, mission_name, ...]} dicts."
             )
 
-        # ── 1. Dataset expansion ─────────────────────────────────────────
         backup_path = self._export.backup()
         added_records, overwritten = self._export.append_corrections(examples)
 
@@ -843,7 +803,6 @@ class Executor:
             overwritten, len(self._export),
         )
 
-        # ── 2. Knowledge repo mirror (inference-time RAG) ─────────────────
         repo_backup = self._repo._backup()
         repo_added: list[str] = []
         valid_feedback_ids: list[str] = []
@@ -877,30 +836,28 @@ class Executor:
         }
 
         return {
-            # Dataset
             "combined_dataset_file":    str(COMBINED_DATASET_FILE),
             "dataset_backup_path":      str(backup_path),
             "records_written":          len(added_records),
             "records_overwritten":      overwritten,
             "dataset_size_after":       len(self._export),
             "added_sample_ids":         [r["sample_id"] for r in added_records],
-            # Knowledge repo (RAG mirror)
             "knowledge_repo_file":      str(KNOWLEDGE_REPO_FILE),
             "knowledge_backup_path":    str(repo_backup),
             "repo_entries_after":       len(self._repo),
-            # Feedback bookkeeping
             "marked_in_feedback":       marked,
             "embedding_backend":        _EMBEDDER_BACKEND or "uninitialised",
-            # Retraining hint
-            "next_step":  (
-                f"Run: python train_spacellm_fresh.py "
-                f"--train_file {COMBINED_DATASET_FILE} "
-                f"--output_dir ./spacellm_v_next_adapter"
+            "next_step": (
+                f"(Auto-training will be triggered automatically "
+                f"if auto_train=True in ExecutorConfig)"
+                if self.config.auto_train
+                else f"Run: python {CORRECTION_FINE_TUNING_SCRIPT} "
+                     f"--train_file {COMBINED_DATASET_FILE} "
+                     f"--output_dir ./spacellm_v_next_adapter"
             ),
         }
 
     def _mark_used_in_training(self, feedback_ids: set[str]) -> int:
-        """Atomically rewrite feedback_log.jsonl flipping used_in_training=True."""
         if not FEEDBACK_LOG.exists() or not feedback_ids:
             return 0
         updated:   int         = 0
@@ -926,17 +883,6 @@ class Executor:
     # ── Handler: PROMPT_PATCH ─────────────────────────────────────────────
 
     def _execute_prompt_patch(self, payload: dict, action: dict) -> dict[str, Any]:
-        """
-        Append a versioned patch block to frontend_patch.md.
-
-        Block format:
-            <!-- PATCH_START patch_key=<key> applied_at=<iso> -->
-            <patch_text>
-            <!-- PATCH_END patch_key=<key> -->
-
-        controller.py's get_system_prompt() parses these blocks and layers
-        them over the base system prompt. Last block per key wins (dedup).
-        """
         patch_key  = payload.get("patch_key", "unknown_patch")
         patch_text = payload.get("patch_text", "").strip()
         target     = payload.get("target", "system_prompt")
@@ -971,10 +917,6 @@ class Executor:
     # ── Handler: TOPIC_GUARDRAIL ──────────────────────────────────────────
 
     def _execute_topic_guardrail(self, payload: dict, action: dict) -> dict[str, Any]:
-        """
-        Merge guardrail directive into mape_k/topic_guardrail.json.
-        FastAPI core reads this on startup to adjust the system prompt.
-        """
         topics           = payload.get("topics_reported", [])
         suggested_action = payload.get("suggested_action", "")
         topic_specific   = payload.get("topic_specific", False)
@@ -1013,15 +955,6 @@ class Executor:
     # ── Handler: FLAG_FOR_REVIEW ──────────────────────────────────────────
 
     def _execute_flag_for_review(self, payload: dict, action: dict) -> dict[str, Any]:
-        """
-        Append flagged items to human_review_queue.jsonl.
-
-        Two payload shapes (both emitted by plan.py):
-          Shape A — repeated failures:
-            { "flagged_questions": [{question_key, negative_count, feedback_id}, ...] }
-          Shape B — retrain cooldown:
-            { "reason": "retrain_cooldown_active", "elapsed_hours": float }
-        """
         now      = datetime.now(timezone.utc).isoformat()
         appended = 0
 
@@ -1156,11 +1089,6 @@ class Executor:
         if STATE_FILE.exists():
             try:
                 state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-                # Restore next_sample_id counter if previously saved
-                if "dataset_next_sample_id" in state:
-                    # DatasetExporter will infer from file, but this is a
-                    # fast-path override set after first run
-                    pass
                 return state
             except Exception as exc:
                 log.warning("Could not load executor state (%s). Starting fresh.", exc)
@@ -1191,7 +1119,11 @@ class Executor:
 if __name__ == "__main__":
     import sys
 
-    executor = Executor()
+    # Can disable auto-training via env var
+    auto_train = os.environ.get("SPACELLM_AUTO_TRAIN", "true").lower() in ("true", "1", "yes")
+    
+    config = ExecutorConfig(auto_train=auto_train)
+    executor = Executor(config)
     records  = executor.run()
 
     print(f"\n{'='*60}")
@@ -1214,12 +1146,14 @@ if __name__ == "__main__":
         print(f"\n  Execution log      → {EXECUTION_LOG}")
         print(f"  Knowledge repo     → {KNOWLEDGE_REPO_FILE}")
         print(f"  Combined dataset   → {COMBINED_DATASET_FILE}")
-        if executed:
-            print(
-                f"\n  To retrain with expanded dataset:\n"
-                f"    python train_spacellm_fresh.py \\\n"
-                f"      --train_file {COMBINED_DATASET_FILE} \\\n"
-                f"      --output_dir ./spacellm_v_next_adapter"
-            )
+        if config.auto_train:
+            print(f"\n  ⚡ AUTO-TRAINING enabled")
+            print(f"     Training script: {CORRECTION_FINE_TUNING_SCRIPT}")
+            print(f"     Output dir:     {TRAINING_OUTPUT_DIR}")
+            last_training = executor._state.get("last_auto_training", {})
+            if last_training:
+                print(f"     Status:         {last_training.get('status')}")
+                if last_training.get("training_log"):
+                    print(f"     Log file:       {last_training.get('training_log')}")
     print(f"{'='*60}\n")
     sys.exit(0 if not any(r.status == "FAILED" for r in records) else 1)
