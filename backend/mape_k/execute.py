@@ -1,35 +1,12 @@
 """
-SpaceLLM MAPE-K :: Executor Component  (v2 — Dataset-Expansion Continual Learning)
-WITH AUTO-TRAINING INTEGRATION
-====================================================================================
-Responsibility: Read Planner output → execute each action → update status
-                PENDING → EXECUTED | FAILED → write execution_log.jsonl
-                PLUS: Optionally trigger offline retraining via correction_fine_tuning.py
-
-Pipeline position:
-    Monitor (monitor_events.jsonl)
-        ↓
-    Analyser (analysis_report.json)
-        ↓
-    Planner (plan_actions.jsonl)
-        ↓
-    Executor  ← YOU ARE HERE
-        (execution_log.jsonl, updated plan_actions.jsonl,
-         combined_dataset.json  ← ready for correction_fine_tuning.py)
-        ↓ (if auto_train=True)
-    correction_fine_tuning.py  ← Auto-triggered after DATASET_EXPANSION
-        (trains fresh adapter, saves to output_dir)
-        ↓
-    GPT-OSS-20B + SpaceLLM_v(N+1)
-
-NEW: Auto-Training Integration
-──────────────────────────────
-Instead of running correction_fine_tuning.py manually after execute.py completes,
-set AUTO_TRAIN=True in ExecutorConfig and the executor will:
-  1. Execute all MAPE-K actions (including DATASET_EXPANSION)
-  2. If any DATASET_EXPANSION succeeded, automatically trigger retraining
-  3. Monitor subprocess and log training progress
-  4. Save training status to executor state
+SpaceLLM MAPE-K :: Executor Component  (v3 — Dataset-Expansion + Merge + Auto-Training)
+==========================================================================================
+Changes from v2:
+  1. DatasetExporter now MERGES core train.json (DatasetA_core_QA_v2/train.json) into
+     combined_dataset.json on first write, so correction fine-tuning always trains on
+     the full corpus, not just the small set of MAPE-K corrections.
+  2. CORRECTION_FINE_TUNING_SCRIPT path corrected to train_spacellm_fresh.py.
+  3. Auto-training CLI flags aligned with train_spacellm_fresh.py's argparse spec.
 """
 
 from __future__ import annotations
@@ -76,17 +53,29 @@ REVIEW_STATS_FILE    = MAPE_DIR / "review_stats.json"
 STATE_FILE           = MAPE_DIR / ".executor_state.json"
 FAILED_LOG           = MAPE_DIR / "executor_failed.jsonl"
 
-# ── v2: dataset expansion ─────────────────────────────────────────────────
+# ── v2/v3: dataset expansion ──────────────────────────────────────────────
 COMBINED_DATASET_FILE = BASE_DIR / "combined_dataset.json"
 DATASET_BACKUP_DIR    = MAPE_DIR / "dataset_backups"
 
-# ── Knowledge repository (still used for inference-time RAG) ──────────────
+# ── FIX 1: Core training dataset to merge into combined_dataset.json ──────
+# This is the original SpaceLLM training corpus. Every time execute.py
+# expands the dataset, corrections are merged ON TOP of this base corpus so
+# that fine-tuning always sees the full dataset, not just the small correction
+# batch.
+CORE_TRAIN_FILE = Path(
+    "/mnt/DATA/saurabh/aditya/SpaceLLM/Model_training_&_Data_Extraction"
+    "/data_processing/DatasetA_core_QA_v2/train.json"
+)
+
+# ── Knowledge repository (inference-time RAG) ─────────────────────────────
 KNOWLEDGE_REPO_FILE  = MAPE_DIR / "knowledge_repository.json"
 KNOWLEDGE_BACKUP_DIR = MAPE_DIR / "knowledge_repository_backups"
 
-# ── Training script location ──────────────────────────────────────────────
+# ── FIX 2: Correct training script filename ───────────────────────────────
+# The script is train_spacellm_fresh.py, NOT correction_fine_tuning.py.
 CORRECTION_FINE_TUNING_SCRIPT = Path(
-    "/mnt/DATA/saurabh/aditya/Model_training_&_Data_Extraction/fine_tuning_v2/correction_fine_tuning.py"
+    "/mnt/DATA/saurabh/aditya/SpaceLLM/Model_training_&_Data_Extraction"
+    "/fine_tuning_v2/train_spacellm_fresh.py"
 )
 TRAINING_OUTPUT_DIR = BASE_DIR / "spacellm_adapters"
 
@@ -119,15 +108,16 @@ class ExecutorConfig:
     retrieval_top_k:            int   = 3
     retrieval_min_similarity:   float = 0.55
     dedup_similarity_threshold: float = 0.97
-    # ── NEW: Auto-training ────────────────────────────────
+    # ── Auto-training ─────────────────────────────────────────────────────
     auto_train:                 bool  = True
-    """Automatically trigger correction_fine_tuning.py after DATASET_EXPANSION"""
+    """Automatically trigger train_spacellm_fresh.py after DATASET_EXPANSION"""
     auto_train_epochs:          int   = 15
     auto_train_lr:              float = 2e-4
     auto_train_batch_size:      int   = 1
     auto_train_grad_accum:      int   = 32
-    auto_train_output_suffix:   str   = "_auto_trained"
-    """Suffix for auto-generated adapter dirs (e.g., spacellm_v1_auto_trained)"""
+    auto_train_lora_r:          int   = 32
+    auto_train_lora_alpha:      int   = 128
+    auto_train_max_seq_len:     int   = 2048
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -234,7 +224,7 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class KnowledgeRepository:
-    """Inference-time RAG; bridging gap between retrains."""
+    """Inference-time RAG; bridges gap between retrains."""
 
     def __init__(self, path: Path = KNOWLEDGE_REPO_FILE,
                  dedup_threshold: float = 0.97) -> None:
@@ -329,34 +319,116 @@ def build_augmented_prompt(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Dataset Exporter
+# Core Dataset Loader  [FIX 1 — NEW]
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_core_train_records() -> list[dict[str, Any]]:
+    """
+    Load DatasetA_core_QA_v2/train.json.
+
+    The file is expected to be a JSON list of records that already use the
+    combined_dataset schema (i.e. each record has a "messages" list with
+    developer/user/assistant turns).  Records that don't match the schema are
+    skipped with a warning so a corrupt core file never blocks a MAPE-K cycle.
+    """
+    if not CORE_TRAIN_FILE.exists():
+        log.warning(
+            "Core train file not found: %s — combined_dataset will contain "
+            "only MAPE-K corrections this cycle.", CORE_TRAIN_FILE
+        )
+        return []
+
+    try:
+        raw = json.loads(CORE_TRAIN_FILE.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log.error("Failed to parse core train file %s: %s", CORE_TRAIN_FILE, exc)
+        return []
+
+    if not isinstance(raw, list):
+        log.error(
+            "Core train file %s is not a JSON list (got %s) — skipping.",
+            CORE_TRAIN_FILE, type(raw).__name__
+        )
+        return []
+
+    valid, skipped = [], 0
+    for rec in raw:
+        msgs = rec.get("messages", [])
+        has_user = any(m.get("role") in ("user",) for m in msgs)
+        has_asst = any(
+            m.get("role") == "assistant" and (m.get("content") or "").strip()
+            for m in msgs
+        )
+        if not (has_user and has_asst):
+            skipped += 1
+            continue
+        valid.append(rec)
+
+    if skipped:
+        log.warning(
+            "Core train file: skipped %d / %d records (missing user or assistant turn).",
+            skipped, len(raw)
+        )
+    log.info(
+        "Loaded %d core training records from %s.", len(valid), CORE_TRAIN_FILE
+    )
+    return valid
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dataset Exporter  [FIX 1 — UPDATED to merge core + corrections]
 # ─────────────────────────────────────────────────────────────────────────────
 
 class DatasetExporter:
-    """Manages COMBINED_DATASET_FILE — unified training corpus."""
+    """
+    Manages COMBINED_DATASET_FILE — unified training corpus.
+
+    On first use (or whenever combined_dataset.json is absent / empty) this
+    class loads the core train.json and seeds combined_dataset.json with it.
+    Subsequent DATASET_EXPANSION calls then append/overwrite only the
+    correction records ON TOP of the already-present core records, so the
+    fine-tuning script always receives the full corpus.
+    """
 
     def __init__(self, path: Path = COMBINED_DATASET_FILE) -> None:
         self.path = path
-        self._records: list[dict[str, Any]] = self._load()
+        self._records: list[dict[str, Any]] = self._load_or_seed()
         self._next_id: int = self._infer_next_id()
 
-    def _load(self) -> list[dict[str, Any]]:
-        if not self.path.exists():
+    def _load_or_seed(self) -> list[dict[str, Any]]:
+        """
+        Load combined_dataset.json if it exists and is non-empty.
+        Otherwise seed it with the core train.json records.
+        """
+        if self.path.exists():
+            try:
+                data = json.loads(self.path.read_text(encoding="utf-8"))
+                if isinstance(data, list) and data:
+                    log.info(
+                        "Loaded %d existing records from %s.", len(data), self.path
+                    )
+                    return data
+                log.info(
+                    "combined_dataset.json exists but is empty — seeding from core train file."
+                )
+            except Exception as exc:
+                log.warning(
+                    "Could not parse %s (%s) — re-seeding from core train file.", self.path, exc
+                )
+        else:
             log.info(
-                "combined_dataset.json not found at %s — will be created on first write.",
-                self.path,
+                "combined_dataset.json not found at %s — seeding from core train file.", self.path
             )
-            return []
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-            if not isinstance(data, list):
-                log.warning("combined_dataset.json is not a list — treating as empty.")
-                return []
-            log.info("Loaded %d existing training records from %s.", len(data), self.path)
-            return data
-        except Exception as exc:
-            log.warning("Could not parse %s (%s) — treating as empty.", self.path, exc)
-            return []
+
+        # Seed from core dataset
+        core_records = _load_core_train_records()
+        if core_records:
+            _atomic_write_json(self.path, core_records)
+            log.info(
+                "Seeded combined_dataset.json with %d core records from %s.",
+                len(core_records), CORE_TRAIN_FILE
+            )
+        return core_records
 
     def _save(self) -> None:
         _atomic_write_json(self.path, self._records)
@@ -432,6 +504,13 @@ class DatasetExporter:
         self,
         examples: list[dict[str, Any]],
     ) -> tuple[list[dict[str, Any]], int]:
+        """
+        Merge correction examples into self._records.
+
+        Matching is done by normalised question text.  If a question already
+        exists (either from a prior correction or from the core corpus) the
+        record is overwritten in-place so the corrected answer takes priority.
+        """
         added:       list[dict[str, Any]] = []
         overwritten: int = 0
 
@@ -462,11 +541,12 @@ class DatasetExporter:
             norm_q = _norm(question)
             if norm_q in existing_by_question:
                 idx = existing_by_question[norm_q]
+                # Preserve the original sample_id so training history is stable
                 new_rec["sample_id"] = self._records[idx]["sample_id"]
                 self._records[idx] = new_rec
                 overwritten += 1
                 log.info(
-                    "  Overwrote existing training record for question: %.80s…", question
+                    "  Overwrote existing record for question: %.80s…", question
                 )
             else:
                 self._records.append(new_rec)
@@ -510,20 +590,20 @@ def _extract_mission_hint(question: str) -> str | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Auto-Training Trigger
+# Auto-Training Trigger  [FIX 2 — CLI flags aligned with train_spacellm_fresh.py]
 # ─────────────────────────────────────────────────────────────────────────────
 
 def trigger_auto_training(config: ExecutorConfig) -> dict[str, Any]:
     """
-    Automatically trigger correction_fine_tuning.py after successful DATASET_EXPANSION.
-    
-    Returns training status dict with keys:
-        - triggered: bool (whether training was started)
-        - status: str ("success" | "failed" | "skipped")
-        - reason: str (explanation)
-        - training_output_dir: str | None
-        - training_log: str | None
-        - training_return_code: int | None
+    Trigger train_spacellm_fresh.py after a successful DATASET_EXPANSION.
+
+    All CLI flags are taken from train_spacellm_fresh.py's argparse spec:
+        --train_file, --output_dir, --epochs, --lr, --batch_size,
+        --grad_accum, --lora_r, --lora_alpha, --max_seq_len, --hf_token
+
+    Returns a status dict with keys:
+        triggered, status, reason, training_output_dir, training_log,
+        training_return_code
     """
     if not config.auto_train:
         return {
@@ -536,7 +616,10 @@ def trigger_auto_training(config: ExecutorConfig) -> dict[str, Any]:
         return {
             "triggered": False,
             "status": "failed",
-            "reason": f"correction_fine_tuning.py not found: {CORRECTION_FINE_TUNING_SCRIPT}",
+            "reason": (
+                f"Training script not found: {CORRECTION_FINE_TUNING_SCRIPT}\n"
+                f"Expected: train_spacellm_fresh.py"
+            ),
         }
 
     if not COMBINED_DATASET_FILE.exists():
@@ -546,38 +629,63 @@ def trigger_auto_training(config: ExecutorConfig) -> dict[str, Any]:
             "reason": f"combined_dataset.json not found: {COMBINED_DATASET_FILE}",
         }
 
-    # Generate unique output dir with timestamp
+    # Verify the combined dataset has actual content
+    try:
+        ds = json.loads(COMBINED_DATASET_FILE.read_text(encoding="utf-8"))
+        if not isinstance(ds, list) or len(ds) == 0:
+            return {
+                "triggered": False,
+                "status": "failed",
+                "reason": "combined_dataset.json is empty — nothing to train on.",
+            }
+        log.info("  Training dataset: %d records in %s", len(ds), COMBINED_DATASET_FILE)
+    except Exception as exc:
+        return {
+            "triggered": False,
+            "status": "failed",
+            "reason": f"Could not read combined_dataset.json: {exc}",
+        }
+
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     output_dir = TRAINING_OUTPUT_DIR / f"spacellm_adapter_{ts}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     log.info("=" * 70)
-    log.info("  AUTO-TRAINING: Triggering correction_fine_tuning.py")
+    log.info("  AUTO-TRAINING: Triggering %s", CORRECTION_FINE_TUNING_SCRIPT.name)
     log.info("=" * 70)
-    log.info("  Train file      : %s", COMBINED_DATASET_FILE)
-    log.info("  Output dir      : %s", output_dir)
-    log.info("  Epochs          : %d", config.auto_train_epochs)
-    log.info("  Learning rate   : %g", config.auto_train_lr)
-    log.info("  Batch size      : %d", config.auto_train_batch_size)
-    log.info("  Grad accum      : %d", config.auto_train_grad_accum)
+    log.info("  Train file    : %s", COMBINED_DATASET_FILE)
+    log.info("  Output dir    : %s", output_dir)
+    log.info("  Epochs        : %d", config.auto_train_epochs)
+    log.info("  Learning rate : %g", config.auto_train_lr)
+    log.info("  Batch size    : %d", config.auto_train_batch_size)
+    log.info("  Grad accum    : %d", config.auto_train_grad_accum)
+    log.info("  LoRA r        : %d", config.auto_train_lora_r)
+    log.info("  LoRA alpha    : %d", config.auto_train_lora_alpha)
+    log.info("  Max seq len   : %d", config.auto_train_max_seq_len)
     log.info("=" * 70)
 
+    # FIX 2: CLI flags match train_spacellm_fresh.py's argparse exactly
     cmd = [
         sys.executable,
         str(CORRECTION_FINE_TUNING_SCRIPT),
-        "--train_file", str(COMBINED_DATASET_FILE),
-        "--output_dir", str(output_dir),
-        "--epochs", str(config.auto_train_epochs),
-        "--lr", str(config.auto_train_lr),
-        "--batch_size", str(config.auto_train_batch_size),
-        "--grad_accum", str(config.auto_train_grad_accum),
+        "--train_file",  str(COMBINED_DATASET_FILE),
+        "--output_dir",  str(output_dir),
+        "--epochs",      str(config.auto_train_epochs),
+        "--lr",          str(config.auto_train_lr),
+        "--batch_size",  str(config.auto_train_batch_size),
+        "--grad_accum",  str(config.auto_train_grad_accum),
+        "--lora_r",      str(config.auto_train_lora_r),
+        "--lora_alpha",  str(config.auto_train_lora_alpha),
+        "--max_seq_len", str(config.auto_train_max_seq_len),
     ]
 
-    # Add HF token if set
-    if os.environ.get("HF_TOKEN"):
-        cmd.extend(["--hf_token", os.environ["HF_TOKEN"]])
+    # Pass HF token via CLI (train_spacellm_fresh.py reads --hf_token)
+    hf_token = os.environ.get("HF_TOKEN")
+    if hf_token:
+        cmd.extend(["--hf_token", hf_token])
 
     training_log_file = MAPE_DIR / f"auto_training_{ts}.log"
+    log.info("  Training log  : %s", training_log_file)
 
     try:
         with training_log_file.open("w", encoding="utf-8") as logfh:
@@ -585,45 +693,44 @@ def trigger_auto_training(config: ExecutorConfig) -> dict[str, Any]:
                 cmd,
                 stdout=logfh,
                 stderr=subprocess.STDOUT,
-                timeout=None,  # No timeout — training can take hours
+                timeout=None,   # training can take hours
                 text=True,
             )
 
         if result.returncode == 0:
             log.info("✓ Auto-training completed successfully")
             log.info("  Adapter saved to: %s", output_dir)
-            log.info("  Training log: %s", training_log_file)
             return {
-                "triggered": True,
-                "status": "success",
-                "training_output_dir": str(output_dir),
-                "training_log": str(training_log_file),
+                "triggered":            True,
+                "status":               "success",
+                "training_output_dir":  str(output_dir),
+                "training_log":         str(training_log_file),
                 "training_return_code": result.returncode,
             }
         else:
-            log.error("✗ Auto-training failed with return code %d", result.returncode)
+            log.error("✗ Auto-training failed (return code %d)", result.returncode)
             log.error("  Check log: %s", training_log_file)
             return {
-                "triggered": True,
-                "status": "failed",
-                "reason": f"Training subprocess returned {result.returncode}",
-                "training_log": str(training_log_file),
+                "triggered":            True,
+                "status":               "failed",
+                "reason":               f"Training subprocess returned {result.returncode}",
+                "training_log":         str(training_log_file),
                 "training_return_code": result.returncode,
             }
 
     except subprocess.TimeoutExpired:
         return {
-            "triggered": True,
-            "status": "failed",
-            "reason": "Training subprocess timed out",
+            "triggered":    True,
+            "status":       "failed",
+            "reason":       "Training subprocess timed out",
             "training_log": str(training_log_file),
         }
     except Exception as exc:
-        log.error("✗ Failed to trigger auto-training: %s", exc, exc_info=True)
+        log.error("✗ Failed to launch auto-training: %s", exc, exc_info=True)
         return {
             "triggered": True,
-            "status": "failed",
-            "reason": str(exc),
+            "status":    "failed",
+            "reason":    str(exc),
         }
 
 
@@ -660,10 +767,10 @@ class Executor:
         Full execution cycle:
           1. Load PENDING / auto_approved actions from plan_actions.jsonl.
           2. Sort by priority descending (CRITICAL first).
-          3. Execute each in isolation — one failure can't poison the batch.
+          3. Execute each in isolation — one failure cannot poison the batch.
           4. Persist records, update statuses, save state.
-          5. (NEW) If any DATASET_EXPANSION succeeded and auto_train=True,
-             trigger correction_fine_tuning.py.
+          5. If any DATASET_EXPANSION succeeded and auto_train=True,
+             trigger train_spacellm_fresh.py on the merged combined_dataset.
         """
         log.info("=" * 60)
         log.info("Executor cycle starting.")
@@ -708,9 +815,8 @@ class Executor:
                 )
                 updated_ids[action_id] = "EXECUTED"
                 log.info("  ✓ EXECUTED in %.3fs", duration_s)
-                
-                # Track if DATASET_EXPANSION succeeded
-                if action_type == "DATASET_EXPANSION":
+
+                if action_type in ("DATASET_EXPANSION", "RETRIEVAL_MEMORY_UPDATE", "RETRAIN_ADAPTER"):
                     self._dataset_expansion_executed = True
 
             except Exception as exc:
@@ -748,15 +854,14 @@ class Executor:
         failed   = sum(1 for r in records if r.status == "FAILED")
         log.info("Cycle complete. %d EXECUTED, %d FAILED.", executed, failed)
 
-        # ── NEW: Trigger auto-training if DATASET_EXPANSION succeeded ──
-        training_status = {}
+        # Trigger auto-training if any dataset expansion succeeded
+        training_status: dict[str, Any] = {}
         if self._dataset_expansion_executed and self.config.auto_train:
             training_status = trigger_auto_training(self.config)
             self._state["last_auto_training"] = training_status
             self._save_state()
 
         log.info("=" * 60)
-        
         return records
 
     # ── Dispatcher ────────────────────────────────────────────────────────
@@ -797,10 +902,12 @@ class Executor:
             raise ValueError("All training examples were invalid — nothing written to dataset.")
 
         log.info(
-            "Dataset expansion: %d record(s) written (%d new, %d overwritten). "
-            "combined_dataset.json now has %d records.",
-            len(added_records), len(added_records) - overwritten,
-            overwritten, len(self._export),
+            "Dataset expansion: %d record(s) written (%d new, %d overwrote existing). "
+            "combined_dataset.json now has %d records total (core + corrections).",
+            len(added_records),
+            len(added_records) - overwritten,
+            overwritten,
+            len(self._export),
         )
 
         repo_backup = self._repo._backup()
@@ -838,6 +945,7 @@ class Executor:
         return {
             "combined_dataset_file":    str(COMBINED_DATASET_FILE),
             "dataset_backup_path":      str(backup_path),
+            "core_train_file":          str(CORE_TRAIN_FILE),
             "records_written":          len(added_records),
             "records_overwritten":      overwritten,
             "dataset_size_after":       len(self._export),
@@ -848,8 +956,8 @@ class Executor:
             "marked_in_feedback":       marked,
             "embedding_backend":        _EMBEDDER_BACKEND or "uninitialised",
             "next_step": (
-                f"(Auto-training will be triggered automatically "
-                f"if auto_train=True in ExecutorConfig)"
+                "(Auto-training will be triggered automatically — "
+                f"trains on full merged corpus of {len(self._export)} records)"
                 if self.config.auto_train
                 else f"Run: python {CORRECTION_FINE_TUNING_SCRIPT} "
                      f"--train_file {COMBINED_DATASET_FILE} "
@@ -1117,17 +1225,15 @@ class Executor:
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import sys
-
-    # Can disable auto-training via env var
+    # Can disable auto-training via env var: SPACELLM_AUTO_TRAIN=false
     auto_train = os.environ.get("SPACELLM_AUTO_TRAIN", "true").lower() in ("true", "1", "yes")
-    
-    config = ExecutorConfig(auto_train=auto_train)
+
+    config   = ExecutorConfig(auto_train=auto_train)
     executor = Executor(config)
     records  = executor.run()
 
     print(f"\n{'='*60}")
-    print(f"  SpaceLLM Executor — Cycle Complete")
+    print(f"  SpaceLLM Executor v3 — Cycle Complete")
     print(f"{'='*60}")
     if not records:
         print("  No actions were executed this cycle.")
@@ -1146,14 +1252,17 @@ if __name__ == "__main__":
         print(f"\n  Execution log      → {EXECUTION_LOG}")
         print(f"  Knowledge repo     → {KNOWLEDGE_REPO_FILE}")
         print(f"  Combined dataset   → {COMBINED_DATASET_FILE}")
+        print(f"  Core train file    → {CORE_TRAIN_FILE}")
         if config.auto_train:
             print(f"\n  ⚡ AUTO-TRAINING enabled")
-            print(f"     Training script: {CORRECTION_FINE_TUNING_SCRIPT}")
-            print(f"     Output dir:     {TRAINING_OUTPUT_DIR}")
+            print(f"     Script    : {CORRECTION_FINE_TUNING_SCRIPT}")
+            print(f"     Output dir: {TRAINING_OUTPUT_DIR}")
             last_training = executor._state.get("last_auto_training", {})
             if last_training:
-                print(f"     Status:         {last_training.get('status')}")
+                print(f"     Status    : {last_training.get('status')}")
                 if last_training.get("training_log"):
-                    print(f"     Log file:       {last_training.get('training_log')}")
+                    print(f"     Log file  : {last_training.get('training_log')}")
+                if last_training.get("training_output_dir"):
+                    print(f"     Adapter   : {last_training.get('training_output_dir')}")
     print(f"{'='*60}\n")
     sys.exit(0 if not any(r.status == "FAILED" for r in records) else 1)
