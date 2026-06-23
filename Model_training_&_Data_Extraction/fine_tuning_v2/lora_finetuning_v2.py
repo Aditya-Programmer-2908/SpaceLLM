@@ -1,342 +1,436 @@
 """
-SpaceLLM v2 Training Script
-============================
-Pipeline:
-    GPT-OSS base (MXFP4 → BF16)
-        ↓  load + merge
-    SpaceLLM_v1 adapter (AdityaPS/SpaceLLM_v1, vocab=200064)
-        ↓  merge_and_unload()  → v1 knowledge baked into weights
-    Merged SpaceLLM weights
-        ↓  resize vocab (200064 → 201088)
-        ↓  attach fresh correction LoRA
-    Train on human corrections  (only correction LoRA params update)
-        ↓
-    Save → SpaceLLM_v2  (adapter contains v1 knowledge + corrections)
+SpaceLLM — Optimized LoRA Fine-Tuning  v4
+==========================================
+Model     : openai/gpt-oss-20b  (MoE, MXFP4 quantized checkpoint)
+Phase     : Experimentation
+Strategy  : Freeze full transformer backbone, apply LoRA ONLY to lm_head
+Method    : Standard BF16 LoRA — NOT QLoRA, no bitsandbytes
 
-The saved adapter at --output_dir can be loaded back with:
-    PeftModel.from_pretrained(base_model_resized, output_dir)
+FIXES vs v3-fixed:
+  [CRITICAL] 1. lm_head weight untied and cloned BEFORE get_peft_model()
+                 → model.config.tie_word_embeddings = False only updates the
+                   config flag — it does NOT break the live tensor tie.
+                   With tie_word_embeddings=True, lm_head.weight and
+                   embed_tokens.weight are the SAME tensor object in memory.
+                   PEFT wraps lm_head, but autograd sees the weight as belonging
+                   to the frozen embed_tokens path and cuts gradients to lora_A.
+                   detach().clone() materializes lm_head as its own independent
+                   parameter before PEFT ever touches it.
 
-Usage:
-    python train_spacellm_v2.py \
-        --train_file   /path/to/corrections.json \
-        --output_dir   /path/to/spacellm_v2 \
-        [--base_model  openai/gpt-oss-20b] \
-        [--v1_adapter  AdityaPS/SpaceLLM_v1] \
-        [--epochs 3] [--lr 2e-4] [--lora_r 64] [--lora_alpha 128]
+  [NICE]     2. LoRA r raised 16→32, lora_alpha raised 64→128
+                 → Stronger learning signal for lm_head-only fine-tuning.
 
-corrections.json format (list of):
-    [
-      {
-        "messages": [
-          {"role": "user",      "content": "<question>"},
-          {"role": "assistant", "content": "<human_corrected_answer>"}
-        ]
-      },
-      ...
-    ]
-    OR flat format:
-    [
-      {"question": "...", "reference": "..."},
-      ...
-    ]
+  [NICE]     3. grad_accum raised 16→32, lr raised 1e-4→2e-4
+                 → Larger effective batch, faster convergence.
+
+  [NICE]     4. max_grad_norm tightened 0.5→0.3, weight_decay=0.01 added.
+
+  [NICE]     5. EarlyStoppingCallback added (patience=8).
+
+  [NICE]     6. lr_scheduler_type changed cosine→cosine_with_restarts.
+
+  [NICE]     7. optim changed adamw_torch→adamw_torch_fused (faster on GPU).
+
+Launch:
+    export CUDA_VISIBLE_DEVICES=1,2
+    python fine_tuning_v2/lora_finetuning_v4.py
+
+    # Override args:
+    python fine_tuning_v2/lora_finetuning_v4.py --lr 2e-4 --epochs 5
+
+Output layout:
+  SpaceLLM/fine_tuning_v2/outputs/
+  ├── checkpoints/
+  ├── spacellm_lora_final/
+  ├── graphs/
+  └── logs/
 """
 
-from __future__ import annotations
-
-# ── Triton stub (must be first) ───────────────────────────────────────────────
+# ── TRITON PATCH — must be the very first thing before any other import ───────
 import sys
 import types
 
 
 def _patch_triton():
+    class _StubDriver:
+        def __getattr__(self, name):
+            return _StubDriver()
+        def __call__(self, *a, **kw):
+            return _StubDriver()
+        def __bool__(self):
+            return False
+
+    class _StubCudaUtils:
+        def __init__(self):
+            pass
+        def __getattr__(self, name):
+            return lambda *a, **kw: None
+
+    class _ActiveDriverDescriptor:
+        def __get__(self, obj, objtype=None):
+            return _StubDriver()
+        def __set__(self, obj, value):
+            pass
+
+    class _StubDriverManager:
+        active  = _ActiveDriverDescriptor()
+        default = _StubDriver()
+        def __init__(self):
+            self._active  = _StubDriver()
+            self._default = _StubDriver()
+
+    def _make_module(name, parent=None):
+        mod = types.ModuleType(name)
+        sys.modules[name] = mod
+        if parent:
+            leaf = name.split(".")[-1]
+            setattr(parent, leaf, mod)
+        return mod
+
     try:
         import triton  # noqa: F401
         return
     except Exception:
         pass
 
-    class _Stub:
-        def __getattr__(self, n): return _Stub()
-        def __call__(self, *a, **kw): return _Stub()
-        def __bool__(self): return False
+    triton_mod          = _make_module("triton")
+    triton_runtime      = _make_module("triton.runtime",                triton_mod)
+    triton_runtime_drv  = _make_module("triton.runtime.driver",         triton_runtime)
+    triton_runtime_bld  = _make_module("triton.runtime.build",          triton_runtime)
+    triton_runtime_jit  = _make_module("triton.runtime.jit",            triton_runtime)
+    triton_backends     = _make_module("triton.backends",               triton_mod)
+    triton_backends_nv  = _make_module("triton.backends.nvidia",        triton_backends)
+    triton_backends_drv = _make_module("triton.backends.nvidia.driver", triton_backends_nv)
 
-    class _ActiveDesc:
-        def __get__(self, obj, t=None): return _Stub()
-        def __set__(self, obj, v): pass
+    drv_singleton = _StubDriverManager()
+    triton_runtime_drv.driver = drv_singleton
 
-    class _DrvMgr:
-        active = _ActiveDesc()
-        default = _Stub()
+    triton_runtime_bld._build                  = lambda *a, **kw: None
+    triton_runtime_bld.compile_module_from_src = lambda *a, **kw: types.ModuleType("_stub_cuda_utils")
+    triton_runtime_bld.load_module             = lambda *a, **kw: types.ModuleType("_stub_cuda_utils")
 
-    def _mod(name, parent=None):
-        m = types.ModuleType(name)
-        sys.modules[name] = m
-        if parent:
-            setattr(parent, name.split(".")[-1], m)
-        return m
-
-    t   = _mod("triton")
-    tr  = _mod("triton.runtime",               t)
-    trd = _mod("triton.runtime.driver",         tr)
-    trb = _mod("triton.runtime.build",          tr)
-    trj = _mod("triton.runtime.jit",            tr)
-    tb  = _mod("triton.backends",              t)
-    tbn = _mod("triton.backends.nvidia",        tb)
-    tbd = _mod("triton.backends.nvidia.driver", tbn)
-
-    trd.driver = _DrvMgr()
-    trb._build = trb.compile_module_from_src = trb.load_module = lambda *a, **kw: types.ModuleType("_s")
-
-    class _JIT:
-        def __init__(self, fn): self.fn = fn
+    class _StubJITFunction:
+        def __init__(self, fn):
+            self.fn = fn
         def __call__(self, *a, **kw):
-            try: return self.fn(*a, **kw)
-            except: return None
-        def __getattr__(self, n): return lambda *a, **kw: None
+            try:
+                return self.fn(*a, **kw)
+            except Exception:
+                return None
+        def __getattr__(self, name):
+            return lambda *a, **kw: None
 
-    trj.JITFunction = _JIT
-    t.jit = lambda fn=None, **kw: (_JIT(fn) if fn else (lambda f: _JIT(f)))
-    tbd.CudaUtils = type("CudaUtils", (), {"__init__": lambda s: None, "__getattr__": lambda s, n: lambda *a, **kw: None})
-    t.runtime = tr; t.backends = tb
+    triton_runtime_jit.JITFunction = _StubJITFunction
+    triton_mod.jit = lambda fn=None, **kw: (
+        _StubJITFunction(fn) if fn is not None
+        else (lambda f: _StubJITFunction(f))
+    )
+
+    triton_backends_drv.CudaUtils = _StubCudaUtils
+    triton_mod.runtime  = triton_runtime
+    triton_mod.backends = triton_backends
 
 
 _patch_triton()
 
-# ── Standard imports ──────────────────────────────────────────────────────────
+# ── Imports ───────────────────────────────────────────────────────────────────
+
 import argparse
 import json
 import logging
-import math
 import os
 import time
-import warnings
-from datetime import datetime, timezone
+from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 
+# ── Directory layout ──────────────────────────────────────────────────────────
+
+SCRIPT_DIR   = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+
+OUTPUT_DIR = SCRIPT_DIR / "outputs"
+CKPT_DIR   = OUTPUT_DIR / "checkpoints"
+FINAL_DIR  = OUTPUT_DIR / "spacellm_lora_final"
+LOG_DIR    = OUTPUT_DIR / "logs"
+GRAPH_DIR  = OUTPUT_DIR / "graphs"
+
+for _d in (CKPT_DIR, FINAL_DIR, LOG_DIR, GRAPH_DIR):
+    _d.mkdir(parents=True, exist_ok=True)
+
+# ── Dataset paths ─────────────────────────────────────────────────────────────
+
+TRAIN_FILE = Path("/mnt/DATA/saurabh/aditya/SpaceLLM/data_processing/DatasetA_core_QA_v2/train.json")
+VAL_FILE   = Path("/mnt/DATA/saurabh/aditya/SpaceLLM/data_processing/DatasetA_core_QA_v2/validate.json")
+TEST_FILE  = Path("/mnt/DATA/saurabh/aditya/SpaceLLM/data_processing/DatasetA_core_QA_v2/test.json")
+
 # ── Logging ───────────────────────────────────────────────────────────────────
+
+RUN_ID   = datetime.now().strftime("%Y%m%d_%H%M%S")
+LOG_FILE = LOG_DIR / f"train_{RUN_ID}.log"
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%H:%M:%S",
-    handlers=[logging.StreamHandler()],
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+    ],
 )
-log = logging.getLogger("SpaceLLM.v2")
+logger = logging.getLogger("SpaceLLM")
+
+# ── Device-aware CE loss ──────────────────────────────────────────────────────
+
+def _make_device_aware_ce_loss():
+    """
+    MoE models shard across GPUs. lm_head may land on cuda:1 or cuda:2
+    while Trainer places labels on cuda:0. Moves labels to match logits
+    before computing CE, then returns loss to cuda:0.
+    """
+    def _device_aware_ce_loss(logits, labels, vocab_size=None, **kwargs):
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+
+        logits_device = shift_logits.device
+        if shift_labels.device != logits_device:
+            shift_labels = shift_labels.to(logits_device)
+
+        vocab_size = shift_logits.size(-1)
+
+        oob_mask = (shift_labels != -100) & (
+            (shift_labels < 0) | (shift_labels >= vocab_size)
+        )
+        if oob_mask.any():
+            shift_labels = shift_labels.clone()
+            shift_labels[oob_mask] = -100
+
+        loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+        loss = loss_fct(
+            shift_logits.view(-1, vocab_size),
+            shift_labels.view(-1).long(),
+        )
+        return loss.to("cuda:0")
+
+    return _device_aware_ce_loss
+
+
+_DEVICE_AWARE_CE_LOSS = _make_device_aware_ce_loss()
+
+
+def _inject_loss_function(model, loss_fn=None, label=""):
+    if loss_fn is None:
+        loss_fn = _DEVICE_AWARE_CE_LOSS
+
+    replaced = False
+    candidates = [model]
+    if hasattr(model, "base_model"):
+        candidates.append(model.base_model)
+    if hasattr(model, "base_model") and hasattr(model.base_model, "model"):
+        candidates.append(model.base_model.model)
+    for child in list(model.children()):
+        candidates.append(child)
+
+    for obj in candidates:
+        if obj is not None and hasattr(obj, "loss_function"):
+            if getattr(obj, "loss_function") is not loss_fn:
+                setattr(obj, "loss_function", loss_fn)
+                replaced = True
+                logger.info(
+                    f"  ✅ Replaced loss_function on {type(obj).__name__}"
+                    + (f" ({label})" if label else "")
+                )
+    return replaced
+
+
+# ── CLI args ──────────────────────────────────────────────────────────────────
+
+def parse_args():
+    p = argparse.ArgumentParser(description="SpaceLLM lm_head LoRA fine-tuning v4")
+    p.add_argument("--model_id",               type=str,   default="openai/gpt-oss-20b")
+    p.add_argument("--epochs",                 type=int,   default=5)
+    p.add_argument("--batch_size",             type=int,   default=1)
+    p.add_argument("--grad_accum",             type=int,   default=32)
+    p.add_argument("--lr",                     type=float, default=2e-4)
+    p.add_argument("--max_seq_len",            type=int,   default=2048)
+    p.add_argument("--warmup_steps",           type=int,   default=200)
+    p.add_argument("--save_steps",             type=int,   default=300)
+    p.add_argument("--eval_steps",             type=int,   default=300)
+    p.add_argument("--logging_steps",          type=int,   default=10)
+    p.add_argument("--save_total_limit",       type=int,   default=3)
+    p.add_argument("--max_test_samples",       type=int,   default=300)
+    p.add_argument("--patience",               type=int,   default=8,
+                   help="Early stopping patience (eval steps)")
+    p.add_argument("--resume_from_checkpoint", type=str,   default=None)
+    p.add_argument("--skip_grad_verify",       action="store_true")
+    return p.parse_args()
+
+
+# ── GPU diagnostics ───────────────────────────────────────────────────────────
+
+def log_gpu_info():
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,name,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            logger.info("Visible GPUs      :")
+            for line in result.stdout.strip().splitlines():
+                idx, name, mem = line.split(",")
+                logger.info(f"  cuda:{idx.strip()} → {name.strip()}  ({int(mem.strip()):,} MiB)")
+    except Exception:
+        pass
+
+
+def log_gpu_memory(label: str = ""):
+    try:
+        if not torch.cuda.is_available():
+            logger.warning("No CUDA device — running on CPU")
+            return
+        for i in range(torch.cuda.device_count()):
+            props  = torch.cuda.get_device_properties(i)
+            alloc  = torch.cuda.memory_allocated(i)  / 1024**3
+            reserv = torch.cuda.memory_reserved(i)   / 1024**3
+            total  = props.total_memory               / 1024**3
+            logger.info(
+                f"GPU {i} [{props.name}] {label} | "
+                f"Allocated={alloc:.2f}GB  Reserved={reserv:.2f}GB  Total={total:.2f}GB"
+            )
+    except Exception as e:
+        logger.warning(f"GPU memory report failed: {e}")
+
+
+def log_trainable_parameters(model):
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total     = sum(p.numel() for p in model.parameters())
+    frozen    = total - trainable
+    pct       = 100.0 * trainable / total if total else 0.0
+    logger.info("─" * 55)
+    logger.info(f"Total parameters     : {total:>15,}")
+    logger.info(f"Trainable parameters : {trainable:>15,}  ({pct:.6f}%)")
+    logger.info(f"Frozen parameters    : {frozen:>15,}")
+    logger.info("─" * 55)
+    logger.info("Trainable layers (LoRA weights only):")
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            logger.info(
+                f"  {name:<60}  "
+                f"shape={str(list(param.shape)):<20}  "
+                f"({param.numel():,} params)"
+            )
+
+
+
+
+# ── JSON loading ──────────────────────────────────────────────────────────────
+
+def load_json(path: Path) -> list:
+    if not path.exists():
+        logger.error(f"File not found: {path}")
+        raise SystemExit(1)
+
+    with path.open(encoding="utf-8") as f:
+        raw = f.read().strip()
+
+    if raw.startswith("["):
+        try:
+            records = json.loads(raw)
+            logger.info(f"Loaded {len(records):,} records (JSON array)  ←  {path}")
+            return records
+        except json.JSONDecodeError:
+            pass
+
+    records = []
+    for line_no, line in enumerate(raw.splitlines(), 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError as e:
+            logger.warning(f"Skipping malformed line {line_no} in {path.name}: {e}")
+
+    logger.info(f"Loaded {len(records):,} records (JSONL)  ←  {path}")
+    return records
+
+
+# ── Dataset sanity check ──────────────────────────────────────────────────────
+
+def dataset_sanity_check(records: list, split_name: str):
+    logger.info(f"── Sanity check: {split_name} ({len(records):,} records) ──")
+    issues, no_assistant = 0, 0
+    org_dist, diff_dist  = defaultdict(int), defaultdict(int)
+    chain_ids            = set()
+
+    for i, r in enumerate(records):
+        for field in ("sample_id", "source_id", "mission_name", "organization",
+                      "aspect", "difficulty", "chain_id", "messages"):
+            if field not in r:
+                logger.warning(f"  Record {i}: missing '{field}'")
+                issues += 1
+                break
+        roles = [m.get("role") for m in r.get("messages", [])]
+        if "assistant" not in roles:
+            no_assistant += 1
+        org_dist[r.get("organization", "?")]  += 1
+        diff_dist[r.get("difficulty",   "?")] += 1
+        chain_ids.add(r.get("chain_id", ""))
+
+    logger.info(f"  Unique chains     : {len(chain_ids)}")
+    logger.info(f"  Structural issues : {issues}")
+    logger.info(f"  No assistant turn : {no_assistant}")
+    logger.info(f"  Organizations     : {dict(sorted(org_dist.items()))}")
+    logger.info(f"  Difficulty        : {dict(sorted(diff_dist.items()))}")
+
+
+# ── Tokenisation ──────────────────────────────────────────────────────────────
 
 IGNORE_INDEX = -100
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train SpaceLLM v2 (merge v1 → correction LoRA)")
-    p.add_argument("--base_model",    default="openai/gpt-oss-20b",
-                   help="HF id or local path of the base foundation model")
-    p.add_argument("--v1_adapter",    default="AdityaPS/SpaceLLM_v1",
-                   help="HF id or local path of the SpaceLLM v1 LoRA adapter")
-    p.add_argument("--train_file",    required=True,
-                   help="JSON file with correction examples")
-    p.add_argument("--output_dir",    required=True,
-                   help="Where to save the SpaceLLM v2 adapter")
-    p.add_argument("--hf_token",      default=os.environ.get("HF_TOKEN"),
-                   help="HuggingFace token (or set HF_TOKEN env var)")
-    # Training hyper-params
-    p.add_argument("--epochs",        type=int,   default=3)
-    p.add_argument("--lr",            type=float, default=2e-4)
-    p.add_argument("--max_seq_len",   type=int,   default=2048)
-    p.add_argument("--batch_size",    type=int,   default=1)
-    p.add_argument("--grad_accum",    type=int,   default=8)
-    p.add_argument("--warmup_ratio",  type=float, default=0.03)
-    p.add_argument("--max_grad_norm", type=float, default=0.3)
-    # LoRA hyper-params
-    p.add_argument("--lora_r",        type=int,   default=64)
-    p.add_argument("--lora_alpha",    type=int,   default=128)
-    p.add_argument("--lora_dropout",  type=float, default=0.1)
-    p.add_argument("--target_modules",default="lm_head",
-                   help="Comma-separated list of module names to apply LoRA to")
-    p.add_argument("--seed",          type=int,   default=42)
-    return p.parse_args()
+def tokenise_record(record: dict, tokenizer, max_seq_len: int, debug: bool = False):
+    messages = record.get("messages", [])
 
+    hf_messages = []
+    for msg in messages:
+        role    = "system" if msg["role"] == "developer" else msg["role"]
+        content = msg.get("content", "").strip()
+        if content:
+            hf_messages.append({"role": role, "content": content})
 
-# ── GPU helpers ───────────────────────────────────────────────────────────────
-def log_gpu(label: str = "") -> None:
-    if not torch.cuda.is_available():
-        return
-    for i in range(torch.cuda.device_count()):
-        p = torch.cuda.get_device_properties(i)
-        a = torch.cuda.memory_allocated(i) / 1024**3
-        r = torch.cuda.memory_reserved(i)  / 1024**3
-        t = p.total_memory                 / 1024**3
-        log.info(f"  GPU{i} [{p.name}] {label} | alloc={a:.1f}GB res={r:.1f}GB total={t:.1f}GB")
-
-
-def log_trainable(model) -> None:
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total     = sum(p.numel() for p in model.parameters())
-    log.info(f"  Trainable: {trainable:,} / {total:,}  ({100*trainable/total:.4f}%)")
-    for n, p in model.named_parameters():
-        if p.requires_grad:
-            log.info(f"    {n}  shape={list(p.shape)}  ({p.numel():,})")
-
-
-# ── lm_head / vocab helpers ───────────────────────────────────────────────────
-def untie_lm_head(model, label: str = "") -> None:
-    """Materialise lm_head as an independent Parameter (no weight sharing)."""
-    model.config.tie_word_embeddings = False
-    lm = model.get_output_embeddings()
-    lm.weight = nn.Parameter(lm.weight.detach().clone())
-    log.info(f"  ✅ lm_head untied{' (' + label + ')' if label else ''}")
-
-
-def resize_vocab(model, tokenizer, label: str = "") -> int:
-    """
-    Resize token embeddings to match tokenizer length, padded to multiple of 64.
-    Re-unties lm_head if resize accidentally re-ties it.
-    Returns the actual (padded) vocab size.
-    """
-    tag = f" ({label})" if label else ""
-    model.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=64)
-    vocab = model.get_output_embeddings().weight.shape[0]
-    model.config.vocab_size = vocab
-
-    # resize_token_embeddings can silently re-tie weights — guard against it
-    if id(model.get_input_embeddings().weight) == id(model.get_output_embeddings().weight):
-        log.warning(f"  resize re-tied lm_head{tag} — re-untying")
-        lm = model.get_output_embeddings()
-        lm.weight = nn.Parameter(lm.weight.detach().clone())
-
-    emb_vocab = model.get_input_embeddings().weight.shape[0]
-    lm_vocab  = model.get_output_embeddings().weight.shape[0]
-    assert emb_vocab == vocab and lm_vocab == vocab, \
-        f"Vocab mismatch after resize{tag}: embed={emb_vocab}, lm_head={lm_vocab}, expected={vocab}"
-
-    log.info(f"  ✅ Vocab resized → {vocab:,} (pad_to_multiple_of=64){tag}")
-    return vocab
-
-
-# ── Device-aware cross-entropy loss ──────────────────────────────────────────
-def _device_aware_ce_loss(logits, labels, vocab_size=None, **kwargs):
-    """
-    MoE models shard across multiple GPUs. lm_head may be on cuda:1/2
-    while Trainer puts labels on cuda:0. This bridges the device gap.
-    """
-    shift_logits = logits[..., :-1, :].contiguous()
-    shift_labels = labels[..., 1:].contiguous()
-
-    if shift_labels.device != shift_logits.device:
-        shift_labels = shift_labels.to(shift_logits.device)
-
-    V = shift_logits.size(-1)
-    # Clamp any out-of-vocab label indices to IGNORE_INDEX
-    oob = (shift_labels != IGNORE_INDEX) & ((shift_labels < 0) | (shift_labels >= V))
-    if oob.any():
-        shift_labels = shift_labels.clone()
-        shift_labels[oob] = IGNORE_INDEX
-
-    loss = nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX)(
-        shift_logits.view(-1, V),
-        shift_labels.view(-1).long(),
-    )
-    return loss.to("cuda:0")
-
-
-def inject_loss(model, label: str = "") -> None:
-    """Patch loss_function on the model and its immediate children."""
-    tag = f" ({label})" if label else ""
-    replaced = False
-    for obj in [model, getattr(model, "base_model", None),
-                getattr(getattr(model, "base_model", None), "model", None),
-                *list(model.children())]:
-        if obj is not None and hasattr(obj, "loss_function"):
-            if getattr(obj, "loss_function") is not _device_aware_ce_loss:
-                obj.loss_function = _device_aware_ce_loss
-                replaced = True
-                log.info(f"  ✅ loss_function patched on {type(obj).__name__}{tag}")
-    if not replaced:
-        log.debug(f"  (no loss_function attribute found to patch{tag})")
-
-
-# ── Data loading ──────────────────────────────────────────────────────────────
-def load_examples(train_file: Path) -> list[dict]:
-    """
-    Load training JSON. Accepts two formats:
-      A) messages format: [{"messages": [{"role":..., "content":...}, ...]}]
-      B) flat format:     [{"question": "...", "reference": "..."}]
-    Always returns messages-format records.
-    """
-    raw = json.loads(train_file.read_text(encoding="utf-8"))
-    if not isinstance(raw, list):
-        raise ValueError(f"Expected a JSON list in {train_file}")
-
-    out, skipped = [], 0
-    for rec in raw:
-        # Flat format → convert to messages format
-        if "question" in rec or "reference" in rec:
-            q = (rec.get("question") or "").strip()
-            a = (rec.get("reference") or "").strip()
-            if not q or not a:
-                skipped += 1
-                continue
-            rec = {
-                "messages": [
-                    {"role": "user",      "content": q},
-                    {"role": "assistant", "content": a},
-                ],
-                **{k: v for k, v in rec.items() if k not in ("question", "reference")},
-            }
-
-        msgs = rec.get("messages", [])
-        asst = [m for m in msgs if m.get("role") == "assistant"]
-        if not asst or not (asst[-1].get("content") or "").strip():
-            skipped += 1
-            continue
-        out.append(rec)
-
-    if skipped:
-        log.warning(f"  Skipped {skipped}/{len(raw)} records (empty/missing content)")
-    if not out:
-        raise ValueError("No usable training examples after filtering.")
-    log.info(f"  Loaded {len(out)} usable correction example(s)")
-    return out
-
-
-def tokenise(record: dict, tokenizer, max_seq_len: int) -> dict | None:
-    """
-    Tokenize one record. Masks the prompt with IGNORE_INDEX so the loss
-    is computed only on the corrected assistant answer.
-    """
-    msgs = record.get("messages", [])
-    hf_msgs = [
-        {"role": "system" if m["role"] == "developer" else m["role"],
-         "content": (m.get("content") or "").strip()}
-        for m in msgs if (m.get("content") or "").strip()
-    ]
-    if not hf_msgs:
+    if not hf_messages:
         return None
 
     try:
         full_text = tokenizer.apply_chat_template(
-            hf_msgs, tokenize=False, add_generation_prompt=False)
+            hf_messages, tokenize=False, add_generation_prompt=False)
     except Exception as e:
-        log.warning(f"  apply_chat_template failed: {e} — skipping")
+        logger.warning(f"apply_chat_template failed: {e} — skipping")
         return None
 
     full_enc  = tokenizer(full_text, truncation=True, max_length=max_seq_len,
                           padding=False, return_tensors=None)
     input_ids = full_enc["input_ids"]
+
     if len(input_ids) < 4:
         return None
 
-    # Build prefix (everything except last assistant turn) to find mask boundary
-    prefix_msgs = [m for m in hf_msgs if m["role"] != "assistant"]
+    prefix_msgs = [m for m in hf_messages if m["role"] != "assistant"]
     try:
         prefix_text = tokenizer.apply_chat_template(
             prefix_msgs, tokenize=False, add_generation_prompt=True)
     except Exception:
         return None
-    prefix_len = len(tokenizer(prefix_text, truncation=True, max_length=max_seq_len,
-                                padding=False, return_tensors=None)["input_ids"])
+
+    prefix_enc = tokenizer(prefix_text, truncation=True, max_length=max_seq_len,
+                           padding=False, return_tensors=None)
+    prefix_len = len(prefix_enc["input_ids"])
 
     if prefix_len >= len(input_ids):
         return None
@@ -344,402 +438,1003 @@ def tokenise(record: dict, tokenizer, max_seq_len: int) -> dict | None:
     labels   = [IGNORE_INDEX] * prefix_len + input_ids[prefix_len:]
     labels   = labels[:len(input_ids)]
     n_active = sum(1 for l in labels if l != IGNORE_INDEX)
+
+    # Extra safety: assistant response must have at least 4 real tokens
     if n_active < 4:
         return None
+
+    if debug:
+        logger.info(f"    prefix_len={prefix_len}  total={len(input_ids)}  active={n_active}")
+        logger.info("    Active (loss) tokens sample:")
+        shown = 0
+        for tok_id, lbl in zip(input_ids, labels):
+            if lbl != IGNORE_INDEX and shown < 10:
+                logger.info(f"      {repr(tokenizer.decode([tok_id]))}")
+                shown += 1
 
     return {
         "input_ids":      input_ids,
         "attention_mask": full_enc["attention_mask"],
         "labels":         labels,
+        "n_active":       n_active,
     }
 
 
-def build_dataset(tokenizer, examples: list[dict], max_seq_len: int, vocab_size: int):
+def build_hf_dataset(records: list, tokenizer, max_seq_len: int, split_name: str,
+                     vocab_size: int = None, debug_first_n: int = 3):
     from datasets import Dataset
 
-    rows, skipped, clamped = [], 0, 0
-    for rec in examples:
-        r = tokenise(rec, tokenizer, max_seq_len)
-        if r is None:
+    tokenised, skipped, clamped_records = [], 0, 0
+    active_counts = []
+
+    for i, record in enumerate(records):
+        result = tokenise_record(
+            record, tokenizer, max_seq_len,
+            debug=(i < debug_first_n and split_name == "train"),
+        )
+        if result is None:
             skipped += 1
             continue
-        # Clamp any OOV label tokens
-        new_labels, had_oob = [], False
-        for lbl in r["labels"]:
-            if lbl != IGNORE_INDEX and (lbl < 0 or lbl >= vocab_size):
-                new_labels.append(IGNORE_INDEX); had_oob = True
+
+        n_active = result.pop("n_active")
+        active_counts.append(n_active)
+
+        if vocab_size is not None:
+            new_labels, had_oob = [], False
+            for lbl in result["labels"]:
+                if lbl != IGNORE_INDEX and (lbl < 0 or lbl >= vocab_size):
+                    new_labels.append(IGNORE_INDEX)
+                    had_oob = True
+                else:
+                    new_labels.append(lbl)
+            if had_oob:
+                result["labels"] = new_labels
+                clamped_records += 1
+
+        if all(lbl == IGNORE_INDEX for lbl in result["labels"]):
+            skipped += 1
+            continue
+
+        tokenised.append(result)
+
+    if skipped:
+        logger.warning(f"[{split_name}] Skipped {skipped} records")
+    if clamped_records:
+        logger.warning(f"[{split_name}] Clamped OOV labels in {clamped_records} records")
+    if not tokenised:
+        logger.error(f"[{split_name}] Zero usable records — aborting")
+        raise SystemExit(1)
+
+    lengths      = [len(t["input_ids"]) for t in tokenised]
+    max_input_id = max(max(t["input_ids"]) for t in tokenised)
+    max_label_id = max(
+        max((lbl for lbl in t["labels"] if lbl != IGNORE_INDEX), default=0)
+        for t in tokenised
+    )
+
+    if vocab_size is not None and max_label_id >= vocab_size:
+        logger.error(f"[{split_name}] FATAL: max_label_id={max_label_id} >= vocab_size={vocab_size}")
+        raise SystemExit(1)
+
+    mean_active = sum(active_counts) / len(active_counts) if active_counts else 0
+    min_active  = min(active_counts) if active_counts else 0
+    max_active  = max(active_counts) if active_counts else 0
+
+    logger.info(
+        f"[{split_name}] {len(tokenised):,} records | "
+        f"seq len  min={min(lengths)}  max={max(lengths)}  mean={sum(lengths)/len(lengths):.0f} | "
+        f"active tokens  min={min_active}  mean={mean_active:.1f}  max={max_active} | "
+        f"max_input_id={max_input_id}  max_label_id={max_label_id}"
+    )
+
+    if mean_active < 10:
+        logger.warning(
+            f"[{split_name}] ⚠️  mean active tokens={mean_active:.1f} — "
+            f"label masking may be too aggressive."
+        )
+
+    return Dataset.from_list(tokenised)
+
+
+# ── Training history callback ─────────────────────────────────────────────────
+
+class HistoryCallback:
+    def __init__(self):
+        self.train_loss : list = []
+        self.eval_loss  : list = []
+        self.lr_history : list = []
+        self.grad_norms : list = []
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs is None:
+            return
+        step = state.global_step
+        if "loss"          in logs: self.train_loss.append((step, logs["loss"]))
+        if "eval_loss"     in logs: self.eval_loss.append((step, logs["eval_loss"]))
+        if "learning_rate" in logs: self.lr_history.append((step, logs["learning_rate"]))
+        if "grad_norm"     in logs: self.grad_norms.append((step, logs["grad_norm"]))
+
+
+# ── Graph saving ──────────────────────────────────────────────────────────────
+
+def save_training_graphs(history: HistoryCallback, run_id: str):
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.ticker as ticker
+    except ImportError:
+        logger.warning("matplotlib not available — skipping graph saving")
+        return
+
+    def _plot(xy_list, title, xlabel, ylabel, color, path):
+        if not xy_list:
+            return
+        steps, vals = zip(*xy_list)
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.plot(steps, vals, color=color, linewidth=1.5, label=ylabel)
+        ax.set_title(title, fontsize=14, fontweight="bold")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        logger.info(f"  Graph saved → {path}")
+
+    _plot(history.train_loss, "Training Loss",         "Step", "Loss",         "#e74c3c",
+          GRAPH_DIR / f"training_loss_{run_id}.png")
+    _plot(history.eval_loss,  "Validation Eval Loss",  "Step", "Eval Loss",    "#2980b9",
+          GRAPH_DIR / f"eval_loss_{run_id}.png")
+    _plot(history.lr_history, "Learning Rate Schedule","Step", "LR",           "#27ae60",
+          GRAPH_DIR / f"lr_schedule_{run_id}.png")
+    _plot(history.grad_norms, "Gradient Norm",         "Step", "Grad Norm",    "#8e44ad",
+          GRAPH_DIR / f"grad_norm_{run_id}.png")
+
+    try:
+        fig, axes = plt.subplots(2, 2, figsize=(18, 10))
+        fig.suptitle(f"SpaceLLM LoRA v4 — Training Overview  [{run_id}]",
+                     fontsize=13, fontweight="bold")
+        panels = [
+            (history.train_loss, "Training Loss",        "#e74c3c", "Loss"),
+            (history.eval_loss,  "Validation Eval Loss", "#2980b9", "Eval Loss"),
+            (history.lr_history, "LR Schedule",          "#27ae60", "LR"),
+            (history.grad_norms, "Gradient Norm",        "#8e44ad", "Grad Norm"),
+        ]
+        for ax, (xy_list, title, color, ylabel) in zip(axes.flat, panels):
+            if xy_list:
+                steps, vals = zip(*xy_list)
+                ax.plot(steps, vals, color=color, linewidth=1.5)
+            ax.set_title(title)
+            ax.set_xlabel("Step")
+            ax.set_ylabel(ylabel)
+            ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        overview_path = GRAPH_DIR / f"training_overview_{run_id}.png"
+        fig.savefig(overview_path, dpi=150)
+        plt.close(fig)
+        logger.info(f"  Overview graph → {overview_path}")
+    except Exception as e:
+        logger.warning(f"Overview graph failed: {e}")
+
+
+def save_test_loss_graph(test_losses: list, run_id: str):
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return
+    if not test_losses:
+        return
+
+    display = test_losses[:200]
+    fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+    fig.suptitle(f"Test Set Evaluation — SpaceLLM LoRA v4  [{run_id}]",
+                 fontsize=13, fontweight="bold")
+
+    axes[0].bar(range(len(display)), display, color="#8e44ad", alpha=0.7, width=1.0)
+    axes[0].set_title(f"Per-Sample Loss (first {len(display)} samples)")
+    axes[0].set_xlabel("Sample index")
+    axes[0].set_ylabel("Loss")
+    mean_v = sum(display) / len(display)
+    axes[0].axhline(mean_v, color="red", linestyle="--", label=f"Mean={mean_v:.4f}")
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].hist(test_losses, bins=40, color="#8e44ad", alpha=0.7, edgecolor="white")
+    axes[1].set_title(f"Loss Distribution (all {len(test_losses)} samples)")
+    axes[1].set_xlabel("Loss")
+    axes[1].set_ylabel("Count")
+    mean_all = sum(test_losses) / len(test_losses)
+    axes[1].axvline(mean_all, color="red", linestyle="--", label=f"Mean={mean_all:.4f}")
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    path = GRAPH_DIR / f"test_loss_{run_id}.png"
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    logger.info(f"  Test loss graph → {path}")
+
+
+# ── Test evaluation ───────────────────────────────────────────────────────────
+
+def run_test_evaluation(model, tokenizer, test_records: list,
+                        max_seq_len: int, vocab_size: int,
+                        max_samples: int, run_id: str):
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info("  Test Evaluation")
+    logger.info("=" * 60)
+
+    model.eval()
+
+    # Phase 1: Loss
+    logger.info(f"── Phase 1: Loss on {len(test_records):,} records ──")
+    per_sample_losses, skipped = [], 0
+
+    with torch.no_grad():
+        for i, record in enumerate(test_records):
+            result = tokenise_record(record, tokenizer, max_seq_len)
+            if result is None:
+                skipped += 1
+                continue
+            result.pop("n_active", None)
+
+            new_labels = [
+                IGNORE_INDEX if (lbl != IGNORE_INDEX and (lbl < 0 or lbl >= vocab_size))
+                else lbl
+                for lbl in result["labels"]
+            ]
+            result["labels"] = new_labels
+
+            if all(lbl == IGNORE_INDEX for lbl in result["labels"]):
+                skipped += 1
+                continue
+
+            input_ids = torch.tensor([result["input_ids"]],      dtype=torch.long)
+            attn_mask = torch.tensor([result["attention_mask"]], dtype=torch.long)
+            labels    = torch.tensor([result["labels"]],          dtype=torch.long)
+
+            device = next(model.parameters()).device
+            try:
+                input_ids = input_ids.to(device)
+                attn_mask = attn_mask.to(device)
+                labels    = labels.to(device)
+            except Exception:
+                pass
+
+            try:
+                outputs  = model(input_ids=input_ids, attention_mask=attn_mask, labels=labels)
+                loss_val = outputs.loss
+                if loss_val is not None and not torch.isnan(loss_val):
+                    per_sample_losses.append(float(loss_val.item()))
+            except Exception as e:
+                logger.warning(f"  Loss eval failed for record {i}: {e}")
+                skipped += 1
+
+            if (i + 1) % 50 == 0:
+                completed   = len(per_sample_losses)
+                mean_so_far = sum(per_sample_losses) / completed if completed else float("nan")
+                logger.info(f"  [{i+1}/{len(test_records)}]  valid={completed}  mean_loss={mean_so_far:.4f}")
+
+    mean_test_loss = sum(per_sample_losses) / len(per_sample_losses) if per_sample_losses else float("nan")
+    logger.info(f"  Loss eval: {len(per_sample_losses):,} samples (skipped={skipped})  mean_loss={mean_test_loss:.4f}")
+    save_test_loss_graph(per_sample_losses, run_id)
+
+    # Phase 2: Generation
+    logger.info("")
+    logger.info(f"── Phase 2: Generation on first {max_samples} records ──")
+
+    gen_records    = test_records[:max_samples]
+    predictions    = []
+    exact_matches  = 0
+    token_overlaps = []
+
+    with torch.no_grad():
+        for i, record in enumerate(gen_records):
+            messages    = record.get("messages", [])
+            hf_messages = []
+            for msg in messages:
+                role    = "system" if msg["role"] == "developer" else msg["role"]
+                content = msg.get("content", "").strip()
+                if content and role != "assistant":
+                    hf_messages.append({"role": role, "content": content})
+
+            ref_answer = ""
+            for msg in messages:
+                if msg.get("role") == "assistant":
+                    ref_answer = msg.get("content", "").strip()
+                    break
+
+            if not hf_messages or not ref_answer:
+                continue
+
+            try:
+                prompt_text = tokenizer.apply_chat_template(
+                    hf_messages, tokenize=False, add_generation_prompt=True)
+            except Exception:
+                continue
+
+            enc = tokenizer(prompt_text, return_tensors="pt",
+                            truncation=True, max_length=max_seq_len - 256)
+            device = next(model.parameters()).device
+            try:
+                enc = {k: v.to(device) for k, v in enc.items()}
+            except Exception:
+                pass
+
+            try:
+                gen_ids   = model.generate(
+                    **enc, max_new_tokens=256, do_sample=False, temperature=1.0,
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                )
+                new_ids   = gen_ids[0][enc["input_ids"].shape[1]:]
+                generated = tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+            except Exception as e:
+                logger.warning(f"  Generation failed for record {i}: {e}")
+                continue
+
+            em = int(generated.lower() == ref_answer.lower())
+            exact_matches += em
+
+            ref_toks = set(ref_answer.lower().split())
+            gen_toks = set(generated.lower().split())
+            if ref_toks or gen_toks:
+                overlap = len(ref_toks & gen_toks)
+                prec    = overlap / len(gen_toks) if gen_toks else 0.0
+                rec     = overlap / len(ref_toks) if ref_toks else 0.0
+                f1      = (2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
             else:
-                new_labels.append(lbl)
-        if had_oob:
-            r["labels"] = new_labels; clamped += 1
-        if all(l == IGNORE_INDEX for l in r["labels"]):
-            skipped += 1; continue
-        rows.append(r)
+                f1 = 0.0
+            token_overlaps.append(f1)
 
-    if skipped:  log.warning(f"  Tokenisation skipped {skipped} examples")
-    if clamped:  log.warning(f"  Clamped OOV labels in {clamped} examples")
-    if not rows: raise ValueError("All examples collapsed after tokenisation.")
+            predictions.append({
+                "sample_id":   record.get("sample_id", i),
+                "reference":   ref_answer,
+                "generated":   generated,
+                "exact_match": em,
+                "token_f1":    round(f1, 4),
+            })
 
-    lengths = [len(r["input_ids"]) for r in rows]
-    log.info(f"  Dataset: {len(rows)} rows | "
-             f"seq_len min={min(lengths)} mean={sum(lengths)/len(lengths):.0f} max={max(lengths)}")
-    return Dataset.from_list(rows)
+            if (i + 1) % 20 == 0:
+                logger.info(f"  [{i+1}/{len(gen_records)}]  "
+                            f"EM={exact_matches}/{len(predictions)}  "
+                            f"mean_F1={sum(token_overlaps)/len(token_overlaps):.4f}")
 
+    n_gen   = len(predictions)
+    em_rate = exact_matches / n_gen                       if n_gen          else float("nan")
+    mean_f1 = sum(token_overlaps) / len(token_overlaps)   if token_overlaps else float("nan")
 
-# ── NaN guard callback ────────────────────────────────────────────────────────
-def make_nan_guard():
-    from transformers import TrainerCallback
+    logger.info("")
+    logger.info("── Test Results ─────────────────────────────────────")
+    logger.info(f"  Mean test loss     : {mean_test_loss:.4f}  ({len(per_sample_losses):,} samples)")
+    logger.info(f"  Exact match        : {exact_matches}/{n_gen}  ({em_rate*100:.2f}%)")
+    logger.info(f"  Mean token F1      : {mean_f1:.4f}")
 
-    class _NaNGuard(TrainerCallback):
-        def __init__(self): self.triggered = False
-        def on_log(self, args, state, control, logs=None, **kwargs):
-            loss = (logs or {}).get("loss")
-            if loss is not None and (math.isnan(loss) or math.isinf(loss)):
-                log.error(f"NaN/Inf loss at step {state.global_step} — stopping.")
-                self.triggered = True
-                control.should_training_stop = True
-            return control
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        if token_overlaps:
+            fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+            fig.suptitle(f"Test Generation Metrics — SpaceLLM LoRA v4  [{run_id}]",
+                         fontsize=13, fontweight="bold")
+            axes[0].hist(token_overlaps, bins=30, color="#16a085", alpha=0.8, edgecolor="white")
+            axes[0].set_title("Token F1 Distribution")
+            axes[0].set_xlabel("Token F1")
+            axes[0].set_ylabel("Count")
+            axes[0].axvline(mean_f1, color="red", linestyle="--", label=f"Mean={mean_f1:.3f}")
+            axes[0].legend()
+            axes[0].grid(True, alpha=0.3)
+            axes[1].bar(["Exact Match", "No Match"], [exact_matches, n_gen - exact_matches],
+                        color=["#27ae60", "#e74c3c"], alpha=0.8)
+            axes[1].set_title(f"Exact Match  ({em_rate*100:.1f}%)")
+            axes[1].set_ylabel("Count")
+            axes[1].grid(True, alpha=0.3, axis="y")
+            fig.tight_layout()
+            gen_graph_path = GRAPH_DIR / f"test_generation_{run_id}.png"
+            fig.savefig(gen_graph_path, dpi=150)
+            plt.close(fig)
+            logger.info(f"  Generation graph → {gen_graph_path}")
+    except Exception as e:
+        logger.warning(f"Generation graph failed: {e}")
 
-    return _NaNGuard()
+    test_results = {
+        "run_id":             run_id,
+        "total_test_records": len(test_records),
+        "loss_eval": {
+            "samples_evaluated": len(per_sample_losses),
+            "samples_skipped":   skipped,
+            "mean_test_loss":    round(mean_test_loss, 6),
+        },
+        "generation_eval": {
+            "samples_evaluated": n_gen,
+            "exact_matches":     exact_matches,
+            "exact_match_rate":  round(em_rate, 6) if n_gen else None,
+            "mean_token_f1":     round(mean_f1, 6) if n_gen else None,
+        },
+        "per_sample_predictions": predictions,
+    }
+    results_path = GRAPH_DIR / f"test_results_{run_id}.json"
+    with results_path.open("w", encoding="utf-8") as f:
+        json.dump(test_results, f, indent=2, ensure_ascii=False)
+    logger.info(f"  Full test results → {results_path}")
+    return test_results
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-def main() -> int:
-    args       = parse_args()
-    output_dir = Path(args.output_dir)
-    train_file = Path(args.train_file)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    torch.manual_seed(args.seed)
 
-    log.info("=" * 65)
-    log.info("  SpaceLLM v2 Training")
-    log.info(f"  base_model  : {args.base_model}")
-    log.info(f"  v1_adapter  : {args.v1_adapter}")
-    log.info(f"  train_file  : {train_file}")
-    log.info(f"  output_dir  : {output_dir}")
-    log.info(f"  LoRA r={args.lora_r}  alpha={args.lora_alpha}  target={args.target_modules}")
-    log.info(f"  epochs={args.epochs}  lr={args.lr}  batch={args.batch_size}  "
-             f"grad_accum={args.grad_accum}")
-    log.info("=" * 65)
+def main():
+    args = parse_args()
 
-    from transformers import AutoModelForCausalLM, AutoTokenizer, Mxfp4Config
-    from transformers import TrainingArguments, DataCollatorForSeq2Seq, Trainer
-    from peft import LoraConfig, TaskType, PeftModel, get_peft_model
+    logger.info("=" * 60)
+    logger.info("  SpaceLLM — LoRA v4  (lm_head only, BF16)")
+    logger.info(f"  Run ID            : {RUN_ID}")
+    logger.info(f"  Model             : {args.model_id}")
+    logger.info(f"  Strategy          : LoRA on lm_head ONLY — backbone frozen")
+    logger.info(f"  Key fix           : lm_head untied BEFORE get_peft_model()")
+    logger.info(f"  Epochs            : {args.epochs}  |  LR: {args.lr}")
+    logger.info(f"  Batch             : {args.batch_size}  |  Grad accum: {args.grad_accum}"
+                f"  |  Eff batch: {args.batch_size * args.grad_accum}")
+    logger.info(f"  CUDA_VISIBLE_DEVS : {os.environ.get('CUDA_VISIBLE_DEVICES', 'unset')}")
+    logger.info(f"  Log               : {LOG_FILE}")
+    logger.info("=" * 60)
 
-    # ── Load correction examples ──────────────────────────────────────────
-    log.info("\n[1/9] Loading correction examples ...")
-    examples = load_examples(train_file)
+    try:
+        from transformers import (
+            AutoModelForCausalLM, AutoTokenizer, TrainingArguments,
+            DataCollatorForSeq2Seq, Trainer, TrainerCallback, Mxfp4Config,
+            EarlyStoppingCallback,
+        )
+        from peft import LoraConfig, TaskType, get_peft_model
+    except ImportError as e:
+        logger.error(f"Missing dependency: {e}")
+        raise SystemExit(1)
+
+    log_gpu_info()
+
+    # ── Dataset file check ────────────────────────────────────────────────
+    logger.info("")
+    logger.info("── Dataset files ────────────────────────────────────")
+    for label, path in [("Train", TRAIN_FILE), ("Val", VAL_FILE), ("Test", TEST_FILE)]:
+        if path.exists():
+            kb = path.stat().st_size / 1024
+            logger.info(f"  {label:<6}: OK  ({kb:.1f} KB)  →  {path}")
+        else:
+            logger.info(f"  {label:<6}: NOT FOUND  →  {path}")
+
+    if not TRAIN_FILE.exists() or not VAL_FILE.exists():
+        logger.error("Train or validation file missing — cannot proceed")
+        raise SystemExit(1)
+
+    log_gpu_memory("before model load")
 
     # ── Tokenizer ─────────────────────────────────────────────────────────
-    log.info(f"\n[2/9] Loading tokenizer: {args.base_model}")
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.base_model, trust_remote_code=True, token=args.hf_token)
+    logger.info("")
+    logger.info(f"Loading tokenizer: {args.model_id}")
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
+    except Exception as e:
+        logger.error(f"Tokenizer load failed: {e}")
+        raise SystemExit(1)
+
     if tokenizer.pad_token is None:
         tokenizer.pad_token    = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
-        log.info("  pad_token set to eos_token")
+        logger.info("pad_token set to eos_token")
+
     tokenizer.padding_side = "right"
-    log.info(f"  tokenizer len={len(tokenizer):,}  "
-             f"chat_template={'found' if tokenizer.chat_template else 'MISSING'}")
+    logger.info(f"Vocab size        : {tokenizer.vocab_size:,}")
+    logger.info(f"len(tokenizer)    : {len(tokenizer):,}")
+    logger.info(f"Pad token         : '{tokenizer.pad_token}'  (id={tokenizer.pad_token_id})")
+    logger.info(f"Chat template     : {'found' if tokenizer.chat_template else 'NOT FOUND'}")
 
-    # =========================================================================
-    # PIPELINE (HF adapter, vocab=200064):
-    #
-    #  Step 3  Load base model to CPU                  (vocab=200064)
-    #  Step 4  Untie lm_head
-    #  Step 5  Inject device-aware CE loss (pre-PEFT)
-    #  Step 6  PeftModel.from_pretrained(v1_adapter)   (shapes match: 200064)
-    #  Step 7  merge_and_unload()                      (v1 baked into weights)
-    #  Step 8  Re-untie lm_head post-merge
-    #  Step 9  resize_token_embeddings                 (200064 → 201088)
-    #  Step 10 Inject CE loss post-resize
-    #  Step 11 Fresh correction LoRA via get_peft_model()
-    #  Step 12 Freeze everything except LoRA params
-    #  Step 13 GPU dispatch
-    #  Step 14 Train
-    #  Step 15 Save v2 adapter
-    # =========================================================================
-
-    # ── [3/9] Load base model ─────────────────────────────────────────────
-    log.info(f"\n[3/9] Loading base model (CPU, MXFP4→BF16): {args.base_model}")
-    log_gpu("pre-load")
+    # ── Model load to CPU ─────────────────────────────────────────────────
+    logger.info("")
+    logger.info(f"Loading model to CPU: {args.model_id}  [MXFP4 → BF16 dequantize]")
     t0 = time.time()
-    model = AutoModelForCausalLM.from_pretrained(
-        args.base_model,
-        quantization_config=Mxfp4Config(dequantize=True),
-        device_map="cpu",
-        trust_remote_code=True,
-        ignore_mismatched_sizes=True,
-        token=args.hf_token,
-    )
-    log.info(f"  Loaded in {time.time()-t0:.1f}s | dtype={next(model.parameters()).dtype}")
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_id,
+            quantization_config=Mxfp4Config(dequantize=True),
+            device_map="cpu",
+            trust_remote_code=True,
+            ignore_mismatched_sizes=True,
+        )
+    except Exception as e:
+        logger.error(f"Model load failed: {e}")
+        raise SystemExit(1)
+
+    logger.info(f"Model loaded in {time.time() - t0:.1f}s  |  dtype: {next(model.parameters()).dtype}")
+
+    # ── Vocab alignment ───────────────────────────────────────────────────
+    logger.info("")
+    logger.info("── Vocab & lm_head alignment ────────────────────────")
+
+    # Step 1: Disable weight tying in config
+    model.config.tie_word_embeddings = False
+
+    # ===========================================================
+    # CRITICAL FIX: Physically untie lm_head from embed_tokens.
+    #
+    # Setting tie_word_embeddings=False in the config only updates
+    # the config flag — it does NOT break the live tensor tie.
+    # With tie_word_embeddings=True, lm_head.weight and
+    # embed_tokens.weight point to the SAME tensor object in memory.
+    # PEFT wraps lm_head, but autograd sees the underlying weight
+    # as belonging to the frozen embed_tokens path, so gradients
+    # to lora_A.weight are cut off at the tied tensor.
+    # detach().clone() materializes lm_head as its own independent
+    # Parameter BEFORE get_peft_model() ever touches the model.
+    # ===========================================================
+    lm_head = model.get_output_embeddings()
+    lm_head.weight = nn.Parameter(lm_head.weight.detach().clone())
+    logger.info("✅ lm_head weight untied and cloned as independent tensor")
+
+    # Step 2: Resize vocab
+    _current_vocab = model.get_output_embeddings().weight.shape[0]
+    model.resize_token_embeddings(_current_vocab, pad_to_multiple_of=64)
+    model.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=64)
+
+    actual_vocab = model.get_output_embeddings().weight.shape[0]
+    model.config.vocab_size = actual_vocab
+
+    assert model.get_input_embeddings().weight.shape[0]  == actual_vocab
+    assert model.get_output_embeddings().weight.shape[0] == actual_vocab
+    logger.info(f"  Vocab alignment PASSED  (vocab={actual_vocab:,}  padded to multiple of 64)")
+
+    # Verify untie was not undone by resize
+    embed_id  = id(model.get_input_embeddings().weight)
+    lm_head_id = id(model.get_output_embeddings().weight)
+    if embed_id == lm_head_id:
+        logger.error("  ❌ FATAL: resize_token_embeddings re-tied lm_head to embed_tokens!")
+        logger.error("  Call lm_head.weight = nn.Parameter(...) again after resize.")
+        lm_head = model.get_output_embeddings()
+        lm_head.weight = nn.Parameter(lm_head.weight.detach().clone())
+        logger.info("  ✅ Re-untied lm_head after resize.")
+    else:
+        logger.info("  ✅ lm_head still independent after resize (tie not re-introduced)")
+
     model.config.use_cache = False
 
-    # ── [4/9] Untie lm_head ───────────────────────────────────────────────
-    log.info("\n[4/9] Untying lm_head ...")
-    untie_lm_head(model, "initial")
+    # ── Inject loss pre-PEFT ──────────────────────────────────────────────
+    logger.info("")
+    logger.info("── Injecting CE loss (pre-PEFT) ─────────────────────")
+    _inject_loss_function(model, label="pre-PEFT")
 
-    # ── [5/9] CE loss injection (pre-PEFT) ───────────────────────────────
-    log.info("\n[5/9] Injecting device-aware CE loss (pre-PEFT) ...")
-    inject_loss(model, "pre-PEFT")
+    # =========================================================================
+    # CORRECT ORDER (v4):
+    #   1. Load model to CPU                     ← done
+    #   2. Vocab alignment + untie lm_head       ← done  *** THE KEY FIX ***
+    #   3. get_peft_model() on raw CPU model     ← PEFT wraps untied lm_head
+    #   4. enable_input_require_grads()          ← hook on correct forward()
+    #   5. gradient_checkpointing_enable()       ← after PEFT
+    #   6. Explicit freeze of all non-LoRA params
+    #   7. dispatch_model() to GPUs              ← dispatch wraps PEFT model
+    #   8. _inject_loss_function() post-dispatch
+    #   9. verify_gradient_flow()                ← must pass
+    # =========================================================================
 
-    # ── [6/9] Load SpaceLLM v1 adapter ───────────────────────────────────
-    log.info(f"\n[6/9] Loading SpaceLLM v1 adapter: {args.v1_adapter}")
-    log.info("      Base model vocab=200064, adapter saved at vocab=200064 → shapes match ✅")
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message=".*tie_word_embeddings.*")
-        peft_model = PeftModel.from_pretrained(
-            model,
-            args.v1_adapter,
-            is_trainable=False,      # read-only — about to merge
-            token=args.hf_token,
-        )
-    log.info("  ✅ SpaceLLM v1 adapter loaded")
+    # ── Step 3: Apply LoRA on CPU ─────────────────────────────────────────
+    logger.info("")
+    logger.info("Applying LoRA to lm_head ONLY (on CPU, before dispatch) ...")
 
-    # ── [7/9] merge_and_unload — bake v1 into base weights ───────────────
-    log.info("\n[7/9] Merging v1 adapter into base weights (merge_and_unload) ...")
-    model = peft_model.merge_and_unload()
-    log.info("  ✅ merge_and_unload() complete — SpaceLLM v1 knowledge is now base weights")
-
-    # ── [8/9] Post-merge cleanup ──────────────────────────────────────────
-    log.info("\n[8/9] Post-merge lm_head realignment ...")
-    model.config.tie_word_embeddings = False
-    if id(model.get_input_embeddings().weight) == id(model.get_output_embeddings().weight):
-        log.warning("  merge re-tied lm_head — re-untying")
-        untie_lm_head(model, "post-merge")
-    else:
-        log.info("  ✅ lm_head already independent post-merge")
-    inject_loss(model, "post-merge")
-
-    # ── Vocab resize (safe now — plain model, no PEFT wrapper) ───────────
-    log.info("  Resizing vocab (200064 → ~201088) ...")
-    actual_vocab = resize_vocab(model, tokenizer, "post-merge")
-    inject_loss(model, "post-resize")
-
-    log.info(f"\n  Final vocab size: {actual_vocab:,}")
-
-    # ── Attach fresh correction LoRA ──────────────────────────────────────
-    target_modules = [m.strip() for m in args.target_modules.split(",") if m.strip()]
-    lora_cfg = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
+    lora_config = LoraConfig(
+        r=32,
+        lora_alpha=128,       # 4×r
+        lora_dropout=0.1,
         bias="none",
         task_type=TaskType.CAUSAL_LM,
-        target_modules=target_modules,
+        target_modules=["lm_head"],
         init_lora_weights=True,
     )
-    model = get_peft_model(model, lora_cfg)
-    log.info(f"\n  ✅ Fresh correction LoRA attached  "
-             f"(r={args.lora_r}, alpha={args.lora_alpha}, target={target_modules})")
+    model = get_peft_model(model, lora_config)
+    logger.info("✅ get_peft_model() applied on raw CPU model (lm_head already untied)")
 
+    # ── Step 4 & 5: enable grads + gradient checkpointing ────────────────
     model.enable_input_require_grads()
-    model.gradient_checkpointing_enable()
-    log.info("  ✅ enable_input_require_grads + gradient_checkpointing")
+    logger.info("✅ enable_input_require_grads() called")
 
-    # ── Freeze everything except LoRA params ──────────────────────────────
-    log.info("\n  Freezing non-LoRA parameters ...")
-    frozen, lora_count = 0, 0
+    model.gradient_checkpointing_enable()
+    logger.info("✅ gradient_checkpointing_enable() called (post-PEFT)")
+
+    # ── Step 6: Explicit freeze ───────────────────────────────────────────
+    logger.info("")
+    logger.info("── Explicit parameter freeze (pre-dispatch) ─────────")
+    frozen_count, lora_count = 0, 0
     for name, param in model.named_parameters():
         if "lora_" in name:
-            param.requires_grad_(True);  lora_count += 1
+            param.requires_grad_(True)
+            lora_count += 1
         else:
-            param.requires_grad_(False); frozen += 1
+            param.requires_grad_(False)
+            frozen_count += 1
+    logger.info(f"  Frozen : {frozen_count} tensors")
+    logger.info(f"  LoRA   : {lora_count} tensors (requires_grad=True)")
 
     leaked = [(n, p.shape) for n, p in model.named_parameters()
               if p.requires_grad and "lora_" not in n]
     if leaked:
-        log.error("  ❌ Non-LoRA params still trainable — aborting:")
-        for n, s in leaked: log.error(f"     {n}  {s}")
-        return 1
-    log.info(f"  Frozen={frozen}  LoRA trainable={lora_count}  ✅ no leaks")
-    inject_loss(model, "post-PEFT")
-    log_trainable(model)
-    log_gpu("after LoRA init (CPU)")
+        logger.error("  ❌ Non-LoRA params still trainable:")
+        for n, s in leaked:
+            logger.error(f"     {n}  {s}")
+        raise SystemExit(1)
+    logger.info("  ✅ No non-LoRA params leaked as trainable")
 
-    # ── GPU dispatch ──────────────────────────────────────────────────────
-    log.info("\n  Dispatching model across GPUs ...")
+    # Re-inject loss post-PEFT
+    logger.info("")
+    logger.info("── Re-injecting CE loss (post-PEFT, pre-dispatch) ───")
+    _inject_loss_function(model, label="post-PEFT pre-dispatch")
+
+    log_trainable_parameters(model)
+    log_gpu_memory("after LoRA init (CPU)")
+
+    # ── Step 7: GPU dispatch ──────────────────────────────────────────────
+    logger.info("")
+    logger.info("Dispatching PEFT model across GPUs ...")
     t1 = time.time()
     try:
         from accelerate import dispatch_model, infer_auto_device_map
 
-        # Collect large module class names for no_split
-        no_split = list({
-            type(m).__name__
-            for m in model.modules()
-            if (isinstance(m, nn.Module) and type(m) is not nn.Module
-                and ("layer" in type(m).__name__.lower() or "block" in type(m).__name__.lower())
-                and sum(p.numel() for p in m.parameters()) > 1_000_000)
-        })
-        log.info(f"  no_split_module_classes: {no_split}")
+        no_split = []
+        for name, module in model.named_modules():
+            cls      = type(module)
+            cls_name = cls.__name__.lower()
+            if (
+                issubclass(cls, nn.Module) and cls is not nn.Module
+                and ("layer" in cls_name or "block" in cls_name)
+                and cls.__name__ not in no_split
+                and sum(p.numel() for p in module.parameters()) > 1_000_000
+            ):
+                no_split.append(cls.__name__)
+        no_split = list(dict.fromkeys(no_split))
+        logger.info(f"no_split_module_classes : {no_split}")
 
-        max_memory = {
-            i: f"{max(0, int((torch.cuda.mem_get_info(i)[0] - 4*1024**3) / 1024**3))}GiB"
-            for i in range(torch.cuda.device_count())
-        }
+        n_gpus     = torch.cuda.device_count()
+        max_memory = {}
+        for i in range(n_gpus):
+            free  = torch.cuda.mem_get_info(i)[0]
+            alloc = max(0, free - 4 * 1024**3)
+            max_memory[i] = f"{int(alloc / 1024**3)}GiB"
         max_memory["cpu"] = "80GiB"
-        log.info(f"  max_memory: {max_memory}")
+        logger.info(f"max_memory per device  : {max_memory}")
 
         device_map = infer_auto_device_map(
             model, max_memory=max_memory, no_split_module_classes=no_split)
         model = dispatch_model(model, device_map=device_map)
-        log.info(f"  GPU dispatch done in {time.time()-t1:.1f}s")
-        if hasattr(model, "hf_device_map"):
-            from collections import Counter
-            for dev, cnt in sorted(Counter(str(v) for v in model.hf_device_map.values()).items()):
-                log.info(f"    {dev}: {cnt} layer(s)")
     except Exception as e:
-        log.warning(f"  dispatch_model failed ({e}) — falling back to cuda:0")
+        logger.warning(f"dispatch_model failed ({e}) — falling back to cuda:0")
         model = model.to("cuda:0")
 
-    log_gpu("after dispatch")
-    inject_loss(model, "post-dispatch")
+    logger.info(f"GPU dispatch done in {time.time() - t1:.1f}s")
+    if hasattr(model, "hf_device_map"):
+        from collections import Counter
+        dev_counts = Counter(str(v) for v in model.hf_device_map.values())
+        for dev, count in sorted(dev_counts.items()):
+            logger.info(f"  {dev} : {count} layers")
+    log_gpu_memory("after dispatch")
 
-    # Sync config vocab after dispatch
-    final_vocab = model.get_output_embeddings().weight.shape[0]
-    if final_vocab != model.config.vocab_size:
-        log.warning(f"  Fixing config.vocab_size: {model.config.vocab_size} → {final_vocab}")
-        model.config.vocab_size = final_vocab
-    log.info(f"  Final vocab (post-dispatch): {final_vocab:,}  ✅")
+    # ── Step 8: Re-inject loss post-dispatch ─────────────────────────────
+    logger.info("")
+    logger.info("── Re-injecting CE loss (post-dispatch) ─────────────")
+    _inject_loss_function(model, label="post-dispatch")
 
-    # ── Build dataset ─────────────────────────────────────────────────────
-    log.info("\n  Tokenising correction examples ...")
-    train_dataset = build_dataset(tokenizer, examples, args.max_seq_len, final_vocab)
+    # ── Vocab check post-dispatch ─────────────────────────────────────────
+    logger.info("")
+    logger.info("── Vocab alignment (post-dispatch) ──────────────────")
+    _post_peft_vocab = model.get_output_embeddings().weight.shape[0]
+    if _post_peft_vocab != model.config.vocab_size:
+        logger.warning(f"  lm_head vocab ({_post_peft_vocab}) != config ({model.config.vocab_size}) — fixing")
+        model.config.vocab_size = _post_peft_vocab
+    logger.info(f"  lm_head vocab = {_post_peft_vocab:,}  ✅")
 
-    # ── TrainingArguments ─────────────────────────────────────────────────
-    MAX_GRAD_NORM = args.max_grad_norm
-    training_args = TrainingArguments(
-        output_dir                  = str(output_dir / "_ckpts"),
-        num_train_epochs            = args.epochs,
-        per_device_train_batch_size = args.batch_size,
-        gradient_accumulation_steps = args.grad_accum,
-        learning_rate               = args.lr,
-        lr_scheduler_type           = "cosine",
-        warmup_ratio                = args.warmup_ratio,
-        max_grad_norm               = MAX_GRAD_NORM,
-        optim                       = "adamw_torch_fused",
-        weight_decay                = 0.01,
-        bf16                        = True,
-        fp16                        = False,
-        logging_steps               = 1,
-        logging_first_step          = True,
-        save_strategy               = "no",
-        eval_strategy               = "no",
-        report_to                   = [],
-        dataloader_num_workers      = 0,
-        remove_unused_columns       = False,
-        seed                        = args.seed,
-        gradient_checkpointing      = True,
+  
+  
+
+    # ── Load datasets ─────────────────────────────────────────────────────
+    logger.info("")
+    logger.info("── Loading datasets ─────────────────────────────────")
+    train_records = load_json(TRAIN_FILE)
+    val_records   = load_json(VAL_FILE)
+    test_records  = load_json(TEST_FILE) if TEST_FILE.exists() else []
+
+    dataset_sanity_check(train_records, "train")
+    dataset_sanity_check(val_records,   "validation")
+    if test_records:
+        dataset_sanity_check(test_records, "test")
+    else:
+        logger.warning("Test file not found — test evaluation will be skipped")
+
+    logger.info("")
+    logger.info("── Tokenising ───────────────────────────────────────")
+    train_dataset = build_hf_dataset(
+        train_records, tokenizer, args.max_seq_len, "train",
+        vocab_size=_post_peft_vocab, debug_first_n=3,
+    )
+    val_dataset = build_hf_dataset(
+        val_records, tokenizer, args.max_seq_len, "validation",
+        vocab_size=_post_peft_vocab, debug_first_n=0,
     )
 
+    # ── Training arguments ────────────────────────────────────────────────
+    MAX_GRAD_NORM = 0.3
+
+    logger.info("")
+    logger.info("── Training configuration ───────────────────────────")
+    training_args = TrainingArguments(
+        output_dir=str(CKPT_DIR),
+        num_train_epochs=args.epochs,
+        per_device_train_batch_size=args.batch_size,
+        per_device_eval_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.grad_accum,
+        learning_rate=args.lr,
+        lr_scheduler_type="cosine_with_restarts",
+        warmup_steps=args.warmup_steps,
+        max_grad_norm=MAX_GRAD_NORM,
+        optim="adamw_torch_fused",
+        weight_decay=0.01,
+        bf16=True,
+        fp16=False,
+        eval_strategy="steps",
+        eval_steps=args.eval_steps,
+        save_strategy="steps",
+        save_steps=args.save_steps,
+        save_total_limit=args.save_total_limit,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
+        logging_steps=args.logging_steps,
+        logging_first_step=True,
+        report_to="none",
+        dataloader_num_workers=0,
+        remove_unused_columns=False,
+    )
+
+    for k, v in {
+        "epochs":           args.epochs,
+        "lr":               args.lr,
+        "max_grad_norm":    MAX_GRAD_NORM,
+        "weight_decay":     0.01,
+        "batch_size":       args.batch_size,
+        "grad_accum":       args.grad_accum,
+        "effective_batch":  args.batch_size * args.grad_accum,
+        "warmup_steps":     args.warmup_steps,
+        "lora_r":           32,
+        "lora_alpha":       128,
+        "optimizer":        "adamw_torch_fused",
+        "scheduler":        "cosine_with_restarts",
+        "bf16":             True,
+        "max_seq_len":      args.max_seq_len,
+        "early_stop_patce": args.patience,
+    }.items():
+        logger.info(f"  {k:<25}: {v}")
+
+    # ── Data collator ─────────────────────────────────────────────────────
     data_collator = DataCollatorForSeq2Seq(
-        tokenizer=tokenizer, model=model,
-        padding=True, pad_to_multiple_of=64,
+        tokenizer=tokenizer,
+        model=model,
+        padding=True,
+        pad_to_multiple_of=64,
         label_pad_token_id=IGNORE_INDEX,
     )
-    nan_guard = make_nan_guard()
 
-    # ── Custom Trainer: device-aware label placement + grad clipping ──────
-    class SpaceLLMTrainer(Trainer):
-        def _lm_device(self):
-            try: return next(self.model.get_output_embeddings().parameters()).device
-            except: return None
+    # ── Callbacks ─────────────────────────────────────────────────────────
+    history = HistoryCallback()
+
+    class _TrainingHistoryCallback(TrainerCallback):
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            history.on_log(args, state, control, logs=logs, **kwargs)
+
+    history_callback    = _TrainingHistoryCallback()
+    early_stop_callback = EarlyStoppingCallback(early_stopping_patience=args.patience)
+
+    # ── Trainer ───────────────────────────────────────────────────────────
+    class DeviceAwareTrainer(Trainer):
+        """
+        1. _prepare_inputs() moves labels to lm_head device.
+        2. training_step() adds explicit clip_grad_norm_ on trainable params
+           as belt-and-suspenders alongside max_grad_norm in TrainingArguments.
+        """
+        def _get_lm_head_device(self):
+            try:
+                return next(self.model.get_output_embeddings().parameters()).device
+            except Exception:
+                return None
 
         def _prepare_inputs(self, inputs):
-            inputs = super()._prepare_inputs(inputs)
-            dev    = self._lm_device()
-            if dev and "labels" in inputs and inputs["labels"].device != dev:
-                inputs["labels"] = inputs["labels"].to(dev)
+            inputs    = super()._prepare_inputs(inputs)
+            lm_device = self._get_lm_head_device()
+            if lm_device is None:
+                return inputs
+            if "labels" in inputs and inputs["labels"].device != lm_device:
+                inputs["labels"] = inputs["labels"].to(lm_device)
             return inputs
 
         def training_step(self, model, inputs, num_items_in_batch=None):
-            loss = (super().training_step(model, inputs, num_items_in_batch)
-                    if num_items_in_batch is not None
-                    else super().training_step(model, inputs))
-            trainable = [p for p in model.parameters() if p.requires_grad and p.grad is not None]
-            if trainable:
-                torch.nn.utils.clip_grad_norm_(trainable, max_norm=MAX_GRAD_NORM)
+            if num_items_in_batch is not None:
+                loss = super().training_step(model, inputs, num_items_in_batch)
+            else:
+                loss = super().training_step(model, inputs)
+
+            # Explicit clip — guards against multi-GPU/BF16 scaler clip misses
+            trainable_params = [
+                p for p in model.parameters()
+                if p.requires_grad and p.grad is not None
+            ]
+            if trainable_params:
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=MAX_GRAD_NORM)
+
             return loss
 
-    trainer = SpaceLLMTrainer(
-        model=model, args=training_args,
+    trainer = DeviceAwareTrainer(
+        model=model,
+        args=training_args,
         train_dataset=train_dataset,
+        eval_dataset=val_dataset,
         processing_class=tokenizer,
         data_collator=data_collator,
-        callbacks=[nan_guard],
+        callbacks=[history_callback, early_stop_callback],
     )
 
-    # Final loss patch after Trainer init
-    inject_loss(trainer.model, "post-Trainer")
-    log.info(f"  lm_head device: {trainer._lm_device()}")
+    # Final loss patch post-Trainer init
+    logger.info("")
+    logger.info("── Final loss_function patch (post-Trainer init) ────")
+    _inject_loss_function(trainer.model, label="post-Trainer")
+    logger.info(f"  lm_head device   : {trainer._get_lm_head_device()}")
 
     # ── Train ─────────────────────────────────────────────────────────────
-    log.info("")
-    log.info("=" * 65)
-    log.info(f"  Starting training | {len(train_dataset)} examples | {args.epochs} epochs")
-    log.info(f"  Base (merged): SpaceLLM_v1 baked into weights")
-    log.info(f"  LoRA: r={args.lora_r}  alpha={args.lora_alpha}  target={target_modules}")
-    log.info("=" * 65)
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info("  Starting training ...")
+    logger.info("=" * 60)
+
+    resume = args.resume_from_checkpoint
+    if resume:
+        if Path(resume).exists():
+            logger.info(f"Resuming from: {resume}")
+        else:
+            logger.warning(f"Checkpoint not found: {resume} — starting fresh")
+            resume = None
 
     t_start = time.time()
     try:
-        trainer.train()
+        train_result = trainer.train(resume_from_checkpoint=resume)
     except KeyboardInterrupt:
-        log.warning("Interrupted — saving current state ...")
-        interrupted = output_dir / "interrupted"
-        trainer.save_model(str(interrupted))
-        tokenizer.save_pretrained(str(interrupted))
-        log.info(f"Partial save → {interrupted}")
-        return 0
+        logger.warning("Interrupted — saving current state ...")
+        interrupted_dir = CKPT_DIR / "interrupted"
+        trainer.save_model(str(interrupted_dir))
+        tokenizer.save_pretrained(str(interrupted_dir))
+        save_training_graphs(history, RUN_ID)
+        logger.info(f"Saved to: {interrupted_dir}")
+        raise SystemExit(0)
     except Exception as e:
-        log.error(f"Training failed: {e}", exc_info=True)
-        return 1
+        logger.error(f"Training failed: {e}", exc_info=True)
+        raise SystemExit(1)
 
     elapsed = time.time() - t_start
-    log.info(f"  Training complete in {elapsed/60:.1f} min")
+    logger.info(f"Training complete in {elapsed / 60:.1f} min")
 
-    if nan_guard.triggered:
-        log.error("  NaN/Inf detected — NOT saving adapter to protect model integrity.")
-        return 1
+    # ── Save graphs ───────────────────────────────────────────────────────
+    logger.info("")
+    logger.info("── Saving training graphs ───────────────────────────")
+    save_training_graphs(history, RUN_ID)
 
-    # ── Save SpaceLLM v2 adapter ──────────────────────────────────────────
-    log.info(f"\n  Saving SpaceLLM v2 adapter → {output_dir}")
-    model.save_pretrained(str(output_dir))
-    tokenizer.save_pretrained(str(output_dir))
+    # ── Metrics ───────────────────────────────────────────────────────────
+    train_metrics = train_result.metrics
+    trainer.log_metrics("train", train_metrics)
+    trainer.save_metrics("train", train_metrics)
 
-    metadata = {
-        "model_name":        "SpaceLLM_v2",
-        "base_model":        args.base_model,
-        "v1_adapter":        args.v1_adapter,
-        "merge_strategy":    "merge_and_unload + fresh_correction_lora",
-        "output_dir":        str(output_dir),
-        "train_file":        str(train_file),
-        "examples_used":     len(train_dataset),
-        "epochs":            args.epochs,
-        "lr":                args.lr,
-        "lora_r":            args.lora_r,
-        "lora_alpha":        args.lora_alpha,
-        "target_modules":    args.target_modules,
-        "vocab_size":        final_vocab,
-        "trained_at":        datetime.now(timezone.utc).isoformat(),
-        "knowledge_sources": ["SpaceLLM_v1 (merged)", "human_corrections"],
+    with (LOG_DIR / f"train_metrics_{RUN_ID}.json").open("w") as f:
+        json.dump(train_metrics, f, indent=2)
+
+    logger.info("Running final validation evaluation ...")
+    eval_metrics = trainer.evaluate()
+    trainer.log_metrics("eval", eval_metrics)
+
+    with (LOG_DIR / f"eval_metrics_{RUN_ID}.json").open("w") as f:
+        json.dump(eval_metrics, f, indent=2)
+
+    # ── Save final LoRA adapters ──────────────────────────────────────────
+    logger.info("")
+    logger.info(f"Saving final LoRA adapters → {FINAL_DIR}")
+    trainer.model.save_pretrained(str(FINAL_DIR))
+    tokenizer.save_pretrained(str(FINAL_DIR))
+
+    # ── Test evaluation ───────────────────────────────────────────────────
+    test_results = None
+    if test_records:
+        test_results = run_test_evaluation(
+            model=trainer.model, tokenizer=tokenizer,
+            test_records=test_records, max_seq_len=args.max_seq_len,
+            vocab_size=_post_peft_vocab, max_samples=args.max_test_samples,
+            run_id=RUN_ID,
+        )
+    else:
+        logger.warning("Skipping test evaluation — test.json not found")
+
+    # ── Adapter info ──────────────────────────────────────────────────────
+    adapter_info = {
+        "run_id":          RUN_ID,
+        "version":         "v4",
+        "base_model":      args.model_id,
+        "strategy":        "LoRA on lm_head ONLY — backbone frozen — BF16",
+        "key_fixes_vs_v3_fixed": [
+            "lm_head weight untied (detach+clone) BEFORE get_peft_model()",
+            "resize_token_embeddings tie-re-introduction guard added",
+            "lora_r raised 16→32, lora_alpha raised 64→128",
+            "grad_accum raised 16→32, lr raised 1e-4→2e-4",
+            "max_grad_norm tightened 0.5→0.3, weight_decay=0.01 added",
+            "EarlyStoppingCallback added",
+            "scheduler changed cosine→cosine_with_restarts",
+            "optimizer changed adamw_torch→adamw_torch_fused",
+        ],
+        "lora_r":                32,
+        "lora_alpha":            128,
+        "lora_dropout":          0.1,
+        "target_modules":        ["lm_head"],
+        "epochs":                args.epochs,
+        "learning_rate":         args.lr,
+        "max_grad_norm":         MAX_GRAD_NORM,
+        "weight_decay":          0.01,
+        "batch_size":            args.batch_size,
+        "gradient_accumulation": args.grad_accum,
+        "effective_batch_size":  args.batch_size * args.grad_accum,
+        "max_seq_len":           args.max_seq_len,
+        "train_samples":         len(train_dataset),
+        "val_samples":           len(val_dataset),
+        "test_samples":          len(test_records),
+        "train_metrics":         train_metrics,
+        "eval_metrics":          eval_metrics,
+        "test_results_summary": (
+            {
+                "mean_test_loss":   test_results["loss_eval"]["mean_test_loss"],
+                "exact_match_rate": test_results["generation_eval"]["exact_match_rate"],
+                "mean_token_f1":    test_results["generation_eval"]["mean_token_f1"],
+            } if test_results else None
+        ),
+        "final_adapter_dir": str(FINAL_DIR),
+        "checkpoints_dir":   str(CKPT_DIR),
+        "graphs_dir":        str(GRAPH_DIR),
+        "log_file":          str(LOG_FILE),
     }
-    (output_dir / "training_metadata.json").write_text(
-        json.dumps(metadata, indent=2), encoding="utf-8")
+    with (FINAL_DIR / "adapter_info.json").open("w") as f:
+        json.dump(adapter_info, f, indent=2)
 
-    log.info("")
-    log.info("=" * 65)
-    log.info("  SpaceLLM v2 — Complete ✅")
-    log.info("=" * 65)
-    log.info(f"  Adapter saved  → {output_dir}")
-    log.info(f"  Contains       : SpaceLLM_v1 knowledge (merged) + human corrections (LoRA)")
-    log.info(f"  To load v2:")
-    log.info(f"    model = AutoModelForCausalLM.from_pretrained('{args.base_model}', ...)")
-    log.info(f"    model.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=64)")
-    log.info(f"    model = PeftModel.from_pretrained(model, '{output_dir}')")
-    log.info("=" * 65)
-    return 0
+    log_gpu_memory("after training")
+
+    # ── Final summary ─────────────────────────────────────────────────────
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info("  SpaceLLM lm_head LoRA v4 — Training Complete")
+    logger.info("=" * 60)
+    logger.info(f"  Final adapters   →  {FINAL_DIR}")
+    logger.info(f"  Checkpoints      →  {CKPT_DIR}")
+    logger.info(f"  Graphs           →  {GRAPH_DIR}")
+    logger.info(f"  Logs             →  {LOG_DIR}")
+    if test_results:
+        le = test_results["loss_eval"]
+        ge = test_results["generation_eval"]
+        logger.info("")
+        logger.info("  Test Results Summary:")
+        logger.info(f"    Mean test loss    : {le['mean_test_loss']:.4f}  ({le['samples_evaluated']:,} samples)")
+        if ge["exact_match_rate"] is not None:
+            logger.info(f"    Exact match       : {ge['exact_match_rate']*100:.2f}%")
+            logger.info(f"    Mean token F1     : {ge['mean_token_f1']:.4f}")
+    logger.info("")
+    logger.info("  To load for evaluation:")
+    logger.info("    from transformers import AutoModelForCausalLM, AutoTokenizer, Mxfp4Config")
+    logger.info("    from peft import PeftModel")
+    logger.info(f"    base  = AutoModelForCausalLM.from_pretrained('{args.model_id}',")
+    logger.info(f"                quantization_config=Mxfp4Config(dequantize=True), device_map='auto')")
+    logger.info(f"    model = PeftModel.from_pretrained(base, '{FINAL_DIR}')")
+    logger.info(f"    tok   = AutoTokenizer.from_pretrained('{FINAL_DIR}')")
+    logger.info("=" * 60)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
