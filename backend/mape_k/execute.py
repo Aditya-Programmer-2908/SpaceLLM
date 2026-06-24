@@ -5,8 +5,9 @@ Changes from v2:
   1. DatasetExporter now MERGES core train.json (DatasetA_core_QA_v2/train.json) into
      combined_dataset.json on first write, so correction fine-tuning always trains on
      the full corpus, not just the small set of MAPE-K corrections.
-  2. CORRECTION_FINE_TUNING_SCRIPT path corrected to train_spacellm_fresh.py.
-  3. Auto-training CLI flags aligned with train_spacellm_fresh.py's argparse spec.
+  2. CORRECTION_FINE_TUNING_SCRIPT correctly points to correction_fine_tuning.py.
+  3. Auto-training CLI flags aligned with correction_fine_tuning.py's argparse spec,
+     including --lora_dropout and --base_model.
 """
 
 from __future__ import annotations
@@ -71,11 +72,10 @@ CORE_TRAIN_FILE = Path(
 KNOWLEDGE_REPO_FILE  = MAPE_DIR / "knowledge_repository.json"
 KNOWLEDGE_BACKUP_DIR = MAPE_DIR / "knowledge_repository_backups"
 
-# ── FIX 2: Correct training script filename ───────────────────────────────
-# The script is train_spacellm_fresh.py, NOT correction_fine_tuning.py.
+# Training script
 CORRECTION_FINE_TUNING_SCRIPT = Path(
     "/mnt/DATA/saurabh/aditya/SpaceLLM/Model_training_&_Data_Extraction"
-    "/fine_tuning_v2/train_spacellm_fresh.py"
+    "/fine_tuning_v2/correction_fine_tuning.py"
 )
 TRAINING_OUTPUT_DIR = BASE_DIR / "spacellm_adapters"
 
@@ -117,6 +117,7 @@ class ExecutorConfig:
     auto_train_grad_accum:      int   = 32
     auto_train_lora_r:          int   = 32
     auto_train_lora_alpha:      int   = 128
+    auto_train_lora_dropout:    float = 0.1
     auto_train_max_seq_len:     int   = 2048
 
 
@@ -661,25 +662,28 @@ def trigger_auto_training(config: ExecutorConfig) -> dict[str, Any]:
     log.info("  Grad accum    : %d", config.auto_train_grad_accum)
     log.info("  LoRA r        : %d", config.auto_train_lora_r)
     log.info("  LoRA alpha    : %d", config.auto_train_lora_alpha)
+    log.info("  LoRA dropout  : %g", config.auto_train_lora_dropout)
     log.info("  Max seq len   : %d", config.auto_train_max_seq_len)
     log.info("=" * 70)
 
-    # FIX 2: CLI flags match train_spacellm_fresh.py's argparse exactly
+    # CLI flags match correction_fine_tuning.py's argparse exactly
     cmd = [
         sys.executable,
         str(CORRECTION_FINE_TUNING_SCRIPT),
-        "--train_file",  str(COMBINED_DATASET_FILE),
-        "--output_dir",  str(output_dir),
-        "--epochs",      str(config.auto_train_epochs),
-        "--lr",          str(config.auto_train_lr),
-        "--batch_size",  str(config.auto_train_batch_size),
-        "--grad_accum",  str(config.auto_train_grad_accum),
-        "--lora_r",      str(config.auto_train_lora_r),
-        "--lora_alpha",  str(config.auto_train_lora_alpha),
-        "--max_seq_len", str(config.auto_train_max_seq_len),
+        "--train_file",   str(COMBINED_DATASET_FILE),
+        "--output_dir",   str(output_dir),
+        "--base_model",   "openai/gpt-oss-20b",
+        "--epochs",       str(config.auto_train_epochs),
+        "--lr",           str(config.auto_train_lr),
+        "--batch_size",   str(config.auto_train_batch_size),
+        "--grad_accum",   str(config.auto_train_grad_accum),
+        "--lora_r",       str(config.auto_train_lora_r),
+        "--lora_alpha",   str(config.auto_train_lora_alpha),
+        "--lora_dropout", str(config.auto_train_lora_dropout),
+        "--max_seq_len",  str(config.auto_train_max_seq_len),
     ]
 
-    # Pass HF token via CLI (train_spacellm_fresh.py reads --hf_token)
+    # Pass HF token via CLI
     hf_token = os.environ.get("HF_TOKEN")
     if hf_token:
         cmd.extend(["--hf_token", hf_token])
@@ -1266,3 +1270,4 @@ if __name__ == "__main__":
                     print(f"     Adapter   : {last_training.get('training_output_dir')}")
     print(f"{'='*60}\n")
     sys.exit(0 if not any(r.status == "FAILED" for r in records) else 1)
+  
